@@ -78,8 +78,6 @@ This took a while, but eventually completed with:
 
 Should I limit to only QUDA? Have it crawl QUDA and record all the kernels that might show up then cross-reference/demangle.
 
-
-
 When I tried to run the analyzer, it failed due to there not being an API key set. 
 
 ```
@@ -108,11 +106,11 @@ Claude responded with:
 
 ```
 ● How it works                                                                                                                            
-                                                                                                                                        
+
   Done locally (pure SQL + Python)                                                                                                        
-   
+
   The analysis/metrics.py layer runs entirely on your machine against the SQLite file — no AI involved:                                   
-                                                            
+
   - Time budget — total GPU kernel time, memcpy time, sync time, profile span                                                             
   - Top kernels — ranked by total GPU time, with call counts and avg/min/max durations
   - GPU idle gap histogram — inter-kernel gaps bucketed by size (<10µs → >100ms)                                                          
@@ -120,27 +118,27 @@ Claude responded with:
   - Stream utilization — per-stream kernel time and percentage                                                                            
   - NVTX ranges — top annotation ranges by wall-clock time                                                                                
   - MPI breakdown — per-operation totals for Barrier, Allreduce, P2P, etc.                                                                
-                                                                                                                                          
+
   All of this is assembled into a ProfileSummary Pydantic object — a structured JSON document.
 
   ---                                                                                                                                     
   Done by AI                                                
-            
+
   The AI's job is purely interpretation and hypothesis generation. It receives the ProfileSummary JSON (with the Claude Code fallback) or
   can issue follow-up SQL queries (with the API backend), and produces the ranked hypothesis list.                                        
-   
+
   The AI contributes:                                                                                                                     
   - Domain knowledge — knowing that 62.8 GB/s on NVLink is poor, that a single dominant CUDA stream prevents overlap, that QUDA has a
   comms_overlap flag, that CG solvers do one Allreduce per iteration                                                                      
   - Cross-metric reasoning — connecting "GPU is 48% idle" + "MPI_Barrier is 37.5s" + "single stream" into a coherent diagnosis
   - Actionable suggestions — specific flags, patterns, and architectural changes to try                                                   
-                                                                                                                                          
+
   The AI does not touch the raw profile data directly — it only sees what the local analysis layer computed.                              
-                                                                                                                                          
+
   ---                                                                                                                                     
   The two backends 
 
-                                                                                                                                          
+
   ┌───────────────────┬────────────────────────────────────────────────┬────────────────────────────────┐
   │                   │                  API backend                   │      Claude Code backend       │                                 
   ├───────────────────┼────────────────────────────────────────────────┼────────────────────────────────┤
@@ -152,20 +150,14 @@ Claude responded with:
   ├───────────────────┼────────────────────────────────────────────────┼────────────────────────────────┤                                 
   │ Cost              │ API credits                                    │ Claude Code Pro subscription   │
   └───────────────────┴────────────────────────────────────────────────┴────────────────────────────────┘                                 
-                                                            
+
   The tradeoff is flexibility: the API backend can drill down (e.g., "show me per-launch-config breakdown for Kernel3D"), while the Claude
    Code backend gets one shot with whatever the ProfileSummary pre-computes.
 ```
 
 Note that Claude reports that using the API would be better than using the fallback to Claude code because the API can drill-down with follow-up queries.
 
-
-
-
-
-
-
-
+To save progress, I put all of this into a new private git repo: https://github.com/leonhostetler/agentic_quda_performance
 
 ## First test analysis
 
@@ -281,6 +273,64 @@ each of which has its own performance characteristics. For example, the reality 
 Should add a verbose mode that dumps all API or claude queries as they are made.
 
 The claim that 99.6% of GPU work is done on a single stream and there is no overlap of P2P with the kernels is incorrect. Why does it conclude this? I think I need to look at more verbose output from the profile summary layer to see what information is actually being sent to the AI.
+
+```
+I want to have a verbose option, e.g. --verbose, that prints the content of the ProfileSummary that is sent to the AI.
+```
+
+Claude added the verbose option. To run, use:
+
+```bash
+.venv/bin/python -m nsight_agent analyze --verbose /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite 2>&1
+```
+
+Now it prints the profile summary information. I also see that the hypotheses returned are now slightly different. I guess it makes sense that the return from Claude Code is not necessarily reproducible.
+
+```
+What is the prompt that is sent to claude when the ProfileSummary is sent? 
+```
+
+Claude responded with:
+
+```
+● The full prompt sent in the Claude Code backend is assembled by _format_summary_prompt() at loop.py:51-62. With the actual              
+  ProfileSummary filled in, it looks like this:
+                                                                                                                                          
+  You are an expert GPU performance engineer. Analyze the following Nsight Systems profile summary                                        
+  for 'cg_4864_1rhs.sqlite' and produce a ranked list of actionable performance hypotheses.                                               
+                                                                                                                                          
+  Each hypothesis object must have these fields:            
+    - bottleneck_type: one of [compute_bound, memory_bound, mpi_latency, mpi_imbalance,                                                   
+                                cpu_launch_overhead, synchronization, io, other]                                                          
+    - description: concise plain-English description of the bottleneck
+    - evidence: specific numbers from the profile that support this hypothesis                                                            
+    - suggestion: concrete, actionable recommendation       
+    - expected_impact: estimated relative improvement (high / medium / low)                                                               
+   
+  Output ONLY a JSON array of hypothesis objects — no prose, no markdown fences.                                                          
+                                                            
+  ## Profile Summary (JSON)                                                                                                               
+   
+  { ... full ProfileSummary JSON ... }                                                                                                    
+                                                            
+  That's the entirety of it — no system prompt, no prior context. Just the one user message sent to claude -p.
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

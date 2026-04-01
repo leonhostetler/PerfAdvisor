@@ -15,8 +15,18 @@ console = Console()
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.agent.loop import run_agent
+    from nsight_agent.analysis.metrics import compute_profile_summary
+    from nsight_agent.ingestion.profile import NsysProfile
 
-    hypotheses = run_agent(args.profile, verbose=not args.quiet)
+    with NsysProfile(args.profile) as profile:
+        summary = compute_profile_summary(profile)
+
+    if args.verbose:
+        console.print("\n[bold]── ProfileSummary sent to AI ──[/bold]")
+        console.print(summary.model_dump_json(indent=2))
+        console.print("[bold]── End ProfileSummary ──[/bold]\n")
+
+    hypotheses = run_agent(args.profile, summary=summary, verbose=not args.quiet)
 
     if args.json:
         print(json.dumps(hypotheses, indent=2))
@@ -86,6 +96,7 @@ def main() -> None:
     p_analyze = sub.add_parser("analyze", help="Run agent hypothesis generation on a profile")
     p_analyze.add_argument("profile", help="Path to .sqlite profile")
     p_analyze.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_analyze.add_argument("--verbose", action="store_true", help="Print the ProfileSummary sent to the AI")
     p_analyze.add_argument("--quiet", action="store_true", help="Suppress agent turn logging")
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")

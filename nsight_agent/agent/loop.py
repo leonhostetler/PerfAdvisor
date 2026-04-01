@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from nsight_agent.analysis.metrics import compute_profile_summary
+from nsight_agent.analysis.models import ProfileSummary
 from nsight_agent.agent.tools import dispatch, tool_schemas
 from nsight_agent.ingestion.profile import NsysProfile
 
@@ -143,12 +144,16 @@ def _run_claude_code(
     profile: NsysProfile,
     *,
     verbose: bool,
+    summary: ProfileSummary | None = None,
 ) -> list[dict[str, Any]]:
     if verbose:
         print("[agent] No ANTHROPIC_API_KEY found — falling back to Claude Code (claude -p)")
-        print("[agent] Computing profile summary...")
 
-    summary = compute_profile_summary(profile)
+    if summary is None:
+        if verbose:
+            print("[agent] Computing profile summary...")
+        summary = compute_profile_summary(profile)
+
     summary_json = summary.model_dump_json(indent=2)
     prompt = _format_summary_prompt(summary_json, profile.path.name)
 
@@ -183,11 +188,15 @@ def run_agent(
     model: str = MODEL,
     max_turns: int = MAX_TURNS,
     verbose: bool = True,
+    summary: ProfileSummary | None = None,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
     Uses the Anthropic API (multi-turn tool-use) when ANTHROPIC_API_KEY is set,
     otherwise falls back to `claude -p` via subprocess.
+
+    Pass a pre-computed `summary` to avoid recomputing it (e.g. when the caller
+    already computed it for display purposes).
     """
     profile = NsysProfile(profile_path)
 
@@ -198,7 +207,7 @@ def run_agent(
         if os.environ.get("ANTHROPIC_API_KEY"):
             hypotheses = _run_api(profile, model=model, max_turns=max_turns, verbose=verbose)
         else:
-            hypotheses = _run_claude_code(profile, verbose=verbose)
+            hypotheses = _run_claude_code(profile, verbose=verbose, summary=summary)
     finally:
         profile.close()
 
