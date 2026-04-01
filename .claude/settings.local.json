@@ -12,7 +12,11 @@
       "Bash(python -m nsight_agent analyze /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite)",
       "Bash(.venv/bin/python -m nsight_agent analyze /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite 2>&1)",
       "Bash(.venv/bin/python -m nsight_agent analyze --help)",
-      "Bash(.venv/bin/python -m nsight_agent analyze --quiet /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite)"
+      "Bash(.venv/bin/python -m nsight_agent analyze --quiet /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite)",
+      "Bash(python -m nsight_agent summary /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite)",
+      "Bash(python -m nsight_agent summary /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite --max-phases 4)",
+      "Bash(python:*)",
+      "Bash(pytest tests/ -x -q)"
     ]
   }
 }

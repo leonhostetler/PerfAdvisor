@@ -19,7 +19,23 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.ingestion.profile import NsysProfile
 
     with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(profile)
+        summary = compute_profile_summary(profile, max_phases=args.max_phases)
+
+    if not args.quiet and summary.phases:
+        ph = Table(title="Detected Execution Phases")
+        for col in ("Phase", "Start (s)", "End (s)", "Duration (s)", "GPU Util %", "Top Kernel"):
+            ph.add_column(col)
+        for p in summary.phases:
+            top = p.top_kernels[0].name if p.top_kernels else "—"
+            ph.add_row(
+                p.name,
+                str(p.start_s),
+                str(p.end_s),
+                str(p.duration_s),
+                f"{p.gpu_utilization_pct}%",
+                top,
+            )
+        console.print(ph)
 
     if args.verbose:
         console.print("\n[bold]── ProfileSummary sent to AI ──[/bold]")
@@ -59,7 +75,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     from nsight_agent.ingestion.profile import NsysProfile
 
     with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(profile)
+        summary = compute_profile_summary(profile, max_phases=args.max_phases)
 
     if args.json:
         print(summary.model_dump_json(indent=2))
@@ -88,6 +104,22 @@ def cmd_summary(args: argparse.Namespace) -> None:
             m.add_row(op.op, str(op.calls), str(op.total_s), str(op.avg_ms))
         console.print(m)
 
+    if summary.phases:
+        ph = Table(title="Execution Phases")
+        for col in ("Phase", "Start (s)", "End (s)", "Duration (s)", "GPU Util %", "Top Kernel"):
+            ph.add_column(col)
+        for p in summary.phases:
+            top = p.top_kernels[0].name if p.top_kernels else "—"
+            ph.add_row(
+                p.name,
+                str(p.start_s),
+                str(p.end_s),
+                str(p.duration_s),
+                f"{p.gpu_utilization_pct}%",
+                top,
+            )
+        console.print(ph)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="nsight-agent")
@@ -98,10 +130,18 @@ def main() -> None:
     p_analyze.add_argument("--json", action="store_true", help="Output raw JSON")
     p_analyze.add_argument("--verbose", action="store_true", help="Print the ProfileSummary sent to the AI")
     p_analyze.add_argument("--quiet", action="store_true", help="Suppress agent turn logging")
+    p_analyze.add_argument(
+        "--max-phases", type=int, default=6,
+        help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+    )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
     p_summary.add_argument("profile", help="Path to .sqlite profile")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_summary.add_argument(
+        "--max-phases", type=int, default=6,
+        help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+    )
 
     args = parser.parse_args()
     if args.command == "analyze":

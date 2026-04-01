@@ -45,8 +45,12 @@ actionable hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
 
-Start by calling profile_summary to orient yourself, then use the other tools as needed.
-Work systematically: time budget → kernels → memory → MPI (if present) → NVTX context → idle gaps.
+Start by calling profile_summary to orient yourself, then call phase_summary to understand the
+sequential execution phases (e.g., initialization, main computation, teardown). Phases can have
+very different performance characteristics — analyze the most time-consuming phases in depth.
+Global averages across all phases can be misleading; focus on phase-specific metrics.
+
+Work systematically within the dominant phases: kernels → memory → MPI (if present) → idle gaps.
 Use sql_query for any targeted follow-up that the structured tools don't cover.
 
 When you have gathered enough evidence, output your final answer as a JSON array of hypothesis
@@ -60,6 +64,12 @@ You are an expert GPU performance engineer. Analyze the following Nsight Systems
 for '{profile_name}' and produce a ranked list of actionable performance hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
+
+The summary includes a 'phases' field that partitions the profile into sequential, non-overlapping
+execution phases (e.g., initialization, solvers, teardown). Each phase has its own GPU utilization,
+top kernels, and MPI breakdown. Analyze phases independently — global averages can be misleading
+when phases have very different performance characteristics. Focus hypotheses on the phases that
+dominate execution time.
 
 Output ONLY a JSON array of hypothesis objects — no prose, no markdown fences.
 

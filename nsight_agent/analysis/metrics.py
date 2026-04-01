@@ -15,9 +15,11 @@ from .models import (
     MemcpySummary,
     MpiOpSummary,
     NvtxRangeSummary,
+    PhaseSummary,
     ProfileSummary,
     StreamSummary,
 )
+from .phases import PhaseWindow, detect_phases
 
 # ---------------------------------------------------------------------------
 # Individual metric functions
@@ -25,16 +27,29 @@ from .models import (
 
 
 def compute_profile_span(profile: NsysProfile) -> float:
-    """Wall-clock duration of the profile in seconds."""
-    # Use GPU-side events only (kernels + memcpy). CUPTI_ACTIVITY_KIND_RUNTIME
-    # records CPU-side CUDA API calls and can extend far beyond GPU activity.
-    row = profile.query("""
-        SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s
-        FROM (
-            SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL
-            UNION ALL SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY
+    """True wall-clock duration from first to last captured event across all sources.
+
+    Includes CPU-side CUDA API calls (RUNTIME) and NVTX annotations so that the
+    reported span matches the timeline shown in the Nsight Systems GUI.
+    """
+    sources = [
+        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL",
+        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY",
+    ]
+    if profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
+        sources.append(
+            "SELECT start, end FROM CUPTI_ACTIVITY_KIND_RUNTIME "
+            "WHERE start IS NOT NULL AND end IS NOT NULL"
         )
-    """)[0]
+    if profile.has_nvtx():
+        sources.append(
+            "SELECT start, end FROM NVTX_EVENTS "
+            "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
+        )
+    union_sql = " UNION ALL ".join(sources)
+    row = profile.query(
+        f"SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s FROM ({union_sql})"
+    )[0]
     return float(row["span_s"] or 0.0)
 
 
@@ -244,17 +259,167 @@ def compute_mpi_ops(profile: NsysProfile, limit: int = 10) -> list[MpiOpSummary]
 
 
 # ---------------------------------------------------------------------------
+# Per-phase metric helpers
+# ---------------------------------------------------------------------------
+
+
+def _window_kernel_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
+    row = profile.query(f"""
+        SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE start >= {start_ns} AND end <= {end_ns}
+    """)[0]
+    return float(row["t"])
+
+
+def _window_memcpy_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
+    row = profile.query(f"""
+        SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t
+        FROM CUPTI_ACTIVITY_KIND_MEMCPY
+        WHERE start >= {start_ns} AND end <= {end_ns}
+    """)[0]
+    return float(row["t"])
+
+
+def _window_idle_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
+    row = profile.query(f"""
+        WITH ordered AS (
+            SELECT start, end, ROW_NUMBER() OVER (ORDER BY start) AS rn
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+            WHERE start >= {start_ns} AND end <= {end_ns}
+        ),
+        gaps AS (
+            SELECT o2.start - o1.end AS gap_ns
+            FROM ordered o1
+            JOIN ordered o2 ON o2.rn = o1.rn + 1
+            WHERE o2.start > o1.end
+        )
+        SELECT COALESCE(SUM(gap_ns), 0) / 1e9 AS t
+        FROM gaps
+    """)[0]
+    return float(row["t"])
+
+
+def _window_top_kernels(
+    profile: NsysProfile, start_ns: int, end_ns: int, total_kernel_s: float, limit: int = 5
+) -> list[KernelSummary]:
+    rows = profile.query(f"""
+        SELECT
+            s.value                             AS name,
+            COUNT(*)                            AS calls,
+            SUM(k.end - k.start) / 1e9         AS total_s,
+            AVG(k.end - k.start) / 1e6         AS avg_ms,
+            MIN(k.end - k.start) / 1e6         AS min_ms,
+            MAX(k.end - k.start) / 1e6         AS max_ms
+        FROM CUPTI_ACTIVITY_KIND_KERNEL k
+        JOIN StringIds s ON k.shortName = s.id
+        WHERE k.start >= {start_ns} AND k.end <= {end_ns}
+        GROUP BY k.shortName
+        ORDER BY total_s DESC
+        LIMIT {limit}
+    """)
+    return [
+        KernelSummary(
+            name=r["name"],
+            calls=r["calls"],
+            total_s=round(r["total_s"], 4),
+            avg_ms=round(r["avg_ms"], 4),
+            min_ms=round(r["min_ms"], 4),
+            max_ms=round(r["max_ms"], 4),
+            pct_of_gpu_time=round(100.0 * r["total_s"] / total_kernel_s, 1) if total_kernel_s else 0.0,
+        )
+        for r in rows
+    ]
+
+
+def _window_mpi_ops(
+    profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 5
+) -> list[MpiOpSummary]:
+    if not profile.has_mpi():
+        return []
+    ops: list[MpiOpSummary] = []
+    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
+        if not profile.has_table(table):
+            continue
+        rows = profile.query(f"""
+            SELECT
+                s.value                         AS op,
+                COUNT(*)                        AS calls,
+                SUM(end - start) / 1e9         AS total_s,
+                AVG(end - start) / 1e6         AS avg_ms,
+                MAX(end - start) / 1e6         AS max_ms
+            FROM {table} e
+            JOIN StringIds s ON e.textId = s.id
+            WHERE e.start >= {start_ns} AND e.end <= {end_ns}
+              AND e.end IS NOT NULL
+            GROUP BY e.textId
+            ORDER BY total_s DESC
+            LIMIT {limit}
+        """)
+        ops.extend(
+            MpiOpSummary(
+                op=r["op"],
+                calls=r["calls"],
+                total_s=round(r["total_s"], 3),
+                avg_ms=round(r["avg_ms"], 3),
+                max_ms=round(r["max_ms"], 3),
+            )
+            for r in rows
+        )
+    seen: dict[str, MpiOpSummary] = {}
+    for op in sorted(ops, key=lambda x: x.total_s, reverse=True):
+        seen.setdefault(op.op, op)
+    return sorted(seen.values(), key=lambda x: x.total_s, reverse=True)[:limit]
+
+
+def compute_phase_summary(
+    profile: NsysProfile,
+    phase: PhaseWindow,
+    profile_start_ns: int,
+) -> PhaseSummary:
+    """Compute full metrics for a single PhaseWindow."""
+    kernel_s = _window_kernel_time(profile, phase.start_ns, phase.end_ns)
+    memcpy_s = _window_memcpy_time(profile, phase.start_ns, phase.end_ns)
+    idle_s = _window_idle_time(profile, phase.start_ns, phase.end_ns)
+    duration_s = (phase.end_ns - phase.start_ns) / 1e9
+    start_s = (phase.start_ns - profile_start_ns) / 1e9
+
+    return PhaseSummary(
+        name=phase.name,
+        start_s=round(start_s, 3),
+        end_s=round(start_s + duration_s, 3),
+        duration_s=round(duration_s, 3),
+        gpu_utilization_pct=round(100.0 * kernel_s / duration_s, 1) if duration_s else 0.0,
+        gpu_kernel_s=round(kernel_s, 3),
+        gpu_memcpy_s=round(memcpy_s, 3),
+        total_gpu_idle_s=round(idle_s, 3),
+        top_kernels=_window_top_kernels(profile, phase.start_ns, phase.end_ns, kernel_s),
+        mpi_ops=_window_mpi_ops(profile, phase.start_ns, phase.end_ns),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
 
-def compute_profile_summary(profile: NsysProfile) -> ProfileSummary:
-    """Compute all metrics for a profile and return a ProfileSummary."""
+def compute_profile_summary(profile: NsysProfile, max_phases: int = 6) -> ProfileSummary:
+    """Compute all metrics for a profile and return a ProfileSummary.
+
+    Set max_phases=1 to skip phase segmentation (returns a single phase).
+    """
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
     memcpy_s = compute_gpu_memcpy_time(profile)
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
+
+    phases_windows = detect_phases(profile, max_phases=max_phases)
+    profile_start_ns = phases_windows[0].start_ns if phases_windows else 0
+    phase_summaries = [
+        compute_phase_summary(profile, pw, profile_start_ns)
+        for pw in phases_windows
+    ]
 
     return ProfileSummary(
         profile_path=str(profile.path),
@@ -271,4 +436,5 @@ def compute_profile_summary(profile: NsysProfile) -> ProfileSummary:
         nvtx_ranges=compute_nvtx_ranges(profile),
         mpi_ops=compute_mpi_ops(profile),
         mpi_present=profile.has_mpi(),
+        phases=phase_summaries,
     )

@@ -31,7 +31,7 @@ def profile():
 
 def test_profile_span(profile):
     span = compute_profile_span(profile)
-    assert 40.0 < span < 60.0, f"Expected ~47.8s, got {span}"
+    assert 95.0 < span < 115.0, f"Expected ~102s (true wall-clock span), got {span}"
 
 
 def test_gpu_kernel_time(profile):
@@ -43,7 +43,7 @@ def test_gpu_utilization_reasonable(profile):
     span = compute_profile_span(profile)
     kernel = compute_gpu_kernel_time(profile)
     util = 100.0 * kernel / span
-    assert 30.0 < util < 80.0, f"Expected ~51%, got {util}"
+    assert 10.0 < util < 40.0, f"Expected ~24% (kernel time / true profile span), got {util}"
 
 
 def test_gpu_memcpy_time(profile):

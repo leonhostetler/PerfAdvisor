@@ -55,6 +55,21 @@ class StreamSummary(BaseModel):
     pct_of_gpu_time: float
 
 
+class PhaseSummary(BaseModel):
+    """Metrics for a single execution phase within a profile."""
+
+    name: str
+    start_s: float              # seconds from profile start
+    end_s: float
+    duration_s: float
+    gpu_utilization_pct: float
+    gpu_kernel_s: float
+    gpu_memcpy_s: float
+    total_gpu_idle_s: float
+    top_kernels: list[KernelSummary]
+    mpi_ops: list[MpiOpSummary] = Field(default_factory=list)
+
+
 class ProfileSummary(BaseModel):
     """Top-level summary of a single Nsight Systems profile.
 
@@ -84,3 +99,4 @@ class ProfileSummary(BaseModel):
     # MPI (absent if profile has no MPI tables)
     mpi_ops: list[MpiOpSummary] = Field(default_factory=list)
     mpi_present: bool = False
+    phases: list[PhaseSummary] = Field(default_factory=list)

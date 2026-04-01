@@ -82,6 +82,21 @@ def tool_stream_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
     return {"streams": [s.model_dump() for s in streams]}
 
 
+def tool_phase_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
+    """Return the profile segmented into sequential execution phases."""
+    from nsight_agent.analysis.metrics import compute_phase_summary
+    from nsight_agent.analysis.phases import detect_phases
+
+    max_phases = int(args.get("max_phases", 6))
+    phases = detect_phases(profile, max_phases=max_phases)
+    if not phases:
+        return {"phases": []}
+
+    profile_start_ns = phases[0].start_ns
+    summaries = [compute_phase_summary(profile, p, profile_start_ns) for p in phases]
+    return {"phases": [s.model_dump() for s in summaries]}
+
+
 def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Execute an arbitrary read-only SQL query against the profile SQLite database.
 
@@ -193,6 +208,28 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                 "A single dominant stream indicates no concurrent kernel execution."
             ),
             "input_schema": {"type": "object", "properties": {}, "required": []},
+        },
+    ),
+    "phase_summary": (
+        tool_phase_summary,
+        {
+            "name": "phase_summary",
+            "description": (
+                "Segment the profile into sequential, non-overlapping execution phases "
+                "(e.g., initialization, main computation, teardown) and return per-phase "
+                "metrics. Use this early in analysis — phases can have very different "
+                "performance characteristics and global averages can be misleading."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "max_phases": {
+                        "type": "integer",
+                        "description": "Maximum number of phases to return (default 6).",
+                    }
+                },
+                "required": [],
+            },
         },
     ),
     "sql_query": (
