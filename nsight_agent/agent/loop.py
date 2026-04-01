@@ -5,6 +5,10 @@ Two backends are supported:
     via the Anthropic SDK. Claude can issue follow-up SQL queries and drill down.
   - Claude Code backend (fallback): pre-computes the full ProfileSummary and sends
     it in a single prompt to `claude -p` via subprocess. No API key required.
+
+Both backends save the prompt and raw response to files next to the profile:
+  {profile_stem}_{timestamp}_prompt.txt
+  {profile_stem}_{timestamp}_response.txt
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +82,30 @@ def _extract_hypotheses(text: str) -> list[dict[str, Any]]:
     return []
 
 
+def _save_files(
+    profile_path: Path,
+    prompt: str,
+    response: str,
+    verbose: bool,
+) -> tuple[Path, Path]:
+    """Save prompt and response to files next to the profile. Returns (prompt_path, response_path)."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = profile_path.stem
+    out_dir = profile_path.parent
+
+    prompt_path = out_dir / f"{stem}_{ts}_prompt.txt"
+    response_path = out_dir / f"{stem}_{ts}_response.txt"
+
+    prompt_path.write_text(prompt, encoding="utf-8")
+    response_path.write_text(response, encoding="utf-8")
+
+    if verbose:
+        print(f"[agent] Prompt saved to:   {prompt_path}")
+        print(f"[agent] Response saved to: {response_path}")
+
+    return prompt_path, response_path
+
+
 # ---------------------------------------------------------------------------
 # API backend (ANTHROPIC_API_KEY)
 # ---------------------------------------------------------------------------
@@ -116,6 +145,14 @@ def _run_api(
                 if hasattr(block, "text"):
                     hypotheses = _extract_hypotheses(block.text)
                     if hypotheses:
+                        # Save: prompt = system prompt + full message history
+                        prompt_record = (
+                            f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                            f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
+                            f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
+                        )
+                        response_record = block.text
+                        _save_files(profile.path, prompt_record, response_record, verbose)
                         return hypotheses
             return []
 
@@ -171,6 +208,8 @@ def _run_claude_code(
 
     data = json.loads(result.stdout)
     response_text = data.get("result", "")
+
+    _save_files(profile.path, prompt, response_text, verbose)
 
     if verbose:
         print(f"[agent] {response_text[:300]}{'...' if len(response_text) > 300 else ''}")
