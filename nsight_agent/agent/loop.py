@@ -45,13 +45,13 @@ actionable hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
 
-Start by calling profile_summary to orient yourself, then call phase_summary to understand the
-sequential execution phases (e.g., initialization, main computation, teardown). Phases can have
-very different performance characteristics — analyze the most time-consuming phases in depth.
-Global averages across all phases can be misleading; focus on phase-specific metrics.
+The profile_summary and phase_summary results have already been pre-loaded for you as the first
+tool-result exchange in this conversation — do not call those tools again.
 
 Work systematically within the dominant phases: kernels → memory → MPI (if present) → idle gaps.
 Use sql_query for any targeted follow-up that the structured tools don't cover.
+
+You may call multiple tools in a single response to gather data in parallel.
 
 When you have gathered enough evidence, output your final answer as a JSON array of hypothesis
 objects (not wrapped in markdown fences) and nothing else after it.
@@ -120,18 +120,55 @@ def _save_files(
 # API backend (ANTHROPIC_API_KEY)
 # ---------------------------------------------------------------------------
 
+def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
+    """Inject profile_summary and phase_summary results as the opening exchange.
+
+    This saves 2 API round-trips by reusing the already-computed ProfileSummary
+    instead of letting the agent call those tools from scratch.
+    """
+    profile_result = json.dumps({
+        "profile_span_s": summary.profile_span_s,
+        "gpu_kernel_s": summary.gpu_kernel_s,
+        "gpu_utilization_pct": summary.gpu_utilization_pct,
+        "mpi_present": summary.mpi_present,
+        "nvtx_present": bool(summary.nvtx_ranges),
+        "tables": sorted(profile.tables),
+    })
+    phase_result = json.dumps({
+        "phases": [p.model_dump() for p in summary.phases]
+    })
+    return [
+        {"role": "user", "content": "Begin analysis."},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "pre_1", "name": "profile_summary", "input": {}},
+                {"type": "tool_use", "id": "pre_2", "name": "phase_summary", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "pre_1", "content": profile_result},
+                {"type": "tool_result", "tool_use_id": "pre_2", "content": phase_result},
+            ],
+        },
+    ]
+
+
 def _run_api(
     profile: NsysProfile,
     *,
     model: str,
     max_turns: int,
     verbose: bool,
+    summary: ProfileSummary | None = None,
 ) -> list[dict[str, Any]]:
     import anthropic
 
     client = anthropic.Anthropic()
     schemas = tool_schemas()
-    messages: list[dict] = []
+    messages: list[dict] = _preseed_messages(profile, summary) if summary is not None else []
 
     for _ in range(max_turns):
         response = client.messages.create(
@@ -254,7 +291,7 @@ def run_agent(
 
     try:
         if os.environ.get("ANTHROPIC_API_KEY"):
-            hypotheses = _run_api(profile, model=model, max_turns=max_turns, verbose=verbose)
+            hypotheses = _run_api(profile, model=model, max_turns=max_turns, verbose=verbose, summary=summary)
         else:
             hypotheses = _run_claude_code(profile, verbose=verbose, summary=summary)
     finally:

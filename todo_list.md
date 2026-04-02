@@ -16,6 +16,7 @@ Prevent the model from leaking training knowledge into hypotheses:
 - **Grounding instruction in prompts**: add to both `_SYSTEM_PROMPT_API` and `_format_summary_prompt` in `nsight_agent/agent/loop.py`:
   
   > "Ground all hypotheses strictly in the provided numbers. Do not infer algorithm names, library internals, or solver types from prior knowledge. Describe only what the data shows."
+
 - **Evidence validation in post-processing**: after `_extract_hypotheses`, scan each `evidence` string and flag hypotheses that cite no specific numbers from the profile data as low-confidence. This does not require an additional LLM call.
 
 ## 3. Per-phase gap histogram
@@ -57,12 +58,30 @@ Implement the "Verification" step described in CLAUDE.md:
 - Add a `diff` subcommand to `__main__.py` that loads two hypothesis JSON files and shows which bottlenecks were resolved, which worsened, and which are new.
 - This enables tracking improvement across profiling iterations without re-running the full agent.
 
-## 8. Runtime performance (analysis speed)
+## 8. Runtime performance (analysis speed) ✓ DONE (2026-04-02)
 
-Currently the analyzer takes several minutes on a 2 GB profile. Likely causes and fixes:
+Profiled with `python -m cProfile -s cumulative -m nsight_agent summary <profile>` on the 565 MB
+test profile. Baseline: **18.9s** total (80 SQL queries). After fixes: **14.2s** (70 queries, −25%).
 
-- **Phase detection issues many fine-grained queries**: `_fingerprint()` and the per-phase helpers each issue separate SQL queries per phase window. Batch these into a single query with conditional aggregation or a `CASE`-based partition, reducing round-trips.
-- **SQLite WAL / page cache**: open the profile with `PRAGMA cache_size = -65536` (64 MB) and `PRAGMA mmap_size = 2147483648` (2 GB) in `NsysProfile.__init__`. For a 2 GB file this can eliminate repeated disk reads.
-- **Index creation**: add `CREATE INDEX IF NOT EXISTS idx_kernel_start ON CUPTI_ACTIVITY_KIND_KERNEL(start)` on first open. The window queries (`WHERE start >= X AND end <= Y`) do full table scans on an unindexed 2 GB table.
-- **Parallel phase computation**: `compute_phase_summary` is called sequentially per phase. Since each call is an independent set of SQL queries, run them in a `ThreadPoolExecutor` — SQLite read-only connections are safe to share across threads in WAL mode.
-- **Profile the profiler**: run `python -m cProfile -s cumulative -m nsight_agent summary <profile>` to identify which queries dominate before optimizing further.
+Changes made:
+
+- **Index creation** (`NsysProfile._ensure_indexes()`): on first open, creates
+  `idx_kernel_start ON CUPTI_ACTIVITY_KIND_KERNEL(start)` and equivalent indexes on all three MPI
+  tables (`MPI_COLLECTIVES_EVENTS`, `MPI_P2P_EVENTS`, `MPI_START_WAIT_EVENTS`). Done via a brief
+  writable connection before the read-only connection opens; silently skipped on read-only
+  filesystems. Eliminated full-table sorts for all range queries and `_fingerprint()` calls.
+
+- **SQLite PRAGMA tuning** (`NsysProfile.__init__`): `PRAGMA cache_size = -65536` (64 MB page
+  cache) and `PRAGMA mmap_size = 2147483648` (2 GB memory-mapped I/O) set on every connection.
+
+- **Single-pass MPI stats** (`_compute_all_mpi_stats()`): replaced the separate `compute_mpi_ops`
+  (global) + `_batch_window_mpi_ops` (per-phase) calls — which each did a full scan of 6.4M MPI
+  rows — with one query per MPI table using CASE-based conditional aggregation. Computes global
+  stats and all per-phase breakdowns simultaneously. MPI scan time: 10.75s → 7.96s.
+
+- **Self-profiling timers**: `compute_profile_summary` accepts an optional `timings` dict and
+  reports `phase_detection_s` and `metrics_s`. `cmd_analyze` times `run_agent` separately and
+  prints a timing breakdown table after hypotheses (suppressed by `--quiet` and `--json`).
+
+Remaining (not implemented): parallel `compute_phase_summary` calls via `ThreadPoolExecutor`
+(~1s potential saving on 6 phases; modest benefit on the current test profile).

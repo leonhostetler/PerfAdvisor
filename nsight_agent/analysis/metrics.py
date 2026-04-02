@@ -7,6 +7,8 @@ before querying, and optional tables (MPI, NVTX) degrade gracefully.
 
 from __future__ import annotations
 
+import time
+
 from nsight_agent.ingestion.profile import NsysProfile
 
 from .models import (
@@ -258,6 +260,90 @@ def compute_mpi_ops(profile: NsysProfile, limit: int = 10) -> list[MpiOpSummary]
     return sorted(seen.values(), key=lambda x: x.total_s, reverse=True)[:limit]
 
 
+def _compute_all_mpi_stats(
+    profile: NsysProfile,
+    phases: list[PhaseWindow],
+    global_limit: int = 10,
+    phase_limit: int = 5,
+) -> tuple[list[MpiOpSummary], list[list[MpiOpSummary]]]:
+    """Compute global and per-phase MPI stats in a single scan per table.
+
+    Replaces separate ``compute_mpi_ops`` + ``_batch_window_mpi_ops`` calls with
+    one query per MPI table using conditional aggregation (CASE WHEN per phase).
+    Saves ~50% of MPI scan time when computing both global and phase-level stats.
+
+    Returns ``(global_ops, per_phase_ops)`` where ``per_phase_ops[i]`` is the list
+    for ``phases[i]``.
+    """
+    if not profile.has_mpi():
+        return [], [[] for _ in phases]
+
+    # Build conditional-aggregation columns for each phase.
+    # We need COUNT, total_ns (for avg computation), and MAX per phase.
+    phase_cols = []
+    for i, p in enumerate(phases):
+        pred = f"e.start >= {p.start_ns} AND e.end <= {p.end_ns}"
+        phase_cols.append(f"""
+            COUNT(CASE WHEN {pred} THEN 1 END)                    AS p{i}_calls,
+            SUM(CASE WHEN {pred} THEN e.end - e.start ELSE 0 END) AS p{i}_sum_ns,
+            MAX(CASE WHEN {pred} THEN e.end - e.start ELSE 0 END) AS p{i}_max_ns
+        """)
+    extra_cols = ",\n".join(phase_cols)
+
+    global_seen: dict[str, MpiOpSummary] = {}
+    phase_ops: list[dict[str, MpiOpSummary]] = [{} for _ in phases]
+
+    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
+        if not profile.has_table(table):
+            continue
+        rows = profile.query(f"""
+            SELECT
+                s.value                         AS op,
+                COUNT(*)                        AS total_calls,
+                SUM(e.end - e.start) / 1e9     AS total_s,
+                AVG(e.end - e.start) / 1e6     AS avg_ms,
+                MAX(e.end - e.start) / 1e6     AS max_ms,
+                {extra_cols}
+            FROM {table} e
+            JOIN StringIds s ON e.textId = s.id
+            WHERE e.end IS NOT NULL
+            GROUP BY e.textId
+        """)
+        for r in rows:
+            op_name = r["op"]
+            # Global (deduplicate by highest total_s across tables)
+            if op_name not in global_seen or r["total_s"] > global_seen[op_name].total_s:
+                global_seen[op_name] = MpiOpSummary(
+                    op=op_name,
+                    calls=r["total_calls"],
+                    total_s=round(r["total_s"], 3),
+                    avg_ms=round(r["avg_ms"], 3),
+                    max_ms=round(r["max_ms"], 3),
+                )
+            # Per-phase
+            for i in range(len(phases)):
+                p_calls = r[f"p{i}_calls"] or 0
+                p_sum_ns = r[f"p{i}_sum_ns"] or 0
+                p_max_ns = r[f"p{i}_max_ns"] or 0
+                if p_calls == 0:
+                    continue
+                if op_name not in phase_ops[i] or p_sum_ns > (phase_ops[i][op_name].total_s * 1e9):
+                    phase_ops[i][op_name] = MpiOpSummary(
+                        op=op_name,
+                        calls=p_calls,
+                        total_s=round(p_sum_ns / 1e9, 3),
+                        avg_ms=round(p_sum_ns / p_calls / 1e6, 3),
+                        max_ms=round(p_max_ns / 1e6, 3),
+                    )
+
+    global_ops = sorted(global_seen.values(), key=lambda x: x.total_s, reverse=True)[:global_limit]
+    per_phase = [
+        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:phase_limit]
+        for d in phase_ops
+    ]
+    return global_ops, per_phase
+
+
 # ---------------------------------------------------------------------------
 # Per-phase metric helpers
 # ---------------------------------------------------------------------------
@@ -332,6 +418,68 @@ def _window_top_kernels(
     ]
 
 
+def _batch_window_mpi_ops(
+    profile: NsysProfile,
+    phases: list[PhaseWindow],
+    limit: int = 5,
+) -> list[list[MpiOpSummary]]:
+    """Fetch per-phase MPI op summaries for all phases in one query per table.
+
+    Replaces N_phases × N_tables separate queries with N_tables queries total,
+    using a CASE expression to assign each event to its phase in one pass.
+    Returns a list indexed by phase position.
+    """
+    if not profile.has_mpi() or not phases:
+        return [[] for _ in phases]
+
+    case_clauses = " ".join(
+        f"WHEN e.start >= {p.start_ns} AND e.end <= {p.end_ns} THEN {i}"
+        for i, p in enumerate(phases)
+    )
+    case_expr = f"CASE {case_clauses} ELSE -1 END"
+    overall_min = min(p.start_ns for p in phases)
+    overall_max = max(p.end_ns for p in phases)
+
+    # phase_ops[i] maps op_name -> MpiOpSummary for phase i
+    phase_ops: list[dict[str, MpiOpSummary]] = [{} for _ in phases]
+
+    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
+        if not profile.has_table(table):
+            continue
+        rows = profile.query(f"""
+            SELECT
+                {case_expr}                     AS phase_idx,
+                s.value                         AS op,
+                COUNT(*)                        AS calls,
+                SUM(e.end - e.start) / 1e9     AS total_s,
+                AVG(e.end - e.start) / 1e6     AS avg_ms,
+                MAX(e.end - e.start) / 1e6     AS max_ms
+            FROM {table} e
+            JOIN StringIds s ON e.textId = s.id
+            WHERE e.start >= {overall_min} AND e.end <= {overall_max}
+              AND e.end IS NOT NULL
+            GROUP BY phase_idx, e.textId
+            HAVING phase_idx >= 0
+            ORDER BY phase_idx, total_s DESC
+        """)
+        for r in rows:
+            pidx = int(r["phase_idx"])
+            op_name = r["op"]
+            if op_name not in phase_ops[pidx]:
+                phase_ops[pidx][op_name] = MpiOpSummary(
+                    op=op_name,
+                    calls=r["calls"],
+                    total_s=round(r["total_s"], 3),
+                    avg_ms=round(r["avg_ms"], 3),
+                    max_ms=round(r["max_ms"], 3),
+                )
+
+    return [
+        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:limit]
+        for d in phase_ops
+    ]
+
+
 def _window_mpi_ops(
     profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 5
 ) -> list[MpiOpSummary]:
@@ -376,13 +524,22 @@ def compute_phase_summary(
     profile: NsysProfile,
     phase: PhaseWindow,
     profile_start_ns: int,
+    *,
+    mpi_ops: list[MpiOpSummary] | None = None,
 ) -> PhaseSummary:
-    """Compute full metrics for a single PhaseWindow."""
+    """Compute full metrics for a single PhaseWindow.
+
+    Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra query when
+    all phases are processed together via _batch_window_mpi_ops).
+    """
     kernel_s = _window_kernel_time(profile, phase.start_ns, phase.end_ns)
     memcpy_s = _window_memcpy_time(profile, phase.start_ns, phase.end_ns)
     idle_s = _window_idle_time(profile, phase.start_ns, phase.end_ns)
     duration_s = (phase.end_ns - phase.start_ns) / 1e9
     start_s = (phase.start_ns - profile_start_ns) / 1e9
+
+    if mpi_ops is None:
+        mpi_ops = _window_mpi_ops(profile, phase.start_ns, phase.end_ns)
 
     return PhaseSummary(
         name=phase.name,
@@ -394,7 +551,7 @@ def compute_phase_summary(
         gpu_memcpy_s=round(memcpy_s, 3),
         total_gpu_idle_s=round(idle_s, 3),
         top_kernels=_window_top_kernels(profile, phase.start_ns, phase.end_ns, kernel_s),
-        mpi_ops=_window_mpi_ops(profile, phase.start_ns, phase.end_ns),
+        mpi_ops=mpi_ops,
     )
 
 
@@ -403,23 +560,40 @@ def compute_phase_summary(
 # ---------------------------------------------------------------------------
 
 
-def compute_profile_summary(profile: NsysProfile, max_phases: int = 6) -> ProfileSummary:
+def compute_profile_summary(
+    profile: NsysProfile,
+    max_phases: int = 6,
+    timings: dict[str, float] | None = None,
+) -> ProfileSummary:
     """Compute all metrics for a profile and return a ProfileSummary.
 
     Set max_phases=1 to skip phase segmentation (returns a single phase).
+    Pass a dict as ``timings`` to receive a breakdown:
+    ``{"phase_detection_s": ..., "metrics_s": ...}``.
     """
+    t_start = time.perf_counter()
+
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
     memcpy_s = compute_gpu_memcpy_time(profile)
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
 
+    t_phase = time.perf_counter()
     phases_windows = detect_phases(profile, max_phases=max_phases)
+    t_phase_done = time.perf_counter()
+
     profile_start_ns = phases_windows[0].start_ns if phases_windows else 0
+    global_mpi_ops, all_phase_mpi = _compute_all_mpi_stats(profile, phases_windows)
     phase_summaries = [
-        compute_phase_summary(profile, pw, profile_start_ns)
-        for pw in phases_windows
+        compute_phase_summary(profile, pw, profile_start_ns, mpi_ops=all_phase_mpi[i])
+        for i, pw in enumerate(phases_windows)
     ]
+
+    if timings is not None:
+        t_end = time.perf_counter()
+        timings["phase_detection_s"] = t_phase_done - t_phase
+        timings["metrics_s"] = (t_end - t_start) - (t_phase_done - t_phase)
 
     return ProfileSummary(
         profile_path=str(profile.path),
@@ -434,7 +608,7 @@ def compute_profile_summary(profile: NsysProfile, max_phases: int = 6) -> Profil
         memcpy_by_kind=compute_memcpy_by_kind(profile),
         streams=compute_streams(profile),
         nvtx_ranges=compute_nvtx_ranges(profile),
-        mpi_ops=compute_mpi_ops(profile),
+        mpi_ops=global_mpi_ops,
         mpi_present=profile.has_mpi(),
         phases=phase_summaries,
     )

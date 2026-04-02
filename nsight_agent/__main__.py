@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -13,13 +14,35 @@ from rich.table import Table
 console = Console()
 
 
+def _print_timings(timings: dict[str, float]) -> None:
+    total = sum(timings.values())
+    if total <= 0:
+        return
+    t = Table(title="Timing breakdown", show_header=True, show_footer=False)
+    t.add_column("Stage")
+    t.add_column("Time (s)", justify="right")
+    t.add_column("%", justify="right", style="dim")
+    labels = [
+        ("phase_detection_s", "Phase detection"),
+        ("metrics_s", "Metrics / analysis"),
+        ("agent_s", "AI correspondence"),
+    ]
+    for key, label in labels:
+        if key in timings:
+            s = timings[key]
+            t.add_row(label, f"{s:.1f}", f"{100 * s / total:.0f}%")
+    t.add_row("[bold]Total[/bold]", f"[bold]{total:.1f}[/bold]", "")
+    console.print(t)
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.agent.loop import run_agent
     from nsight_agent.analysis.metrics import compute_profile_summary
     from nsight_agent.ingestion.profile import NsysProfile
 
+    timings: dict[str, float] = {}
     with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(profile, max_phases=args.max_phases)
+        summary = compute_profile_summary(profile, max_phases=args.max_phases, timings=timings)
 
     if not args.quiet and summary.phases:
         ph = Table(title="Detected Execution Phases")
@@ -42,7 +65,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print(summary.model_dump_json(indent=2))
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
-    hypotheses = run_agent(args.profile, summary=summary, verbose=not args.quiet)
+    t_agent = time.perf_counter()
+    hypotheses = run_agent(args.profile, summary=summary, verbose=not args.quiet, model=args.model)
+    timings["agent_s"] = time.perf_counter() - t_agent
 
     if args.json:
         print(json.dumps(hypotheses, indent=2))
@@ -68,6 +93,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         )
 
     console.print(table)
+
+    if not args.quiet:
+        _print_timings(timings)
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -133,6 +161,13 @@ def main() -> None:
     p_analyze.add_argument(
         "--max-phases", type=int, default=6,
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+    )
+    p_analyze.add_argument(
+        "--model", default="claude-opus-4-6",
+        help=(
+            "Claude model for hypothesis generation (default: claude-opus-4-6). "
+            "Use claude-sonnet-4-6 for 2-3x faster analysis at similar quality."
+        ),
     )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")

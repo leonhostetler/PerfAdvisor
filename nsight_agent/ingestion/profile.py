@@ -15,14 +15,48 @@ class NsysProfile:
     use resolve_string() or the join helpers to get human-readable names.
     """
 
+    # Indexes to create on first open. Each entry: (table_name, index_ddl).
+    _INDEX_DDLS: list[tuple[str, str]] = [
+        ("CUPTI_ACTIVITY_KIND_KERNEL",
+         "CREATE INDEX IF NOT EXISTS idx_kernel_start ON CUPTI_ACTIVITY_KIND_KERNEL(start)"),
+        ("MPI_COLLECTIVES_EVENTS",
+         "CREATE INDEX IF NOT EXISTS idx_mpi_coll_start ON MPI_COLLECTIVES_EVENTS(start)"),
+        ("MPI_P2P_EVENTS",
+         "CREATE INDEX IF NOT EXISTS idx_mpi_p2p_start ON MPI_P2P_EVENTS(start)"),
+        ("MPI_START_WAIT_EVENTS",
+         "CREATE INDEX IF NOT EXISTS idx_mpi_swe_start ON MPI_START_WAIT_EVENTS(start)"),
+    ]
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"Profile not found: {self.path}")
+        self._ensure_indexes()
         self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA cache_size = -65536")    # 64 MB page cache
+        self._conn.execute("PRAGMA mmap_size = 2147483648")  # 2 GB memory-mapped I/O
         self._tables: set[str] | None = None
         self._string_cache: dict[int, str] = {}
+
+    def _ensure_indexes(self) -> None:
+        """Create query-accelerating indexes if not present.
+
+        Opens a brief writable connection to add indexes to the exported SQLite.
+        Silently skips if the file is on a read-only filesystem or the DB is locked.
+        """
+        try:
+            conn = sqlite3.connect(str(self.path), timeout=5)
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            for table, ddl in self._INDEX_DDLS:
+                if table in tables:
+                    conn.execute(ddl)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # Read-only filesystem, WAL contention, or locked — skip silently
 
     # ------------------------------------------------------------------
     # Schema introspection
