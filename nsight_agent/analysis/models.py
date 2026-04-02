@@ -22,6 +22,8 @@ class KernelSummary(BaseModel):
     avg_registers_per_thread: int = 0
     avg_shared_mem_bytes: int = 0
     estimated_occupancy: float | None = Field(default=None, description="Estimated wave occupancy (0–1): avg launch threads / (SM count × max threads per SM)")
+    avg_launch_overhead_us: float | None = Field(default=None, description="Avg CPU-to-GPU enqueue latency in µs: time from cudaLaunchKernel on CPU to kernel start on GPU")
+    max_launch_overhead_us: float | None = Field(default=None, description="Max CPU-to-GPU enqueue latency in µs across all launches of this kernel")
 
 
 class MemcpySummary(BaseModel):
@@ -105,6 +107,10 @@ class ProfileSummary(BaseModel):
 
     # GPU hardware info (from TARGET_INFO_GPU, absent in older profiles)
     peak_memory_bandwidth_GBs: float | None = Field(default=None, description="Device peak memory bandwidth in GB/s (from TARGET_INFO_GPU.memoryBandwidth)")
+
+    # CPU–GPU overlap (absent if CUPTI_ACTIVITY_KIND_RUNTIME is not captured)
+    cpu_sync_blocked_s: float | None = Field(default=None, description="Total CPU time spent in CUDA sync calls (*Synchronize) during the profile")
+    cpu_sync_blocked_pct: float | None = Field(default=None, description="cpu_sync_blocked_s as a fraction of total GPU kernel time (0–100); high value means GPU is being serialized by CPU sync barriers")
 
     # MPI (absent if profile has no MPI tables)
     mpi_ops: list[MpiOpSummary] = Field(default_factory=list)

@@ -35,12 +35,21 @@ Changes made:
 - **`nsight_agent/analysis/models.py`**: Added `gap_histogram: list[GapBucket] = Field(default_factory=list)` to `PhaseSummary`.
 - **`nsight_agent/analysis/metrics.py`**: Changed `_window_idle_time` signature from `→ float` to `→ tuple[float, list[GapBucket]]`. Now uses the same CASE-based bucketing as `compute_gap_histogram` (6 buckets: `<10us` through `>100ms`), scoped to the phase window. Updated `compute_phase_summary` to unpack both and pass `gap_histogram` to `PhaseSummary`.
 
-## 4. CPU–GPU overlap metrics
+## 4. CPU–GPU overlap metrics ✓ DONE (2026-04-02)
 
 Add structured metrics for CPU-side behavior during GPU execution, using `CUPTI_ACTIVITY_KIND_RUNTIME`:
 
-- **CPU launch overhead**: time from `cudaLaunchKernel` API call on CPU to kernel `start` on GPU (enqueue latency). Expose as avg and max per kernel.
-- **CPU utilization during GPU execution**: fraction of GPU-active time where the CPU thread is busy vs. blocked (e.g., in `cudaDeviceSynchronize` or `MPI_Barrier`). A low fraction means GPU execution is being serialized by CPU synchronization points.
+Changes made:
+
+- **`nsight_agent/analysis/models.py`**: Added `avg_launch_overhead_us` and `max_launch_overhead_us` (both `float | None`) to `KernelSummary`. Added `cpu_sync_blocked_s` and `cpu_sync_blocked_pct` (`float | None`) to `ProfileSummary`.
+
+- **`nsight_agent/analysis/metrics.py`**: Added `_compute_launch_overhead(profile)` — joins `CUPTI_ACTIVITY_KIND_KERNEL` with `CUPTI_ACTIVITY_KIND_RUNTIME` on `correlationId`, computes avg/max `(k.start − rt.start)` per kernel name. Added `compute_cpu_sync_time(profile, gpu_kernel_s)` — sums time in `*Synchronize` API calls (nameId → StringIds join) and expresses it as a % of GPU kernel time. Both degrade gracefully to `{}` / `(None, None)` if RUNTIME table is absent. Updated `compute_top_kernels`, `_window_top_kernels`, `compute_phase_summary`, and `compute_profile_summary` to thread `launch_overhead` through and populate all new fields.
+
+Sample values on test profile (A100, CG run):
+
+- `Kernel3D`: avg launch overhead = 73.7µs, max = 39.2ms (high max suggests occasional GPU stalls)
+- `Reduction2D`: avg = 6.2µs (well-pipelined, low overhead)
+- CPU sync blocked: 5.0s = **20.5% of GPU kernel time** (cuEventSynchronize dominates at 86K calls)
 
 ## 5. Multi-rank comparison
 
