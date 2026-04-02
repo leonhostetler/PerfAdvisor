@@ -19,6 +19,12 @@ dev = [
     "pytest-cov",
     "ruff>=0.4",
 ]
+openai = [
+    "openai>=1.0",
+]
+gemini = [
+    "google-generativeai>=0.5",
+]
 
 [project.scripts]
 nsight-agent = "nsight_agent.__main__:main"

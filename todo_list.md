@@ -103,14 +103,14 @@ Changes made:
 Remaining (not implemented): parallel `compute_phase_summary` calls via `ThreadPoolExecutor`
 (~1s potential saving on 6 phases; modest benefit on the current test profile).
 
-## 9. Multi-provider LLM support (OpenAI, Gemini)
+## 9. Multi-provider LLM support (OpenAI, Gemini) ✓ DONE (2026-04-02)
 
-Extend the agent loop to support inference backends beyond the Anthropic API:
+Extend the agent loop to support inference backends beyond the Anthropic API.
 
-- Add a `--provider` flag to `nsight_agent/__main__.py` accepting `anthropic` (default), `openai`, and `gemini`. Wire through to `run_agent()` and `_run_api()`.
-- Abstract the inference call in `nsight_agent/agent/loop.py` behind a thin provider interface so each backend can translate the shared tool-use conversation format into provider-specific API calls. Key differences to handle:
-  - OpenAI uses `openai.OpenAI()` with `client.chat.completions.create(tools=..., tool_choice=...)` — tool schemas are compatible with OpenAI's function-calling format but need `"type": "function"` wrappers.
-  - Gemini uses `google-generativeai` with `genai.GenerativeModel(...).start_chat()` — function declarations use a different schema format; multi-turn state is managed via a chat session rather than a messages list.
-- Pre-seeding (`_preseed_messages`) is Anthropic-specific; each provider backend should handle its own conversation initialization.
-- Add optional dependencies to `pyproject.toml`: `openai` and `google-generativeai` (both optional extras).
-- The `--model` flag should accept provider-prefixed model IDs (e.g., `openai:gpt-4o`, `gemini:gemini-2.0-flash`) to make the provider unambiguous when `--provider` is omitted.
+Changes made:
+
+- **`nsight_agent/agent/loop.py`**: Added `_parse_provider_and_model()` — resolves (provider, model_id) from optional prefix in model string, explicit `--provider`, then auto-detects from env vars (ANTHROPIC → OPENAI → GOOGLE). Added `_schemas_to_openai()` — wraps Anthropic tool schemas in `{"type":"function","function":{...}}`. Added `_preseed_messages_openai()` — injects pre-computed summaries as OpenAI-format tool call/result pairs. Added `_run_openai()` — OpenAI function-calling loop using `client.chat.completions.create`; serializes messages to dict for history. Added `_run_gemini()` — Gemini `start_chat()` loop using `google-generativeai`; pre-seeding not supported so summary is injected into the initial user message; function responses sent via `genai.protos.FunctionResponse`. Updated `run_agent()` to accept `provider: str | None`, route through `_parse_provider_and_model`, and dispatch to the correct backend.
+
+- **`nsight_agent/__main__.py`**: Added `--provider {anthropic,openai,gemini}` flag to `p_analyze`. Updated `--model` help text to document provider-prefix syntax. Threaded `provider=args.provider` through to `run_agent()`.
+
+- **`pyproject.toml`**: Added optional extras `openai` (`openai>=1.0`) and `gemini` (`google-generativeai>=0.5`). Install with `pip install 'nsight-agent[openai]'` or `pip install 'nsight-agent[gemini]'`.

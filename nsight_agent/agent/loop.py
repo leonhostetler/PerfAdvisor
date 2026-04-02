@@ -1,12 +1,19 @@
-"""Agent loop: drives Claude to analyze a profile and produce hypotheses.
+"""Agent loop: drives an LLM to analyze a profile and produce hypotheses.
 
-Two backends are supported:
-  - API backend (default when ANTHROPIC_API_KEY is set): multi-turn tool-use loop
-    via the Anthropic SDK. Claude can issue follow-up SQL queries and drill down.
-  - Claude Code backend (fallback): pre-computes the full ProfileSummary and sends
-    it in a single prompt to `claude -p` via subprocess. No API key required.
+Three backends are supported:
+  - anthropic (default when ANTHROPIC_API_KEY is set): multi-turn tool-use loop
+    via the Anthropic SDK. Supports pre-seeding to skip 2 round-trips.
+  - openai (when OPENAI_API_KEY is set): OpenAI function-calling format.
+    Uses the same tool schemas, translated to OpenAI's "type":"function" wrapper.
+  - gemini (when GOOGLE_API_KEY is set): Google GenerativeAI function declarations.
+    Summary is injected into the initial message rather than pre-seeded.
+  - claude_code (fallback): pre-computes the full ProfileSummary and sends it to
+    `claude -p` via subprocess. No API key required.
 
-Both backends save the prompt and raw response to files next to the profile:
+Select a provider explicitly with --provider, or prefix the model ID:
+  openai:gpt-4o, gemini:gemini-2.0-flash, anthropic:claude-opus-4-6
+
+Both prompt and raw response are saved next to the profile:
   {profile_stem}_{timestamp}_prompt.txt
   {profile_stem}_{timestamp}_response.txt
 """
@@ -27,6 +34,8 @@ from nsight_agent.ingestion.profile import NsysProfile
 
 MODEL = "claude-opus-4-6"
 MAX_TURNS = 20
+
+_KNOWN_PROVIDERS = ("anthropic", "openai", "gemini")
 
 _HYPOTHESIS_SCHEMA = """\
 Each hypothesis object must have these fields:
@@ -98,7 +107,7 @@ def _save_files(
     response: str,
     verbose: bool,
 ) -> tuple[Path, Path]:
-    """Save prompt and response to files next to the profile. Returns (prompt_path, response_path)."""
+    """Save prompt and response to files next to the profile."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = profile_path.stem
     out_dir = profile_path.parent
@@ -116,15 +125,60 @@ def _save_files(
     return prompt_path, response_path
 
 
+def _parse_provider_and_model(provider: str | None, model: str) -> tuple[str, str]:
+    """Resolve (provider, model_id) from explicit --provider and model string.
+
+    Model strings may carry a provider prefix: "openai:gpt-4o", "gemini:gemini-2.0-flash".
+    Resolution order:
+      1. Provider prefix in model string (e.g. "openai:gpt-4o")
+      2. Explicit --provider flag
+      3. Auto-detect from available API keys (ANTHROPIC > OPENAI > GOOGLE)
+      4. Fall back to claude_code subprocess
+    """
+    for p in _KNOWN_PROVIDERS:
+        if model.startswith(f"{p}:"):
+            return p, model[len(p) + 1:]
+
+    if provider:
+        return provider, model
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic", model
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai", model
+    if os.environ.get("GOOGLE_API_KEY"):
+        return "gemini", model
+
+    return "claude_code", model
+
+
 # ---------------------------------------------------------------------------
-# API backend (ANTHROPIC_API_KEY)
+# Schema translation helpers
+# ---------------------------------------------------------------------------
+
+def _schemas_to_openai(schemas: list[dict]) -> list[dict]:
+    """Wrap Anthropic tool schemas in OpenAI's {"type":"function","function":{...}} envelope."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": s["name"],
+                "description": s["description"],
+                "parameters": s["input_schema"],
+            },
+        }
+        for s in schemas
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic backend
 # ---------------------------------------------------------------------------
 
 def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
     """Inject profile_summary and phase_summary results as the opening exchange.
 
-    This saves 2 API round-trips by reusing the already-computed ProfileSummary
-    instead of letting the agent call those tools from scratch.
+    Saves 2 API round-trips by reusing the already-computed ProfileSummary.
     """
     profile_result = json.dumps({
         "profile_span_s": summary.profile_span_s,
@@ -192,14 +246,12 @@ def _run_api(
                 if hasattr(block, "text"):
                     hypotheses = _extract_hypotheses(block.text)
                     if hypotheses:
-                        # Save: prompt = system prompt + full message history
                         prompt_record = (
                             f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
                             f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
                             f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                         )
-                        response_record = block.text
-                        _save_files(profile.path, prompt_record, response_record, verbose)
+                        _save_files(profile.path, prompt_record, block.text, verbose)
                         return hypotheses
             return []
 
@@ -221,6 +273,230 @@ def _run_api(
 
 
 # ---------------------------------------------------------------------------
+# OpenAI backend
+# ---------------------------------------------------------------------------
+
+def _preseed_messages_openai(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
+    """Inject pre-computed profile/phase summaries in OpenAI's tool-call format."""
+    profile_result = json.dumps({
+        "profile_span_s": summary.profile_span_s,
+        "gpu_kernel_s": summary.gpu_kernel_s,
+        "gpu_utilization_pct": summary.gpu_utilization_pct,
+        "mpi_present": summary.mpi_present,
+        "nvtx_present": bool(summary.nvtx_ranges),
+        "tables": sorted(profile.tables),
+    })
+    phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
+    return [
+        {"role": "user", "content": "Begin analysis."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "pre_1", "type": "function",
+                 "function": {"name": "profile_summary", "arguments": "{}"}},
+                {"id": "pre_2", "type": "function",
+                 "function": {"name": "phase_summary", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "pre_1", "content": profile_result},
+        {"role": "tool", "tool_call_id": "pre_2", "content": phase_result},
+    ]
+
+
+def _run_openai(
+    profile: NsysProfile,
+    *,
+    model: str,
+    max_turns: int,
+    verbose: bool,
+    summary: ProfileSummary | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError(
+            "openai package is required for the OpenAI backend: "
+            "pip install 'nsight-agent[openai]'"
+        )
+
+    client = OpenAI()
+    schemas = tool_schemas()
+    openai_tools = _schemas_to_openai(schemas)
+    messages: list[dict] = (
+        _preseed_messages_openai(profile, summary) if summary is not None
+        else [{"role": "user", "content": "Begin analysis."}]
+    )
+    # Prepend system prompt as a system message
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT_API}] + messages
+
+    for _ in range(max_turns):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+            max_tokens=4096,
+        )
+        choice = response.choices[0]
+        msg = choice.message
+
+        # Serialize to dict for the history (SDK objects aren't JSON-serializable)
+        msg_dict: dict[str, Any] = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ]
+        messages.append(msg_dict)
+
+        if verbose:
+            if msg.content:
+                print(f"[agent] {msg.content[:200]}{'...' if len(msg.content) > 200 else ''}")
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    print(f"[tool ] {tc.function.name}({tc.function.arguments[:120]})")
+
+        if choice.finish_reason == "stop":
+            hypotheses = _extract_hypotheses(msg.content or "")
+            if hypotheses:
+                prompt_record = (
+                    f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                    f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
+                )
+                _save_files(profile.path, prompt_record, msg.content or "", verbose)
+                return hypotheses
+            return []
+
+        # finish_reason == "tool_calls"
+        for tc in (msg.tool_calls or []):
+            result_json = dispatch(profile, tc.function.name, json.loads(tc.function.arguments))
+            if verbose:
+                print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result_json,
+            })
+
+    raise RuntimeError(f"Agent did not finish within {max_turns} turns")
+
+
+# ---------------------------------------------------------------------------
+# Gemini backend
+# ---------------------------------------------------------------------------
+
+def _run_gemini(
+    profile: NsysProfile,
+    *,
+    model: str,
+    max_turns: int,
+    verbose: bool,
+    summary: ProfileSummary | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        import google.generativeai as genai
+        from google.generativeai.types import FunctionDeclaration, Tool as GeminiTool
+    except ImportError:
+        raise ImportError(
+            "google-generativeai package is required for the Gemini backend: "
+            "pip install 'nsight-agent[gemini]'"
+        )
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY environment variable is not set for Gemini backend")
+    genai.configure(api_key=api_key)
+
+    schemas = tool_schemas()
+    declarations = [
+        FunctionDeclaration(
+            name=s["name"],
+            description=s["description"],
+            parameters=s["input_schema"],
+        )
+        for s in schemas
+    ]
+    gemini_model = genai.GenerativeModel(
+        model_name=model,
+        tools=[GeminiTool(function_declarations=declarations)],
+        system_instruction=_SYSTEM_PROMPT_API,
+    )
+    chat = gemini_model.start_chat()
+
+    # Gemini doesn't support injecting pre-computed tool results into history;
+    # include the pre-computed summary directly in the initial user message.
+    if summary is not None:
+        profile_result = json.dumps({
+            "profile_span_s": summary.profile_span_s,
+            "gpu_kernel_s": summary.gpu_kernel_s,
+            "gpu_utilization_pct": summary.gpu_utilization_pct,
+            "mpi_present": summary.mpi_present,
+            "nvtx_present": bool(summary.nvtx_ranges),
+            "tables": sorted(profile.tables),
+        })
+        phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
+        init_msg = (
+            "Begin analysis. Pre-computed profile data is provided below.\n\n"
+            f"profile_summary:\n{profile_result}\n\n"
+            f"phase_summary:\n{phase_result}"
+        )
+    else:
+        init_msg = "Begin analysis."
+
+    response = chat.send_message(init_msg)
+
+    for _ in range(max_turns):
+        function_calls = [
+            p.function_call for p in response.parts
+            if getattr(p, "function_call", None) and p.function_call.name
+        ]
+
+        if verbose:
+            for p in response.parts:
+                if getattr(p, "text", None):
+                    print(f"[agent] {p.text[:200]}{'...' if len(p.text) > 200 else ''}")
+                fc = getattr(p, "function_call", None)
+                if fc and fc.name:
+                    print(f"[tool ] {fc.name}({dict(fc.args)})")
+
+        if not function_calls:
+            text = "".join(
+                p.text for p in response.parts if getattr(p, "text", None)
+            )
+            hypotheses = _extract_hypotheses(text)
+            if hypotheses:
+                prompt_record = (
+                    f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                    f"=== INITIAL MESSAGE ===\n{init_msg}"
+                )
+                _save_files(profile.path, prompt_record, text, verbose)
+                return hypotheses
+            return []
+
+        function_responses = []
+        for fc in function_calls:
+            result_json = dispatch(profile, fc.name, dict(fc.args))
+            if verbose:
+                print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
+            function_responses.append(
+                genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name=fc.name,
+                        response={"result": json.loads(result_json)},
+                    )
+                )
+            )
+        response = chat.send_message(function_responses)
+
+    raise RuntimeError(f"Agent did not finish within {max_turns} turns")
+
+
+# ---------------------------------------------------------------------------
 # Claude Code backend (subprocess, no API key needed)
 # ---------------------------------------------------------------------------
 
@@ -231,7 +507,7 @@ def _run_claude_code(
     summary: ProfileSummary | None = None,
 ) -> list[dict[str, Any]]:
     if verbose:
-        print("[agent] No ANTHROPIC_API_KEY found — falling back to Claude Code (claude -p)")
+        print("[agent] No API key found — falling back to Claude Code (claude -p)")
 
     if summary is None:
         if verbose:
@@ -272,26 +548,45 @@ def run_agent(
     profile_path: str | Path,
     *,
     model: str = MODEL,
+    provider: str | None = None,
     max_turns: int = MAX_TURNS,
     verbose: bool = True,
     summary: ProfileSummary | None = None,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
-    Uses the Anthropic API (multi-turn tool-use) when ANTHROPIC_API_KEY is set,
-    otherwise falls back to `claude -p` via subprocess.
+    Provider selection order:
+      1. Provider prefix in model string (e.g. "openai:gpt-4o")
+      2. Explicit `provider` argument (or --provider CLI flag)
+      3. Auto-detect from ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY
+      4. Fall back to `claude -p` subprocess (no API key required)
 
     Pass a pre-computed `summary` to avoid recomputing it (e.g. when the caller
     already computed it for display purposes).
     """
+    resolved_provider, resolved_model = _parse_provider_and_model(provider, model)
+
     profile = NsysProfile(profile_path)
 
     if verbose:
-        print(f"[agent] Analyzing {profile.path.name}")
+        print(f"[agent] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
 
     try:
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            hypotheses = _run_api(profile, model=model, max_turns=max_turns, verbose=verbose, summary=summary)
+        if resolved_provider == "anthropic":
+            hypotheses = _run_api(
+                profile, model=resolved_model, max_turns=max_turns,
+                verbose=verbose, summary=summary,
+            )
+        elif resolved_provider == "openai":
+            hypotheses = _run_openai(
+                profile, model=resolved_model, max_turns=max_turns,
+                verbose=verbose, summary=summary,
+            )
+        elif resolved_provider == "gemini":
+            hypotheses = _run_gemini(
+                profile, model=resolved_model, max_turns=max_turns,
+                verbose=verbose, summary=summary,
+            )
         else:
             hypotheses = _run_claude_code(profile, verbose=verbose, summary=summary)
     finally:

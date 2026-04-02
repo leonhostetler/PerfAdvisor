@@ -66,7 +66,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
     t_agent = time.perf_counter()
-    hypotheses = run_agent(args.profile, summary=summary, verbose=not args.quiet, model=args.model)
+    hypotheses = run_agent(
+        args.profile, summary=summary, verbose=not args.quiet,
+        model=args.model, provider=args.provider,
+    )
     timings["agent_s"] = time.perf_counter() - t_agent
 
     if args.json:
@@ -165,8 +168,17 @@ def main() -> None:
     p_analyze.add_argument(
         "--model", default="claude-opus-4-6",
         help=(
-            "Claude model for hypothesis generation (default: claude-opus-4-6). "
-            "Use claude-sonnet-4-6 for 2-3x faster analysis at similar quality."
+            "Model for hypothesis generation (default: claude-opus-4-6). "
+            "Use a provider prefix to select the backend implicitly: "
+            "openai:gpt-4o, gemini:gemini-2.0-flash, anthropic:claude-opus-4-6."
+        ),
+    )
+    p_analyze.add_argument(
+        "--provider", default=None,
+        choices=["anthropic", "openai", "gemini"],
+        help=(
+            "LLM provider to use (default: auto-detected from available API keys). "
+            "Overridden by a provider prefix in --model."
         ),
     )
 
