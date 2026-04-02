@@ -979,6 +979,12 @@ Would it be easy and non-intrusive (for the general user of this analyzer) if th
 
 Claude assured me that it's a simple change that would be invisible to the end user, so I told it to go ahead and make the change.
 
-Next, I had Claude implement a few more of the items on our todo list including the multi-provider support.
+Next, I had Claude implement a few more of the items on our todo list including the multi-provider support. Finally, I asked Claude to add a readme:
+
+```
+Please create a README.md for the end user. It should include an overview of how it works (highlighting which parts do or do not query the LLM), how to use it (including various use cases like different providers, setting the max phases, etc.). Include also information on token expenditure and how to minimize token expenditure if desired.
+```
+
+
 
 
