@@ -65,10 +65,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print(summary.model_dump_json(indent=2))
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
+    token_usage: dict[str, int | None] = {}
     t_agent = time.perf_counter()
     hypotheses = run_agent(
         args.profile, summary=summary, verbose=not args.quiet,
-        model=args.model, provider=args.provider,
+        model=args.model, provider=args.provider, token_usage=token_usage,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
 
@@ -99,6 +100,17 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         _print_timings(timings)
+        inp = token_usage.get("input_tokens")
+        out = token_usage.get("output_tokens")
+        if inp is not None and out is not None:
+            cost = token_usage.get("cost_usd")
+            cost_str = f"  Cost: [yellow]${cost:.4f}[/yellow]" if cost is not None else ""
+            console.print(
+                f"  Tokens: [cyan]{inp:,}[/cyan] in / [cyan]{out:,}[/cyan] out"
+                f"  ([dim]{inp + out:,} total[/dim]){cost_str}"
+            )
+        else:
+            console.print("  Tokens: [dim]N/A[/dim]")
 
 
 def cmd_summary(args: argparse.Namespace) -> None:

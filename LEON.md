@@ -985,6 +985,16 @@ Next, I had Claude implement a few more of the items on our todo list including 
 Please create a README.md for the end user. It should include an overview of how it works (highlighting which parts do or do not query the LLM), how to use it (including various use cases like different providers, setting the max phases, etc.). Include also information on token expenditure and how to minimize token expenditure if desired.
 ```
 
+After creating the README, I asked Claude to implement also token reporting to report the input and output tokens used after the end of a run.
+
+
+
+
+
+
+
+
+
 
 
 

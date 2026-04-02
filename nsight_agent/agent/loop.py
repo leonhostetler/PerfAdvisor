@@ -217,12 +217,14 @@ def _run_api(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     import anthropic
 
     client = anthropic.Anthropic()
     schemas = tool_schemas()
     messages: list[dict] = _preseed_messages(profile, summary) if summary is not None else []
+    input_tokens = 0
+    output_tokens = 0
 
     for _ in range(max_turns):
         response = client.messages.create(
@@ -232,6 +234,8 @@ def _run_api(
             tools=schemas,
             messages=messages,
         )
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
         messages.append({"role": "assistant", "content": response.content})
 
         if verbose:
@@ -252,8 +256,8 @@ def _run_api(
                             f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                         )
                         _save_files(profile.path, prompt_record, block.text, verbose)
-                        return hypotheses
-            return []
+                        return hypotheses, input_tokens, output_tokens
+            return [], input_tokens, output_tokens
 
         tool_results = []
         for block in response.content:
@@ -311,7 +315,7 @@ def _run_openai(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     try:
         from openai import OpenAI
     except ImportError:
@@ -329,6 +333,8 @@ def _run_openai(
     )
     # Prepend system prompt as a system message
     messages = [{"role": "system", "content": _SYSTEM_PROMPT_API}] + messages
+    input_tokens = 0
+    output_tokens = 0
 
     for _ in range(max_turns):
         response = client.chat.completions.create(
@@ -338,6 +344,9 @@ def _run_openai(
             tool_choice="auto",
             max_tokens=4096,
         )
+        if response.usage:
+            input_tokens += response.usage.prompt_tokens
+            output_tokens += response.usage.completion_tokens
         choice = response.choices[0]
         msg = choice.message
 
@@ -369,8 +378,8 @@ def _run_openai(
                     f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                 )
                 _save_files(profile.path, prompt_record, msg.content or "", verbose)
-                return hypotheses
-            return []
+                return hypotheses, input_tokens, output_tokens
+            return [], input_tokens, output_tokens
 
         # finish_reason == "tool_calls"
         for tc in (msg.tool_calls or []):
@@ -397,7 +406,7 @@ def _run_gemini(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     try:
         import google.generativeai as genai
         from google.generativeai.types import FunctionDeclaration, Tool as GeminiTool
@@ -448,7 +457,18 @@ def _run_gemini(
     else:
         init_msg = "Begin analysis."
 
+    input_tokens = 0
+    output_tokens = 0
+
+    def _add_gemini_usage(r: Any) -> None:
+        nonlocal input_tokens, output_tokens
+        um = getattr(r, "usage_metadata", None)
+        if um:
+            input_tokens += getattr(um, "prompt_token_count", 0) or 0
+            output_tokens += getattr(um, "candidates_token_count", 0) or 0
+
     response = chat.send_message(init_msg)
+    _add_gemini_usage(response)
 
     for _ in range(max_turns):
         function_calls = [
@@ -475,8 +495,8 @@ def _run_gemini(
                     f"=== INITIAL MESSAGE ===\n{init_msg}"
                 )
                 _save_files(profile.path, prompt_record, text, verbose)
-                return hypotheses
-            return []
+                return hypotheses, input_tokens, output_tokens
+            return [], input_tokens, output_tokens
 
         function_responses = []
         for fc in function_calls:
@@ -492,6 +512,7 @@ def _run_gemini(
                 )
             )
         response = chat.send_message(function_responses)
+        _add_gemini_usage(response)
 
     raise RuntimeError(f"Agent did not finish within {max_turns} turns")
 
@@ -505,7 +526,7 @@ def _run_claude_code(
     *,
     verbose: bool,
     summary: ProfileSummary | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int, float | None]:
     if verbose:
         print("[agent] No API key found — falling back to Claude Code (claude -p)")
 
@@ -532,12 +553,22 @@ def _run_claude_code(
     data = json.loads(result.stdout)
     response_text = data.get("result", "")
 
+    usage = data.get("usage", {})
+    # Include cache tokens in the input total — they drive cost and context size
+    inp = (
+        (usage.get("input_tokens") or 0)
+        + (usage.get("cache_creation_input_tokens") or 0)
+        + (usage.get("cache_read_input_tokens") or 0)
+    )
+    out = usage.get("output_tokens") or 0
+    cost_usd: float | None = data.get("total_cost_usd")
+
     _save_files(profile.path, prompt, response_text, verbose)
 
     if verbose:
         print(f"[agent] {response_text[:300]}{'...' if len(response_text) > 300 else ''}")
 
-    return _extract_hypotheses(response_text)
+    return _extract_hypotheses(response_text), inp, out, cost_usd
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +583,7 @@ def run_agent(
     max_turns: int = MAX_TURNS,
     verbose: bool = True,
     summary: ProfileSummary | None = None,
+    token_usage: dict[str, int | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
@@ -563,6 +595,9 @@ def run_agent(
 
     Pass a pre-computed `summary` to avoid recomputing it (e.g. when the caller
     already computed it for display purposes).
+
+    If `token_usage` is provided, it will be populated with `input_tokens` and
+    `output_tokens` after the run (both None for the claude_code fallback).
     """
     resolved_provider, resolved_model = _parse_provider_and_model(provider, model)
 
@@ -573,23 +608,29 @@ def run_agent(
 
     try:
         if resolved_provider == "anthropic":
-            hypotheses = _run_api(
+            hypotheses, inp, out = _run_api(
                 profile, model=resolved_model, max_turns=max_turns,
                 verbose=verbose, summary=summary,
             )
         elif resolved_provider == "openai":
-            hypotheses = _run_openai(
+            hypotheses, inp, out = _run_openai(
                 profile, model=resolved_model, max_turns=max_turns,
                 verbose=verbose, summary=summary,
             )
         elif resolved_provider == "gemini":
-            hypotheses = _run_gemini(
+            hypotheses, inp, out = _run_gemini(
                 profile, model=resolved_model, max_turns=max_turns,
                 verbose=verbose, summary=summary,
             )
         else:
-            hypotheses = _run_claude_code(profile, verbose=verbose, summary=summary)
+            hypotheses, inp, out, cost_usd = _run_claude_code(profile, verbose=verbose, summary=summary)
+            if token_usage is not None and cost_usd is not None:
+                token_usage["cost_usd"] = cost_usd
     finally:
         profile.close()
+
+    if token_usage is not None:
+        token_usage["input_tokens"] = inp
+        token_usage["output_tokens"] = out
 
     return hypotheses
