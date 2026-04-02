@@ -869,9 +869,9 @@ Claude came back with:
 
 ```
 ● Here's the full picture:                                                                                                                
-                                                                                                                                          
+
   Total: 18.9s, all in sqlite3.execute                                                                                                    
-                                                                                                                                          
+
   ┌─────────────────────────────────────────────────────┬───────┬──────────────────────────────────────────────────┐                      
   │                     Bottleneck                      │ Time  │                    Root cause                    │                      
   ├─────────────────────────────────────────────────────┼───────┼──────────────────────────────────────────────────┤                      
@@ -883,14 +883,14 @@ Claude came back with:
   ├─────────────────────────────────────────────────────┼───────┼──────────────────────────────────────────────────┤                      
   │ compute_gap_histogram + _window_idle_time × 6       │ 2.5s  │ ROW_NUMBER() self-joins, no index                │
   └─────────────────────────────────────────────────────┴───────┴──────────────────────────────────────────────────┘                      
-                                                            
+
   Only 1 index exists in the DB (OSRT_CALLCHAINS). No index on CUPTI_ACTIVITY_KIND_KERNEL(start) or any MPI table.                        
-                                                            
+
   Three fixes, in order of impact:                                                                                                        
   1. Create indexes on start for KERNEL and all MPI tables — one-time write, benefits every run
   2. SQLite PRAGMAs (cache_size, mmap_size) — trivial                                                                                     
   3. Batch _window_mpi_ops from 18 queries (6 phases × 3 tables) down to 3 queries (1 per table, all phases in one CASE-partitioned query)
-                                                                                                                                          
+
   Let me implement all three: 
 ```
 
@@ -928,15 +928,15 @@ Claude reported:
 
 ```
 ● Several things at play here. Let me understand the current agent loop structure:                                                        
-                                                                                                                                          
+
   - Uses claude-opus-4-6 for every turn                                                                                                   
   - First 2 turns are always profile_summary + phase_summary — mandatory exploration that happens every single run                        
   - tool_phase_summary re-runs detect_phases even though we already computed it for the CLI display                                       
   - The loop already supports parallel tool calls (multiple tool_use blocks per response), but the system prompt instructs sequential     
   calls                                                                                                                                   
-                                                                                                                                          
+
   Three independent speedups, none of which trade quality:                                                                                
-                                                            
+
   1. Pre-seed the first two tool calls — inject profile_summary + phase_summary results directly from the already-computed summary object,
    saving 2 API round-trips and avoiding re-running detect_phases in the tool handler
   2. Allow parallel tool calls — tell the model it can call multiple tools per turn                                                       
@@ -944,17 +944,24 @@ Claude reported:
   (current default)
 ```
 
-And then Claude went ahead and made changes. However, the changes made were only to the API pathway and not the Claude Code fallback pathway, which is what I am using. When I explained this, Claude replied:
+And then Claude went ahead and made changes. However, the changes made were only to the API pathway and not the Claude Code fallback pathway, which is what I am using.
+
+Next I asked Claude to implement the first todo list item, which is to add richer GPU metrics. After some work, Claude responded with:
 
 ```
-
+● Done. Here's a summary of what was implemented:        
+                                                                                          
+  models.py — 3 new fields on KernelSummary:                                                                                              
+  - std_dev_ms / cv — duration variability (CV=1.93 on Kernel3D signals load imbalance)                                                   
+  - avg_registers_per_thread / avg_shared_mem_bytes — resource pressure proxies                                                           
+  - estimated_occupancy — avg launch threads ÷ (SM count × max threads per SM)                                                            
+                                                                                                                                          
+  Plus pct_of_peak_bandwidth on MemcpySummary and peak_memory_bandwidth_GBs on ProfileSummary.                                            
+                                                                                                                                          
+  metrics.py — new compute_device_info() reads TARGET_INFO_GPU (SM count = 108, peak BW = 1555.2 GB/s for this A100). Std dev is computed 
+  via sum-of-squares since SQLite lacks STDDEV. The new fields flow through both global and per-phase kernel queries without added SQL    
+  round-trips. 
 ```
-
-
-
-
-
-
 
 
 

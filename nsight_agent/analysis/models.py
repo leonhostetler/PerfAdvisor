@@ -17,6 +17,11 @@ class KernelSummary(BaseModel):
     min_ms: float
     max_ms: float
     pct_of_gpu_time: float = Field(description="Fraction of total GPU kernel time (0–100)")
+    std_dev_ms: float = 0.0
+    cv: float = Field(default=0.0, description="Coefficient of variation (std_dev / avg); high value signals load imbalance or wavefront irregularity")
+    avg_registers_per_thread: int = 0
+    avg_shared_mem_bytes: int = 0
+    estimated_occupancy: float | None = Field(default=None, description="Estimated wave occupancy (0–1): avg launch threads / (SM count × max threads per SM)")
 
 
 class MemcpySummary(BaseModel):
@@ -25,6 +30,7 @@ class MemcpySummary(BaseModel):
     total_bytes: int
     total_s: float
     effective_GBs: float
+    pct_of_peak_bandwidth: float | None = Field(default=None, description="Effective bandwidth as % of device peak (requires TARGET_INFO_GPU)")
 
 
 class MpiOpSummary(BaseModel):
@@ -95,6 +101,9 @@ class ProfileSummary(BaseModel):
     memcpy_by_kind: list[MemcpySummary]
     streams: list[StreamSummary]
     nvtx_ranges: list[NvtxRangeSummary] = Field(default_factory=list)
+
+    # GPU hardware info (from TARGET_INFO_GPU, absent in older profiles)
+    peak_memory_bandwidth_GBs: float | None = Field(default=None, description="Device peak memory bandwidth in GB/s (from TARGET_INFO_GPU.memoryBandwidth)")
 
     # MPI (absent if profile has no MPI tables)
     mpi_ops: list[MpiOpSummary] = Field(default_factory=list)

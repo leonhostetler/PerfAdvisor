@@ -1,13 +1,20 @@
 # Todo List — nsight_agent Improvements
 
-## 1. Richer GPU metrics
+## 1. Richer GPU metrics ✓ DONE (2026-04-02)
 
-Add analytical per-kernel metrics to `ProfileSummary` and `PhaseSummary`:
+Added analytical per-kernel metrics to `KernelSummary` (propagates to both `ProfileSummary` and `PhaseSummary`).
 
-- **Arithmetic intensity proxy**: extract `registersPerThread` and `sharedMemoryExecuted` from `CUPTI_ACTIVITY_KIND_KERNEL` and combine with grid/block dims to flag kernels that are register-bound or occupancy-limited.
-- **Estimated occupancy**: compute `(gridX * gridY * gridZ * blockX * blockY * blockZ) / (SM count * max threads per SM)` using kernel table + `TARGET_INFO_GPU`. Expose as a field in `KernelSummary`.
-- **Memory bandwidth utilization %**: compare effective GB/s from `CUPTI_ACTIVITY_KIND_MEMCPY` against device peak bandwidth (from `TARGET_INFO_GPU`) to give a % of peak rather than raw numbers.
-- **Kernel duration CV (coefficient of variation)**: add `std_dev` to `KernelSummary` and compute `cv = std_dev / avg`. A high CV on a frequently-called kernel signals load imbalance or wavefront irregularity. Currently only min/max/avg are exposed.
+Changes made:
+
+- **`nsight_agent/analysis/models.py`**: Added to `KernelSummary`: `std_dev_ms`, `cv`, `avg_registers_per_thread`, `avg_shared_mem_bytes`, `estimated_occupancy`. Added `pct_of_peak_bandwidth` to `MemcpySummary`. Added `peak_memory_bandwidth_GBs` to `ProfileSummary`.
+
+- **`nsight_agent/analysis/metrics.py`**: Added `compute_device_info()` — queries `TARGET_INFO_GPU` for `smCount`, `maxWarpsPerSm × threadsPerWarp` (max threads per SM), and `memoryBandwidth` (bytes/s → GB/s). Updated `compute_top_kernels()` and `_window_top_kernels()` to compute `std_dev_ms`/`cv` via sum-of-squares (SQLite has no STDDEV), `avg_registers_per_thread`, `avg_shared_mem_bytes` (with `sharedMemoryExecuted` → static+dynamic fallback), and `estimated_occupancy` = avg launch threads / (SM count × max threads per SM). Updated `compute_memcpy_by_kind()` to compute `pct_of_peak_bandwidth`. Updated `compute_profile_summary()` to call `compute_device_info()` and thread results through.
+
+Sample values on test profile (A100 SXM4-40GB, 108 SMs):
+
+- `Kernel3D`: cv=1.93 (high — load imbalance), regs=64, shmem=71 KB, occupancy=0.796
+- `Kernel2D`: occupancy=1.0 (saturates SMs), cv=0.73
+- Device-to-Device memcpy: 495 GB/s = 31.9% of 1555 GB/s peak
 
 ## 2. Grounding the model's output
 
@@ -85,3 +92,15 @@ Changes made:
 
 Remaining (not implemented): parallel `compute_phase_summary` calls via `ThreadPoolExecutor`
 (~1s potential saving on 6 phases; modest benefit on the current test profile).
+
+## 9. Multi-provider LLM support (OpenAI, Gemini)
+
+Extend the agent loop to support inference backends beyond the Anthropic API:
+
+- Add a `--provider` flag to `nsight_agent/__main__.py` accepting `anthropic` (default), `openai`, and `gemini`. Wire through to `run_agent()` and `_run_api()`.
+- Abstract the inference call in `nsight_agent/agent/loop.py` behind a thin provider interface so each backend can translate the shared tool-use conversation format into provider-specific API calls. Key differences to handle:
+  - OpenAI uses `openai.OpenAI()` with `client.chat.completions.create(tools=..., tool_choice=...)` — tool schemas are compatible with OpenAI's function-calling format but need `"type": "function"` wrappers.
+  - Gemini uses `google-generativeai` with `genai.GenerativeModel(...).start_chat()` — function declarations use a different schema format; multi-turn state is managed via a chat session rather than a messages list.
+- Pre-seeding (`_preseed_messages`) is Anthropic-specific; each provider backend should handle its own conversation initialization.
+- Add optional dependencies to `pyproject.toml`: `openai` and `google-generativeai` (both optional extras).
+- The `--model` flag should accept provider-prefixed model IDs (e.g., `openai:gpt-4o`, `gemini:gemini-2.0-flash`) to make the provider unambiguous when `--provider` is omitted.

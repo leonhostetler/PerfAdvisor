@@ -7,6 +7,7 @@ before querying, and optional tables (MPI, NVTX) degrade gracefully.
 
 from __future__ import annotations
 
+import math
 import time
 
 from nsight_agent.ingestion.profile import NsysProfile
@@ -76,37 +77,73 @@ def compute_gpu_sync_time(profile: NsysProfile) -> float:
     return float(row["t"])
 
 
-def compute_top_kernels(profile: NsysProfile, limit: int = 15) -> list[KernelSummary]:
+def compute_top_kernels(
+    profile: NsysProfile,
+    limit: int = 15,
+    device_info: dict | None = None,
+) -> list[KernelSummary]:
     total_gpu_s = compute_gpu_kernel_time(profile)
     rows = profile.query(f"""
         SELECT
-            s.value                             AS name,
-            COUNT(*)                            AS calls,
-            SUM(k.end - k.start) / 1e9         AS total_s,
-            AVG(k.end - k.start) / 1e6         AS avg_ms,
-            MIN(k.end - k.start) / 1e6         AS min_ms,
-            MAX(k.end - k.start) / 1e6         AS max_ms
+            s.value                                                         AS name,
+            COUNT(*)                                                        AS calls,
+            SUM(k.end - k.start) / 1e9                                     AS total_s,
+            AVG(k.end - k.start) / 1e6                                     AS avg_ms,
+            MIN(k.end - k.start) / 1e6                                     AS min_ms,
+            MAX(k.end - k.start) / 1e6                                     AS max_ms,
+            SUM(CAST(k.end - k.start AS REAL) * (k.end - k.start))        AS sum_sq_ns,
+            SUM(k.end - k.start)                                            AS sum_ns,
+            AVG(COALESCE(k.registersPerThread, 0))                         AS avg_registers,
+            AVG(COALESCE(k.sharedMemoryExecuted,
+                         k.staticSharedMemory + k.dynamicSharedMemory, 0)) AS avg_shared_mem,
+            AVG(CAST(k.gridX * k.gridY * k.gridZ *
+                     k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN StringIds s ON k.shortName = s.id
         GROUP BY k.shortName
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
-    return [
-        KernelSummary(
+    sm_count = (device_info or {}).get("sm_count")
+    max_threads_per_sm = (device_info or {}).get("max_threads_per_sm")
+    result = []
+    for r in rows:
+        n = r["calls"]
+        sum_ns = r["sum_ns"] or 0
+        sum_sq_ns = r["sum_sq_ns"] or 0.0
+        mean_ns = sum_ns / n if n else 0.0
+        variance = (sum_sq_ns / n - mean_ns ** 2) if n > 1 else 0.0
+        std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
+        avg_ms = r["avg_ms"] or 0.0
+        cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
+
+        occupancy = None
+        if sm_count and max_threads_per_sm:
+            avg_threads = r["avg_total_threads"] or 0.0
+            if avg_threads > 0:
+                occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
+
+        result.append(KernelSummary(
             name=r["name"],
-            calls=r["calls"],
+            calls=n,
             total_s=round(r["total_s"], 4),
-            avg_ms=round(r["avg_ms"], 4),
+            avg_ms=round(avg_ms, 4),
             min_ms=round(r["min_ms"], 4),
             max_ms=round(r["max_ms"], 4),
             pct_of_gpu_time=round(100.0 * r["total_s"] / total_gpu_s, 1) if total_gpu_s else 0.0,
-        )
-        for r in rows
-    ]
+            std_dev_ms=round(std_dev_ms, 4),
+            cv=cv,
+            avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
+            avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
+            estimated_occupancy=occupancy,
+        ))
+    return result
 
 
-def compute_memcpy_by_kind(profile: NsysProfile) -> list[MemcpySummary]:
+def compute_memcpy_by_kind(
+    profile: NsysProfile,
+    peak_bandwidth_GBs: float | None = None,
+) -> list[MemcpySummary]:
     rows = profile.query("""
         SELECT
             e.label                              AS kind,
@@ -127,6 +164,11 @@ def compute_memcpy_by_kind(profile: NsysProfile) -> list[MemcpySummary]:
             total_bytes=r["total_bytes"] or 0,
             total_s=round(r["total_s"], 4),
             effective_GBs=round(r["effective_GBs"] or 0.0, 2),
+            pct_of_peak_bandwidth=(
+                round(100.0 * (r["effective_GBs"] or 0.0) / peak_bandwidth_GBs, 1)
+                if peak_bandwidth_GBs and (r["effective_GBs"] or 0.0) > 0
+                else None
+            ),
         )
         for r in rows
     ]
@@ -217,6 +259,43 @@ def compute_nvtx_ranges(profile: NsysProfile, limit: int = 20) -> list[NvtxRange
         )
         for r in rows
     ]
+
+
+def compute_device_info(profile: NsysProfile) -> dict:
+    """Query TARGET_INFO_GPU for hardware properties used in occupancy and bandwidth metrics.
+
+    Returns a dict with keys ``sm_count``, ``max_threads_per_sm``, ``peak_bandwidth_GBs``.
+    Any value may be ``None`` if TARGET_INFO_GPU is absent or the column is missing.
+    """
+    empty: dict = {"sm_count": None, "max_threads_per_sm": None, "peak_bandwidth_GBs": None}
+    if not profile.has_table("TARGET_INFO_GPU"):
+        return empty
+
+    cols = set(profile.columns("TARGET_INFO_GPU"))
+    rows = profile.query("SELECT * FROM TARGET_INFO_GPU LIMIT 1")
+    if not rows:
+        return empty
+    r = rows[0]
+
+    sm_count = int(r["smCount"]) if "smCount" in cols and r["smCount"] else None
+
+    max_threads_per_sm = None
+    if "maxWarpsPerSm" in cols and "threadsPerWarp" in cols:
+        warps = r["maxWarpsPerSm"]
+        warp_size = r["threadsPerWarp"]
+        if warps and warp_size:
+            max_threads_per_sm = int(warps) * int(warp_size)
+
+    # memoryBandwidth is stored in bytes/s
+    peak_bandwidth_GBs = None
+    if "memoryBandwidth" in cols and r["memoryBandwidth"]:
+        peak_bandwidth_GBs = round(float(r["memoryBandwidth"]) / 1e9, 1)
+
+    return {
+        "sm_count": sm_count,
+        "max_threads_per_sm": max_threads_per_sm,
+        "peak_bandwidth_GBs": peak_bandwidth_GBs,
+    }
 
 
 def compute_mpi_ops(profile: NsysProfile, limit: int = 10) -> list[MpiOpSummary]:
@@ -387,16 +466,28 @@ def _window_idle_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float
 
 
 def _window_top_kernels(
-    profile: NsysProfile, start_ns: int, end_ns: int, total_kernel_s: float, limit: int = 5
+    profile: NsysProfile,
+    start_ns: int,
+    end_ns: int,
+    total_kernel_s: float,
+    limit: int = 5,
+    device_info: dict | None = None,
 ) -> list[KernelSummary]:
     rows = profile.query(f"""
         SELECT
-            s.value                             AS name,
-            COUNT(*)                            AS calls,
-            SUM(k.end - k.start) / 1e9         AS total_s,
-            AVG(k.end - k.start) / 1e6         AS avg_ms,
-            MIN(k.end - k.start) / 1e6         AS min_ms,
-            MAX(k.end - k.start) / 1e6         AS max_ms
+            s.value                                                         AS name,
+            COUNT(*)                                                        AS calls,
+            SUM(k.end - k.start) / 1e9                                     AS total_s,
+            AVG(k.end - k.start) / 1e6                                     AS avg_ms,
+            MIN(k.end - k.start) / 1e6                                     AS min_ms,
+            MAX(k.end - k.start) / 1e6                                     AS max_ms,
+            SUM(CAST(k.end - k.start AS REAL) * (k.end - k.start))        AS sum_sq_ns,
+            SUM(k.end - k.start)                                            AS sum_ns,
+            AVG(COALESCE(k.registersPerThread, 0))                         AS avg_registers,
+            AVG(COALESCE(k.sharedMemoryExecuted,
+                         k.staticSharedMemory + k.dynamicSharedMemory, 0)) AS avg_shared_mem,
+            AVG(CAST(k.gridX * k.gridY * k.gridZ *
+                     k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN StringIds s ON k.shortName = s.id
         WHERE k.start >= {start_ns} AND k.end <= {end_ns}
@@ -404,18 +495,40 @@ def _window_top_kernels(
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
-    return [
-        KernelSummary(
+    sm_count = (device_info or {}).get("sm_count")
+    max_threads_per_sm = (device_info or {}).get("max_threads_per_sm")
+    result = []
+    for r in rows:
+        n = r["calls"]
+        sum_ns = r["sum_ns"] or 0
+        sum_sq_ns = r["sum_sq_ns"] or 0.0
+        mean_ns = sum_ns / n if n else 0.0
+        variance = (sum_sq_ns / n - mean_ns ** 2) if n > 1 else 0.0
+        std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
+        avg_ms = r["avg_ms"] or 0.0
+        cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
+
+        occupancy = None
+        if sm_count and max_threads_per_sm:
+            avg_threads = r["avg_total_threads"] or 0.0
+            if avg_threads > 0:
+                occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
+
+        result.append(KernelSummary(
             name=r["name"],
-            calls=r["calls"],
+            calls=n,
             total_s=round(r["total_s"], 4),
-            avg_ms=round(r["avg_ms"], 4),
+            avg_ms=round(avg_ms, 4),
             min_ms=round(r["min_ms"], 4),
             max_ms=round(r["max_ms"], 4),
             pct_of_gpu_time=round(100.0 * r["total_s"] / total_kernel_s, 1) if total_kernel_s else 0.0,
-        )
-        for r in rows
-    ]
+            std_dev_ms=round(std_dev_ms, 4),
+            cv=cv,
+            avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
+            avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
+            estimated_occupancy=occupancy,
+        ))
+    return result
 
 
 def _batch_window_mpi_ops(
@@ -526,11 +639,13 @@ def compute_phase_summary(
     profile_start_ns: int,
     *,
     mpi_ops: list[MpiOpSummary] | None = None,
+    device_info: dict | None = None,
 ) -> PhaseSummary:
     """Compute full metrics for a single PhaseWindow.
 
     Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra query when
     all phases are processed together via _batch_window_mpi_ops).
+    Pass ``device_info`` (from compute_device_info) to enable occupancy metrics.
     """
     kernel_s = _window_kernel_time(profile, phase.start_ns, phase.end_ns)
     memcpy_s = _window_memcpy_time(profile, phase.start_ns, phase.end_ns)
@@ -550,7 +665,7 @@ def compute_phase_summary(
         gpu_kernel_s=round(kernel_s, 3),
         gpu_memcpy_s=round(memcpy_s, 3),
         total_gpu_idle_s=round(idle_s, 3),
-        top_kernels=_window_top_kernels(profile, phase.start_ns, phase.end_ns, kernel_s),
+        top_kernels=_window_top_kernels(profile, phase.start_ns, phase.end_ns, kernel_s, device_info=device_info),
         mpi_ops=mpi_ops,
     )
 
@@ -573,6 +688,9 @@ def compute_profile_summary(
     """
     t_start = time.perf_counter()
 
+    device_info = compute_device_info(profile)
+    peak_bw = device_info.get("peak_bandwidth_GBs")
+
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
     memcpy_s = compute_gpu_memcpy_time(profile)
@@ -586,7 +704,7 @@ def compute_profile_summary(
     profile_start_ns = phases_windows[0].start_ns if phases_windows else 0
     global_mpi_ops, all_phase_mpi = _compute_all_mpi_stats(profile, phases_windows)
     phase_summaries = [
-        compute_phase_summary(profile, pw, profile_start_ns, mpi_ops=all_phase_mpi[i])
+        compute_phase_summary(profile, pw, profile_start_ns, mpi_ops=all_phase_mpi[i], device_info=device_info)
         for i, pw in enumerate(phases_windows)
     ]
 
@@ -604,11 +722,12 @@ def compute_profile_summary(
         gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
         total_gpu_idle_s=round(total_idle_s, 3),
         gap_histogram=gap_histogram,
-        top_kernels=compute_top_kernels(profile),
-        memcpy_by_kind=compute_memcpy_by_kind(profile),
+        top_kernels=compute_top_kernels(profile, device_info=device_info),
+        memcpy_by_kind=compute_memcpy_by_kind(profile, peak_bandwidth_GBs=peak_bw),
         streams=compute_streams(profile),
         nvtx_ranges=compute_nvtx_ranges(profile),
         mpi_ops=global_mpi_ops,
         mpi_present=profile.has_mpi(),
         phases=phase_summaries,
+        peak_memory_bandwidth_GBs=peak_bw,
     )
