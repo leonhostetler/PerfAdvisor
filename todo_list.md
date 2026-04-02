@@ -26,13 +26,14 @@ Prevent the model from leaking training knowledge into hypotheses:
 
 - **Evidence validation in post-processing**: after `_extract_hypotheses`, scan each `evidence` string and flag hypotheses that cite no specific numbers from the profile data as low-confidence. This does not require an additional LLM call.
 
-## 3. Per-phase gap histogram
+## 3. Per-phase gap histogram ✓ DONE (2026-04-02)
 
 The current `gap_histogram` is global. A `>100ms` gap in teardown looks the same as one mid-compute.
 
-- Add a `gap_histogram: list[GapBucket]` field to `PhaseSummary`.
-- Extend `_window_idle_time` (in `nsight_agent/analysis/metrics.py`) to return a bucketed histogram rather than just total idle seconds.
-- This lets the model distinguish one large synchronization barrier from thousands of small launch gaps within the same phase.
+Changes made:
+
+- **`nsight_agent/analysis/models.py`**: Added `gap_histogram: list[GapBucket] = Field(default_factory=list)` to `PhaseSummary`.
+- **`nsight_agent/analysis/metrics.py`**: Changed `_window_idle_time` signature from `→ float` to `→ tuple[float, list[GapBucket]]`. Now uses the same CASE-based bucketing as `compute_gap_histogram` (6 buckets: `<10us` through `>100ms`), scoped to the phase window. Updated `compute_phase_summary` to unpack both and pass `gap_histogram` to `PhaseSummary`.
 
 ## 4. CPU–GPU overlap metrics
 

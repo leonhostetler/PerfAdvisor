@@ -446,8 +446,11 @@ def _window_memcpy_time(profile: NsysProfile, start_ns: int, end_ns: int) -> flo
     return float(row["t"])
 
 
-def _window_idle_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
-    row = profile.query(f"""
+def _window_idle_time(
+    profile: NsysProfile, start_ns: int, end_ns: int
+) -> tuple[float, list[GapBucket]]:
+    """Return (total_idle_s, gap_histogram) for inter-kernel gaps within a time window."""
+    rows = profile.query(f"""
         WITH ordered AS (
             SELECT start, end, ROW_NUMBER() OVER (ORDER BY start) AS rn
             FROM CUPTI_ACTIVITY_KIND_KERNEL
@@ -459,10 +462,26 @@ def _window_idle_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float
             JOIN ordered o2 ON o2.rn = o1.rn + 1
             WHERE o2.start > o1.end
         )
-        SELECT COALESCE(SUM(gap_ns), 0) / 1e9 AS t
+        SELECT
+            CASE
+                WHEN gap_ns < 10000      THEN '<10us'
+                WHEN gap_ns < 100000     THEN '10-100us'
+                WHEN gap_ns < 1000000    THEN '100us-1ms'
+                WHEN gap_ns < 10000000   THEN '1-10ms'
+                WHEN gap_ns < 100000000  THEN '10-100ms'
+                ELSE '>100ms'
+            END                          AS label,
+            COUNT(*)                     AS count,
+            SUM(gap_ns) / 1e9           AS total_s
         FROM gaps
-    """)[0]
-    return float(row["t"])
+        GROUP BY label
+        ORDER BY MIN(gap_ns)
+    """)
+    buckets = [
+        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3))
+        for r in rows
+    ]
+    return sum(b.total_s for b in buckets), buckets
 
 
 def _window_top_kernels(
@@ -649,7 +668,7 @@ def compute_phase_summary(
     """
     kernel_s = _window_kernel_time(profile, phase.start_ns, phase.end_ns)
     memcpy_s = _window_memcpy_time(profile, phase.start_ns, phase.end_ns)
-    idle_s = _window_idle_time(profile, phase.start_ns, phase.end_ns)
+    idle_s, gap_histogram = _window_idle_time(profile, phase.start_ns, phase.end_ns)
     duration_s = (phase.end_ns - phase.start_ns) / 1e9
     start_s = (phase.start_ns - profile_start_ns) / 1e9
 
@@ -665,6 +684,7 @@ def compute_phase_summary(
         gpu_kernel_s=round(kernel_s, 3),
         gpu_memcpy_s=round(memcpy_s, 3),
         total_gpu_idle_s=round(idle_s, 3),
+        gap_histogram=gap_histogram,
         top_kernels=_window_top_kernels(profile, phase.start_ns, phase.end_ns, kernel_s, device_info=device_info),
         mpi_ops=mpi_ops,
     )

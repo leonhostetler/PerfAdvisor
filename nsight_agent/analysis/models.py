@@ -72,6 +72,7 @@ class PhaseSummary(BaseModel):
     gpu_kernel_s: float
     gpu_memcpy_s: float
     total_gpu_idle_s: float
+    gap_histogram: list[GapBucket] = Field(default_factory=list)
     top_kernels: list[KernelSummary]
     mpi_ops: list[MpiOpSummary] = Field(default_factory=list)
 
