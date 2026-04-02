@@ -34,8 +34,16 @@ class NsysProfile:
         self._ensure_indexes()
         self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA cache_size = -65536")    # 64 MB page cache
-        self._conn.execute("PRAGMA mmap_size = 2147483648")  # 2 GB memory-mapped I/O
+        try:
+            file_size = self.path.stat().st_size
+        except OSError:
+            file_size = 64 * 1024 * 1024  # fallback: 64 MB
+        # Cache: up to 25% of file size, capped at 512 MB, minimum 16 MB
+        cache_kb = max(16 * 1024, min(file_size // (1024 * 4), 512 * 1024))
+        # mmap: full file size, capped at 16 GB
+        mmap_size = min(file_size, 16 * 1024 ** 3)
+        self._conn.execute(f"PRAGMA cache_size = -{cache_kb}")
+        self._conn.execute(f"PRAGMA mmap_size = {mmap_size}")
         self._tables: set[str] | None = None
         self._string_cache: dict[int, str] = {}
 

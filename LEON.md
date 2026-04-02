@@ -950,18 +950,38 @@ Next I asked Claude to implement the first todo list item, which is to add riche
 
 ```
 ● Done. Here's a summary of what was implemented:        
-                                                                                          
+
   models.py — 3 new fields on KernelSummary:                                                                                              
   - std_dev_ms / cv — duration variability (CV=1.93 on Kernel3D signals load imbalance)                                                   
   - avg_registers_per_thread / avg_shared_mem_bytes — resource pressure proxies                                                           
   - estimated_occupancy — avg launch threads ÷ (SM count × max threads per SM)                                                            
-                                                                                                                                          
+
   Plus pct_of_peak_bandwidth on MemcpySummary and peak_memory_bandwidth_GBs on ProfileSummary.                                            
-                                                                                                                                          
+
   metrics.py — new compute_device_info() reads TARGET_INFO_GPU (SM count = 108, peak BW = 1555.2 GB/s for this A100). Std dev is computed 
   via sum-of-squares since SQLite lacks STDDEV. The new fields flow through both global and per-phase kernel queries without added SQL    
   round-trips. 
 ```
+
+I asked Claude:
+
+```
+Check the code and list everything that is Perlmutter-specific, hardware-specific, or profile-specific. The goal is to see if anything  
+non-general has been hardcoded. Don't make any changes without asking.
+```
+
+Claude analyzed the code and responded that only the tests contain profile-specific things (which is fine, I will just remove the tests before making it public). The production code is clean--nothing hardcoded. Claude did note that the pragma sizing that was set to improve the runtime performance is based on the size of the test profile that I'm using and is not currently adaptive.
+
+```
+Would it be easy and non-intrusive (for the general user of this analyzer) if the PRAGMA sizing were made adaptive based on the size of 
+ the profile being passed in? Don't make any changes without asking.
+```
+
+Claude assured me that it's a simple change that would be invisible to the end user, so I told it to go ahead and make the change.
+
+
+
+
 
 
 
