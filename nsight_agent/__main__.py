@@ -69,18 +69,38 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     if not args.quiet and summary.phases:
         ph = Table(title="Detected Execution Phases")
-        for col in ("Phase", "Start (s)", "End (s)", "Duration (s)", "GPU Util %", "Top Kernel"):
-            ph.add_column(col)
+        ph.add_column("Phase")
+        ph.add_column("Start (s)", justify="right")
+        ph.add_column("End (s)", justify="right")
+        ph.add_column("Duration (s)", justify="right")
+        ph.add_column("GPU Util %", justify="right")
+        ph.add_column("GPU Kernel (s)", justify="right")
+        ph.add_column("GPU Idle (s)", justify="right")
+        ph.add_column("Top Kernel")
+        if summary.mpi_present:
+            ph.add_column("Top MPI Op")
         for p in summary.phases:
-            top = p.top_kernels[0].name if p.top_kernels else "—"
-            ph.add_row(
+            top_kernel = (
+                f"{p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
+                if p.top_kernels else "—"
+            )
+            row = [
                 p.name,
                 str(p.start_s),
                 str(p.end_s),
                 str(p.duration_s),
                 f"{p.gpu_utilization_pct}%",
-                top,
-            )
+                str(p.gpu_kernel_s),
+                str(p.total_gpu_idle_s),
+                top_kernel,
+            ]
+            if summary.mpi_present:
+                top_mpi = (
+                    f"{p.mpi_ops[0].op} ({p.mpi_ops[0].total_s}s)"
+                    if p.mpi_ops else "—"
+                )
+                row.append(top_mpi)
+            ph.add_row(*row)
         console.print(ph)
 
     if args.verbose:
