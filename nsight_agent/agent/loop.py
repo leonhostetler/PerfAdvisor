@@ -372,15 +372,26 @@ def _run_openai(
     messages = [{"role": "system", "content": _SYSTEM_PROMPT_API}] + messages
     input_tokens = 0
     output_tokens = 0
+    # Older models use max_tokens; newer models (o-series, gpt-4.1+) require max_completion_tokens.
+    # Detect which parameter to use on the first call and reuse that for subsequent turns.
+    _token_limit_param = "max_tokens"
+
+    def _create(msgs: list[dict]) -> Any:
+        nonlocal _token_limit_param
+        from openai import BadRequestError
+        kwargs = dict(model=model, messages=msgs, tools=openai_tools, tool_choice="auto",
+                      **{_token_limit_param: 4096})
+        try:
+            return client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            if _token_limit_param == "max_tokens" and "max_completion_tokens" in str(e):
+                _token_limit_param = "max_completion_tokens"
+                kwargs[_token_limit_param] = kwargs.pop("max_tokens")
+                return client.chat.completions.create(**kwargs)
+            raise
 
     for _ in range(max_turns):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=openai_tools,
-            tool_choice="auto",
-            max_tokens=4096,
-        )
+        response = _create(messages)
         if response.usage:
             input_tokens += response.usage.prompt_tokens
             output_tokens += response.usage.completion_tokens

@@ -1157,6 +1157,54 @@ When I tried to rerun with `--model gpt-5.4-pro`, it failed with error:
 openai.NotFoundError: Error code: 404 - {'error': {'message': 'This is not a chat model and thus not supported in the v1/chat/completions endpoint. Did you mean to use v1/completions?', 'type': 'invalid_request_error', 'param': 'model', 'code': None}}
 ```
 
+I retried with `--model gpt-5.4`. This went further but failed with:
+
+```
+openai.BadRequestError: Error code: 400 - {'error': {'message': "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", 'type': 'invalid_request_error', 'param': 'max_tokens', 'code': 'unsupported_parameter'}}
+```
+
+After having Claude fix this by adding support for both the older `max_tokens` and the newer `max_completion_tokens`, I tried again. Now the hypotheses returned from OpenAI are much better, I think:
+
+```
+┏━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ #   ┃ Type                ┃ Impact ┃ Description                                       ┃ Suggestion                                         ┃
+┡━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 1   │ mpi_latency         │ high   │ Excessive MPI synchronization dominates runtime,  │ Reduce global synchronizations: eliminate or batch │
+│     │                     │        │ especially MPI_Barrier during initialization and  │ MPI_Barrier calls in initialization, fuse or defer │
+│     │                     │        │ frequent MPI_Allreduce during the main solve.     │ reductions, use hierarchical/nonblocking           │
+│     │                     │        │                                                   │ collectives where possible, and review algorithmic │
+│     │                     │        │                                                   │ points that force per-iteration Allreduce.         │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 2   │ cpu_launch_overhead │ high   │ The main compute phase launches extremely many    │ Fuse fine-grained kernels, use CUDA Graphs for     │
+│     │                     │        │ short kernels, making launch/scheduling overhead  │ repeated launch patterns, reduce host-side         │
+│     │                     │        │ a major limiter.                                  │ per-kernel orchestration, and consider persistent  │
+│     │                     │        │                                                   │ kernels or larger work aggregation in the solver   │
+│     │                     │        │                                                   │ iteration.                                         │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 3   │ synchronization     │ high   │ Large GPU idle gaps indicate substantial waiting  │ Inspect host synchronization points around kernel  │
+│     │                     │        │ between launches beyond pure kernel execution,    │ batches and MPI calls; overlap communication with  │
+│     │                     │        │ likely from host synchronization and              │ computation, remove unnecessary cudaStream/device  │
+│     │                     │        │ communication boundaries.                         │ synchronizations, and pipeline reductions/halo     │
+│     │                     │        │                                                   │ exchange to keep the GPU fed.                      │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 4   │ memory_bound        │ medium │ Inter-GPU peer-to-peer traffic is substantial and │ Reduce halo/data exchange volume, improve          │
+│     │                     │        │ likely contributes to the main-phase stalls and   │ communication/computation overlap, combine small   │
+│     │                     │        │ limited scaling.                                  │ P2P transfers, and verify topology-aware GPU       │
+│     │                     │        │                                                   │ placement and NVLink/PCIe affinity. If possible,   │
+│     │                     │        │                                                   │ increase arithmetic intensity per exchanged byte.  │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 5   │ other               │ medium │ GPU work is effectively serialized onto a single  │ Where dependencies permit, schedule independent    │
+│     │                     │        │ stream, leaving little concurrent execution or    │ kernels/transfers on separate streams and overlap  │
+│     │                     │        │ overlap opportunity.                              │ copies with compute. If algorithmic ordering       │
+│     │                     │        │                                                   │ prevents this, prioritize kernel fusion and        │
+│     │                     │        │                                                   │ communication overlap instead.                     │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 6   │ io                  │ low    │ There is a noticeable end-of-run MPI file open    │ If this is on the critical path for repeated runs  │
+│     │                     │        │ delay, though it is not a dominant whole-run      │ or checkpoints, optimize filesystem access, defer  │
+│     │                     │        │ bottleneck.                                       │ file open, or reuse file handles.                  │
+└─────┴─────────────────────┴────────┴───────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+```
+
 
 
 
