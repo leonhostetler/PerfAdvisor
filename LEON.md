@@ -1205,6 +1205,722 @@ After having Claude fix this by adding support for both the older `max_tokens` a
 └─────┴─────────────────────┴────────┴───────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
 ```
 
+## Short vs. Long Kernel Names
+
+```
+❯ Our nsight-agent appears to look only at short GPU kernel names like "Kernel3D". In reality, the full kernel names make it clear that   
+Kernel3D actually encompasses half a dozen or more different GPU kernels. Would it be helpful to look at the full kernel names instead?   
+Don't make any changes yet.                                                                                                               
+
+● Good question. Let me look at how kernel names are currently resolved before answering.                                                 
+
+  Searched for 1 pattern (ctrl+o to expand)                                                                                               
+
+● The current code groups by k.shortName throughout — in compute_top_kernels, _window_top_kernels, and _fingerprint. That means all       
+  kernels sharing the same short name (e.g., Kernel3D) get merged into a single KernelSummary entry.                                    
+
+  Whether this matters depends on what "Kernel3D" actually is in this profile. In CUDA/QUDA code, shortName typically comes from the CUDA 
+  symbol's first few tokens. For templated kernels, the demangled name would look something like quda::kernel3d<float, 256, true>(...) —  
+  and different template instantiations (different types, block sizes, or boolean flags) would share the same shortName but have distinct 
+  demangledName or mangledName values.                                                                                                  
+
+  It would be helpful, but with a cost:
+  - Benefit: The agent would see that "Kernel3D" is actually 6 distinct kernels with different performance characteristics — some may be
+  compute-bound, others memory-bound, some with high occupancy, others low. Right now that variance is buried in the cv field.            
+  - Cost: Demangled CUDA names are long and noisy (e.g., void quda::Dslash<...>::kernel3d<quda::WilsonArg<float, ...>, 256, true>(...)).
+  Grouping by demangledName could produce dozens of rows per logical "kernel family," making the summary token-heavy and harder for the   
+  agent to reason about.                                                                                                                  
+
+  A middle path worth considering: group by shortName for the primary summary (current behavior), but add a variants subfield to          
+  KernelSummary listing distinct demangledName entries (with their individual call counts and avg times). This keeps the top-level summary
+   compact while giving the agent the ability to distinguish template specializations when it matters.
+
+  Want to explore what the actual demangled names look like in the test profile first? That would tell us how many distinct kernels are   
+  behind "Kernel3D" and whether the split is meaningful.
+
+❯ Yes, let's explore the demangled names in the test profile.                                                                             
+
+● Bash(sqlite3 /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite "                                       
+      SELECT…)                                                                                                                          
+  ⎿  Kernel3D|std::enable_if<device::use_kernel_arg<T2>()&&T2::max_regs==(int)0, void>::type quda::Kernel3D<quda::dslash_functor, qud     
+     a::dslash_functor_arg<quda::staggered, quda::packStaggeredShmem, (bool)0, (bool)0, (quda::KernelType)5, quda::StaggeredArg<short     
+     , (int)3, (int)4, quda::DDNo, (QudaReconstructType_s)18, (QudaReconstructType_s)9, (bool)1, (QudaStaggeredPhase_s)1, (int)3>>, (     
+     … +97 lines (ctrl+o to expand)                                                                                                     
+
+● Very revealing. Here's what's actually hiding under Kernel3D:
+
+  Dominant kernels (short name Kernel3D, ordered by total time):                                                                          
+
+  ┌───────────────────────────────────┬──────────────┬───────────┬────────────┬────────┬───────────┬──────────┐                           
+  │              Functor              │  KernelType  │ Precision │ Bool flags │ Calls  │ Total (s) │ Avg (ms) │                           
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor (staggered Dslash) │ 5 (interior) │ short     │ (bool)0    │ 43,384 │ 8.22      │ 0.190    │                         
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤
+  │ dslash_functor (staggered Dslash) │ 5 (interior) │ short     │ (bool)1    │ 43,384 │ 8.11      │ 0.187    │                           
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ blas::axpyZpbx_                   │ —            │ short     │ —          │ 43,316 │ 1.64      │ 0.038    │                           
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ pack_staggered                    │ —            │ short     │ —          │ 86,768 │ 0.88      │ 0.010    │                         
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor                    │ 1 (exterior) │ short     │ (bool)1    │ 43,384 │ 0.62      │ 0.014    │                         
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor                    │ 1 (exterior) │ short     │ (bool)0    │ 43,384 │ 0.60      │ 0.014    │
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor                    │ 2 (exterior) │ short     │ both       │ ~43K×2 │ ~1.19     │ 0.014    │                         
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor                    │ 3 (exterior) │ short     │ both       │ ~43K×2 │ ~1.03     │ 0.012    │                         
+  ├───────────────────────────────────┼──────────────┼───────────┼────────────┼────────┼───────────┼──────────┤                           
+  │ dslash_functor                    │ 5 (interior) │ double    │ both       │ ~226   │ ~0.16     │ 0.70     │                         
+  └───────────────────────────────────┴──────────────┴───────────┴────────────┴────────┴───────────┴──────────┘                           
+
+  Key findings:                                                                                                                           
+
+  1. The current summary is masking the Dslash structure entirely. KernelType maps to QUDA's interior/exterior phase split: KernelType 5  
+  is the interior Dslash (overlapped with MPI), types 1/2/3 are the exterior boundary face kernels that run after halo exchange. These
+  have completely different optimization strategies — you'd never want to conflate them.                                                  
+  2. The two bool variants of KernelType 5 (likely the dagger vs. non-dagger Dirac operator) together account for ~16.3s — the clear    
+  dominant cost. The current analysis rolls this up with BLAS and packing and reports a single misleading 22s blob.                       
+  3. BLAS (axpyZpbx_) and packing (pack_staggered) are separate functional categories with very different avg times (0.038ms vs 0.010ms)
+  that deserve their own entries.                                                                                                         
+  4. double-precision Dslash (134 calls, 0.70ms avg) is structurally different from the short-precision bulk — high avg time suggests this
+   is initialization or setup, not the solver hot path.                                                                                   
+
+  Conclusion: yes, grouping by shortName is significantly wrong here. The right fix isn't necessarily to switch to raw demangledName      
+  (those 300-character strings are unreadable), but to extract a logical name from the demangled string — something like                
+  dslash_functor[KT=5,prec=short] — and group on that. This gives the agent functionally distinct, human-readable kernel identities.      
+
+  Want to discuss the extraction strategy before implementing? 
+
+❯ Yes, let's discuss the extraction strategy. Let's also keep in mind that we're trying to build a general nsight-agent that works just   
+as well with profiles from non-QUDA applications. If that turns out to be sub-optimal, then we can consider making nsight-agent           
+completely QUDA specific. Make no changes yet. 
+
+● Here's how I see the options, starting from most general to most QUDA-specific:                                                         
+
+  ---                                                                                                                                     
+  Option 1: Group by demangledName, light normalization (recommended)                                                                     
+
+  Switch the primary grouping key from shortName to demangledName (fall back to shortName when demangledName is NULL). Apply two          
+  normalization passes:                                                                                                                   
+
+  1. Strip the std::enable_if<...>::type  return-type prefix. This is the C++ SFINAE wrapper around QUDA's kernel dispatch. It carries no 
+  semantic information and adds ~70 chars of noise. Similar patterns appear in other CUDA template libraries (not just QUDA), so stripping
+   it is reasonable generally.                                                                                                            
+  2. Strip the trailing (T2) argument placeholder that QUDA appends (also library-specific boilerplate).                                
+
+  What remains — quda::Kernel3D<quda::dslash_functor, ..., KernelType=5, short, ...> — is the actual functionally-meaningful              
+  instantiation. The agent can read C++ template types and will correctly interpret this as "interior staggered Dslash, half precision."  
+
+  General behavior: For non-QUDA kernels, demangled names are already clean and descriptive (reduce_kernel<float, 256>,                   
+  volta_sgemm_128x64_nn), so normalization is a no-op. The approach degrades gracefully.
+
+  Tradeoff: The top_kernels list grows from ~4 short-name groups to potentially 15-20 entries. The existing top_n limit handles this      
+  naturally — only the highest-cost variants surface.
+
+  ---                                                                                                                                   
+  Option 2: Keep shortName grouping, add variants subfield
+
+  Keep current aggregation intact. Add variants: list[KernelVariant] to KernelSummary, where each variant lists its demangled name, call
+  count, and timing. The agent can drill into variants on demand.                                                                         
+
+  Pro: Backward-compatible, compact top-level summary.                                                                                    
+  Con: The agent only sees variants if it reasons to look at them. The most important structural information — that the two dominant    
+  Dslash variants together account for 16.3s while BLAS accounts for only 1.6s — is still hidden at the top level.                        
+
+  ---                                                                                                                                     
+  Option 3: Extract a parsed "logical name"                                                                                             
+
+  Parse the demangled name with regex to extract the functor type + key template params (precision, KernelType, etc.) and synthesize a
+  compact label like dslash_functor[KT=5,prec=short].                                                                                     
+
+  Pro: Most readable for humans and agent alike.                                                                                          
+  Con: Requires QUDA-specific parsing knowledge. For other applications (cuDNN, PyTorch, user kernels), the structure is completely     
+  different — no single regex covers them all. This approach slides toward QUDA-specificity.                                              
+
+  ---                                                                                                                                     
+  My recommendation                                                                                                                     
+
+  Option 1, for these reasons:
+
+  - It's general: the normalization only strips universal CUDA boilerplate (the std::enable_if wrapper), not application-specific         
+  structure.
+  - The demangled name carries all the information the agent needs — C++ template specializations are essentially self-documenting for a  
+  capable model.                                                                                                                          
+  - It's a small change: swap k.shortName for COALESCE(k.demangledName, k.shortName) in the GROUP BY, plus a Python normalization function
+   on the name string.                                                                                                                    
+  - If it turns out that QUDA profiles need even more structure (e.g., KernelType → human label mapping), that's an optional additive   
+  layer, not a rearchitecture.                                                                                                            
+
+  One open question: should KernelSummary.name store the full normalized demangled name (200+ chars), or should we also carry a short_name
+   field for display? The full name is what the agent should reason over; a truncated display name is only needed for the CLI table. We 
+  could keep short_name for the Rich table and send name (full demangled) to the agent.                                                   
+
+  Does this direction make sense to you before we start coding?
+```
+
+## Categorizing the suggestions
+
+```
+❯ How easy would it be to categorize the returned hypotheses into categories like run/environment variables, compile-time flags and       
+optimizations, code optimizations, and algorithm improvements. Don't make any changes yet.                                                
+
+● Pretty easy — the natural implementation is to add a field to the hypothesis JSON that the LLM fills in at generation time. Here's the  
+  breakdown:                                                                                                                            
+
+  Why it's straightforward
+
+  The LLM already understands what type of intervention it's recommending when it writes the suggestion field. Adding an action_category  
+  enum field to the output schema just asks it to be explicit. No new tool calls, no post-processing heuristics needed.
+
+  What would change                                                                                                                       
+
+  1. loop.py system prompt — add action_category to the JSON schema and describe the four enum values. One short paragraph.               
+  2. loop.py hypothesis schema (the tool/structured-output spec) — add the field with an enum constraint.                               
+  3. __main__.py CLI table — add a column. Optionally add --filter-category to the analyze subcommand.                                    
+
+  That's roughly 15–20 lines across two files.                                                                                            
+
+  The main design question                                                                                                                
+
+  Your four proposed categories span two different axes:                                                                                  
+
+  ┌──────────────────────────────┬───────────────────────────────────────────────────────────────────┐                                    
+  │             Axis             │                            Categories                             │                                  
+  ├──────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ When the change takes effect │ run/env vars, compile-time flags, code changes, algorithm changes │
+  ├──────────────────────────────┼───────────────────────────────────────────────────────────────────┤
+  │ How hard to apply            │ trivial (env var) → significant (algorithm)                       │                                    
+  └──────────────────────────────┴───────────────────────────────────────────────────────────────────┘                                    
+
+  These overlap naturally but aren't identical. For example, switching MPI collective algorithms might be a runtime flag or a code change 
+  depending on the library. Worth deciding upfront whether:                                                                             
+
+  - The categories are mutually exclusive (pick one primary), or                                                                          
+  - Allow multiple (e.g., ["compile_flag", "code_optimization"])
+
+  One alternative: derive from suggestion with a second cheap pass                                                                        
+
+  You could run a haiku classification pass after hypothesis generation. Cleaner separation of concerns, but adds latency and cost for    
+  what the original model already knows implicitly. Probably not worth it.                                                              
+
+  Verdict                                                                                                                               
+
+  This is a small, low-risk addition — mostly a prompt and schema change. The main thing to settle first is the exact category taxonomy   
+  and whether a hypothesis can belong to multiple categories.
+
+❯ Can you come up with a better set of categories?                                                                                        
+
+● The original four categories mix two different axes — where the change lives (env var vs. source code) and how big the change is (flag  
+  flip vs. algorithm rewrite). That makes them hard to use for triage.                                                                    
+
+  A better organizing principle is effort to try, which is what a performance engineer actually wants when prioritizing. Here's a cleaner 
+  taxonomy:                                                                                                                               
+
+  ┌───────────────────┬───────────────────────────────────────────────────────────────────────┬───────────────────────────────────────┐   
+  │     Category      │                            What it covers                             │                Effort                 │
+  ├───────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────────────────────────┤   
+  │ runtime_config    │ Env vars, MPI params, CUDA driver flags, library runtime options      │ None — try immediately, no rebuild    │ 
+  │                   │ (e.g. NCCL_ALGO, cuBLAS workspace)                                    │                                       │
+  ├───────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────────────────────────┤   
+  │ launch_config     │ Block/grid dimensions, shared memory allocation, occupancy tuning     │ Low — change a constant or auto-tune  │
+  │                   │                                                                       │ call, recompile                       │   
+  ├───────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────────────────────────┤ 
+  │ code_optimization │ Kernel rewrites, memory layout/coalescing, stream pipelining, async   │ Moderate — targeted source changes,   │   
+  │                   │ transfers, collective selection                                       │ same algorithm                        │   
+  ├───────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────────────────────────┤
+  │ algorithm         │ Solver change, preconditioner, deflation, different parallelism       │ High — changes the computational      │   
+  │                   │ strategy, mathematical reformulation                                  │ approach                              │   
+  └───────────────────┴───────────────────────────────────────────────────────────────────────┴───────────────────────────────────────┘
+
+  Why this is better than the original:                                                                                                 
+
+  1. Ordered by effort — a performance engineer can immediately sort hypotheses as "try now" vs "hard". The original mixed env vars and   
+  compile flags into two categories at the same effort level.
+  2. launch_config earns its own slot — block size and occupancy changes are faster to experiment with than kernel rewrites (often        
+  auto-tunable), so conflating them with code_optimization buries quick wins.                                                             
+  3. code_optimization is bounded — it covers changes within the current algorithm, so it doesn't bleed into algorithm. The distinguishing
+   question: "Does this change what is computed, or just how it's computed?"                                                              
+  4. Mutually exclusive in practice — boundary cases exist (e.g., switching MPI collective could be code_optimization or algorithm), but
+  the rule is clear: does it change the mathematical/computational approach? If yes → algorithm. If it's just a better implementation of  
+  the same approach → code_optimization.
+```
+
+## Judging hypothesis/suggestion quality
+
+```
+❯ Next, let's discuss more deeply how to judge hypotheses and suggestions returned from the LLM. How do we eliminate the ones that don't  
+apply in our case? Does the agent need to look through the actual codebase to determine this? Can the agent determine which optimizations 
+ are already being used, which are available, which don't apply, and so on?  
+
+● This is a deep problem. Let me break it into distinct sub-problems because they have different solutions.                               
+
+  ---                                                                                                                                     
+  The three kinds of "doesn't apply"                                                                                                      
+
+  1. Unsupported by profile data — the LLM hallucinated or over-generalized. "Consider using tensor cores" when there's no evidence of    
+  FP16 operations. This is purely a grounding problem — solvable without source code.                                                     
+
+  2. Already implemented — the optimization is already in use. "Use shared memory for reuse" when the kernel already allocates 71 KB of   
+  shared memory. The profile often shows this implicitly — but the agent may ignore it.                                                 
+
+  3. Architecturally inapplicable — the suggestion doesn't fit the hardware, framework, or problem. "Reduce H2D transfer bandwidth" for a 
+  job that's already compute-bound and does negligible transfers.
+
+  ---                                                                                                                                   
+  What the profile already tells you (no source code needed)
+
+  The profile data is richer than it looks as a filter:
+
+  ┌──────────────────────────────────────┬────────────────────────────────────────────────────────────┐                                 
+  │            Profile signal            │             What it implies is already in use              │                                   
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ avg_shared_mem_bytes is high         │ shared memory tiling already employed                      │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ registersPerThread is 64+            │ compiler is already at -O2/-O3 or higher                   │                                 
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ estimated_occupancy ≈ 1.0            │ launch config is already near-optimal                      │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ CPU/GPU overlap exists in trace      │ async launches / stream pipelining in use                  │                                 
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ cpu_sync_blocked_pct is low          │ synchronization overhead already managed                   │                                 
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ MPI collectives visible              │ MPI is already the communication layer (not shared memory) │                                 
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────┤                                   
+  │ Grid dims match problem size exactly │ no obvious occupancy gap to exploit                        │                                 
+  └──────────────────────────────────────┴────────────────────────────────────────────────────────────┘    
+
+  So a significant fraction of "already implemented" cases can be caught by requiring the agent to cross-check its suggestion against the 
+  profile metrics before finalizing it.                                                                                                 
+
+  ---                                                                                                                                   
+  What requires source code
+
+  There's a real ceiling to profile-only filtering. You genuinely can't tell from a profile whether:
+
+  - __ldg() or __restrict__ annotations are used
+  - Prefetching is manually coded vs. absent                                                                                              
+  - A specific MPI collective was chosen deliberately vs. by default                                                                      
+  - The kernel is already using warp shuffle intrinsics                                                                                   
+  - The compiler flags include --use_fast_math                                                                                            
+
+  However, the agent doesn't need to read the codebase — it needs to search it. Targeted grep-style tools ("does this pattern exist in the
+   source?") would cover most cases without loading whole files. The key insight is that most suggestions reduce to a verifiable pattern: 
+  __ldg, cudaMemcpyAsync, cudaStreamCreate, MPI_Irecv, #pragma unroll, etc.
+
+  ---
+  Practical architecture
+
+  Tier 1 — Prompt-level grounding (free, implement now)
+
+  Require the agent to include a profile_evidence field for each hypothesis citing specific numbers. If it can't, the hypothesis is       
+  low-confidence. Also require it to check: "Does the profile already show this optimization in use?" before suggesting it.               
+
+  Tier 2 — Structured user context (lightweight)                                                                                        
+
+  A small --context input or flags the user provides once:                                                                                
+  - Compiler flags in use (-O3, --use_fast_math, target arch)
+  - Framework (QUDA, cuBLAS, custom kernels)                                                                                              
+  - Known constraints ("precision is fixed at half", "this is MPI-only, no OpenMP")                                                     
+
+  The agent uses this to filter at generation time. This is maybe 5–10 facts, not a full description of the codebase.                     
+
+  Tier 3 — Targeted source search tools (optional, high value)                                                                            
+
+  Give the agent a search_source tool that runs a grep against a provided source directory. The agent calls it after generating a         
+  hypothesis — not to understand the code, but to verify a specific claim. Examples:                                                    
+  - "Does this codebase call cudaMemcpyAsync?" before suggesting async transfers                                                          
+  - "Is __ldg used in this kernel file?" before suggesting it                                                                             
+  - "Are NVTX ranges manually inserted?" before recommending profiling annotations
+
+  This is much more tractable than full code reading. The agent already knows what pattern to look for because it just wrote the          
+  suggestion.   
+
+  ---                                                                                                                                     
+  The verdict                                                                                                                           
+
+  You don't need the agent to read the codebase. The realistic progression is:
+
+  1. Profile grounding eliminates hallucinated/unsupported hypotheses — this is a prompt change
+  2. User-provided context eliminates architecturally inapplicable ones — this is a small structured input                                
+  3. Targeted search tools eliminate "already implemented" ones — this is a new tool, optional but high value                             
+
+  Full source comprehension is expensive, brittle, and unnecessary for the filtering problem. The agent's job is hypothesis generation    
+  from performance data, not code review.  
+
+❯ Would it make sense to have a separate post-LLM-suggestion agent to evaluate the hypotheses/suggestions? This could even mean more      
+calls to the LLM if necessary. In terms of giving such a secondary agent more context, would it make sense to point it to the build and   
+run logs to understand the build flags that were used as well as the run environment? Also, if the codebase itself is provided to this    
+kind of agent for it to search through for various things, the problem is that many codebases are huge whereas the actual code relevant   
+to the current application is a very small fraction of it. Is there a feasible way to limit the agent's codebase search to the relevant   
+fraction?
+
+● All three ideas are sound and fit together naturally. Let me work through each.                                                         
+
+  ---                                                                                                                                     
+  A separate evaluation agent                                                                                                             
+
+  Yes, this is a well-established pattern — generator/critic, or proposer/verifier. The key insight is that the two passes require        
+  different reasoning postures: the primary agent is in a generative mode (what could be wrong?), while the evaluator should be skeptical 
+  (does the evidence actually support this? is this already handled?). Using the same model in the same context for both is harder than
+  separating them.                                                                                                                        
+
+  Practical benefits:
+  - Different system prompt → evaluator is instructed to be adversarial rather than creative
+  - Can use a cheaper model (Haiku or Sonnet) since it's classification/scoring, not open-ended reasoning                                 
+  - Produces structured output: confidence score, already_implemented: true/false, not_applicable: true/false, rationale
+  - Can invoke additional tools (build logs, source search) that the primary agent doesn't need                                           
+
+  The evaluator's job per hypothesis: does the profile evidence actually support this claim? Is there evidence it's already applied? Is it
+   architecturally applicable given the known context? Then it rescores and filters before the results reach the user.
+
+  ---                                                                                                                                     
+  Build and run logs                                                                                                                    
+
+  This is high-value and practical. These logs are typically small (a few KB to ~100KB) and contain exactly the information that's hardest
+   to infer from the profile:                                                                                                             
+
+  Build logs give you:                                                                                                                    
+  - Compiler flags (-O3, --use_fast_math, -arch=sm_80, -DQUDA_PRECISION=short)                                                          
+  - NVCC optimization reports (which loops were unrolled, vectorized — if -opt-report was used)                                           
+  - Library versions (CUDA toolkit, cuBLAS, MPI implementation)                                
+  - Which source files were compiled → natural map of the codebase structure                                                              
+
+  Run logs give you:                                                                                                                      
+  - MPI topology (ranks, nodes, how processes were mapped)                                                                              
+  - Environment variables that were set (OMP_NUM_THREADS, CUDA_VISIBLE_DEVICES, NCCL_ALGO, etc.)                                          
+  - Library auto-tuning output (cuBLAS and NCCL often print their selected algorithm)                                                   
+  - Application-level configuration (for QUDA/MILC: lattice volume, solver tolerance, deflation space size)                               
+  - Anything the application prints at startup                                                                                          
+
+  Many "already implemented" verdicts fall out directly from these two sources without touching source code at all. If the build log shows
+   --use_fast_math, the evaluator can immediately reject suggestions about enabling fast math. If the run log shows NCCL_ALGO=TREE was    
+  set, collective tuning suggestions are filtered.     
+
+  ---                                                                                                                                   
+  Limiting codebase search to the relevant fraction
+
+  This is the hard problem, but there's a natural solution hiding in the profile itself: the demangled kernel names are codebase 
+  navigation keys.                                                                                                                        
+
+  From a name like quda::Kernel3D<dslash_functor<...KernelType=5...>, ...>, the evaluator can extract dslash_functor and grep for it. In  
+  almost any CUDA codebase, a functor name appears in 1–3 source files. So the search path is:                                          
+
+  1. Extract functor/function name from the demangled kernel name (already available once todo item 2 is implemented)                     
+  2. Grep the codebase for that name → identifies 1–5 relevant files out of potentially thousands
+  3. Search within those files for specific patterns the evaluator wants to verify (__ldg, cudaMemcpyAsync, cudaStreamCreate, #pragma     
+  unroll, etc.)                                                                                                                           
+
+  This requires no semantic understanding of the code — just targeted pattern matching. The evaluator never needs to "read" the codebase; 
+  it needs to ask yes/no questions about it. The demangled names turn an unstructured codebase into a searchable index.                 
+
+  NVTX annotations reinforce this further. If the profile shows that the hot kernel is always launched inside an                          
+  nvtx::range("dslash_interior") region, that's an additional search term that maps directly to a code location.
+
+  What this looks like in practice:                                                                                                       
+
+  The evaluator receives a hypothesis: "Kernel3D interior Dslash appears memory-bandwidth limited — consider using __ldg for read-only    
+  lattice gauge links."                                                                                                                 
+
+  It then:                                                                                                                                
+  1. Extracts dslash_functor from the demangled name
+  2. Calls search_codebase("dslash_functor") → returns 2 matching files                                                                   
+  3. Calls search_in_files(["lib/dslash_staggered.cu", "include/dslash_functor.h"], "__ldg") → finds 47 matches                         
+  4. Verdict: already_implemented: true, filters the hypothesis                                                                           
+
+  The entire search touches maybe 2,000 lines of a 100,000-line codebase.
+
+  ---                                                                                                                                     
+  The complete picture                                                                                                                    
+
+  The evaluation agent gets:
+  - Hypotheses JSON from the primary agent                                                                                                
+  - Profile summary (reused, already computed)                                                                                          
+  - Build log path (user provides once, agent reads on demand — small)
+  - Run log path (same)                                                                                                                   
+  - search_codebase(pattern) tool → returns matching file paths
+  - read_file(path, lines) tool → reads specific files or ranges                                                                          
+
+  The demangled kernel names (todo item 2) are the connective tissue between the profile and the source — they let the evaluator navigate 
+  from "this kernel is slow" to "these are the relevant source files" in one grep.                                                        
+
+  Cost/latency is manageable: the evaluation pass can use Haiku since it's doing structured verification, not open-ended reasoning. The   
+  expensive Opus call remains scoped to hypothesis generation.
+
+❯ How would this be implemented? Make no changes yet. 
+
+● Overview
+
+  Two new files, two modified files. The evaluator is a second agent loop that runs after the primary agent, optionally triggered by
+  providing build/run logs or a source directory.
+
+  ---
+  New files
+
+  nsight_agent/agent/eval_tools.py
+
+  Filesystem tools exposed to the evaluator — completely separate from the profile query tools in tools.py:
+
+  - search_codebase(pattern, directory, file_glob=None) — shells out to rg (ripgrep) or grep -r; returns a list of (file_path,
+  line_number, line_content) matches, capped at ~50 results to avoid context explosion. The evaluator uses this first to locate relevant
+  files by grepping for functor names extracted from demangled kernel names, then again to check for specific patterns within those files.
+  - read_file_section(path, start_line, end_line) — reads a slice of a source file. The evaluator uses this after search_codebase
+  identifies relevant files, not to understand the code but to verify a specific narrow claim (e.g., "is __ldg used near the gauge field
+  load?").
+  - read_log(path, max_lines=500) — reads a build or run log, truncated. The evaluator calls this once at the start to establish context:
+  compiler flags, env vars, runtime configuration, library versions.
+
+  All three validate that paths stay within user-provided roots to avoid path traversal.
+
+  nsight_agent/agent/evaluator.py                                                                                                         
+
+  The evaluation agent loop. Main entry point:                                                                                            
+
+  def run_evaluator(                                                                                                                    
+      hypotheses: list[dict],                                                                                                             
+      profile_summary: ProfileSummary,
+      build_log: str | None,                                                                                                              
+      run_log: str | None,                                                                                                              
+      source_dir: str | None,                                                                                                           
+      model: str | None = None,                                                                                                           
+      provider: str | None = None,
+      token_usage: dict | None = None,                                                                                                    
+  ) -> list[dict]                                                                                                                         
+
+  System prompt — explicitly adversarial posture: "You are a skeptical performance engineer. For each hypothesis, determine: (1) is the   
+  profile evidence cited accurate and sufficient? (2) is there any evidence this optimization is already applied? (3) is it applicable  
+  given the hardware and software context?"                                                                                               
+
+  Pre-seeded context — the hypotheses JSON and profile summary are injected as pre-seeded tool results (same pattern as the primary       
+  agent), so the evaluator starts with full context before making any tool calls.
+
+  Output tool — submit_evaluations takes a list of evaluated hypotheses, each adding:                                                     
+  evaluation_status: "confirmed" | "already_implemented" | "not_applicable" | "insufficient_evidence" | "speculative"                   
+  evaluation_rationale: str   # one sentence explaining the verdict                                                                       
+  confidence_score: float     # 0.0–1.0                                                                                                   
+  filtered: bool              # whether to suppress from default output                                                                 
+
+  Loop depth — shallow, maybe 5 turns max. The evaluator makes a handful of tool calls (read build log, search for functor name, check for
+   a pattern), then submits verdicts. It doesn't need the deep reasoning loop of the primary agent.                                       
+
+  Model default — claude-haiku-4-5-20251001 unless overridden, since this is classification/verification not open-ended reasoning.        
+
+  ---                                                                                                                                     
+  Modified files                                                                                                                        
+
+  nsight_agent/__main__.py
+
+  New arguments on p_analyze:                                                                                                           
+
+  --build-log PATH          Path to build log (compiler flags, library versions)
+  --run-log PATH            Path to run/stdout log (env vars, runtime config)                                                             
+  --source-dir PATH         Root of source tree for codebase search
+  --no-evaluate             Skip evaluation pass even if context is provided                                                              
+  --evaluate-model MODEL    Model for evaluation pass (default: haiku)                                                                  
+
+  The evaluation pass is opt-in — it only runs if at least one of --build-log, --run-log, or --source-dir is provided (and --no-evaluate  
+  is not set).                                                                                                                            
+
+  cmd_analyze becomes a two-stage pipeline:                                                                                               
+
+  compute_profile_summary()                                                                                                               
+      → run_agent()              # primary: generates raw hypotheses                                                                      
+      → run_evaluator()          # secondary: scores and filters (if context provided)
+      → display()                # filtered view by default; --show-filtered to include suppressed ones                                   
+
+  The CLI table gains an Eval column showing confirmed / filtered / speculative etc., and filtered hypotheses are either hidden (default) 
+  or shown dimmed with --show-filtered.                                                                                                   
+
+  nsight_agent/analysis/models.py                                                                                                         
+
+  Optionally add evaluation fields to the hypothesis TypedDict/schema so the JSON output (--json) is self-describing. Alternatively keep  
+  hypotheses as plain dicts throughout — lower coupling, easier to add the evaluation pass incrementally.                               
+
+  ---                                                                                                                                   
+  Key design questions to resolve before implementing
+
+  1. Does the evaluator always run, or only when context is provided?
+  Even without build/run logs or source, the evaluator can do useful profile-grounded filtering (checking that cited numbers are accurate,
+   flagging suggestions that contradict what the profile shows). Could run in a "lightweight mode" with no filesystem tools.              
+  2. How are demangled kernel names used as navigation keys?
+  The evaluator needs to extract functor names from demangled names to drive search_codebase. This depends on todo item 2 (demangled name 
+  resolution) being implemented first — otherwise the evaluator only has short names like "Kernel3D" to search for, which are less useful.
+   The evaluator implementation should probably come after item 2.                                                                        
+  3. Does the evaluator ever add hypotheses?                                                                                              
+  The simple answer is no — keep it focused. But it could in principle notice something the primary agent missed while reading the build
+  log (e.g., "fast math is not enabled" when the primary agent didn't flag it). If so, it would need a submit_hypotheses tool too, which  
+  increases scope.
+  4. Token budget for evaluation pass                                                                                                     
+  Build and run logs can be large. read_log should truncate, but the truncation strategy matters — beginning (has compiler invocation) vs.
+   end (has runtime output) may both be important. A reasonable default: read first 200 lines and last 100 lines of each log.
+```
+
+## Multi-model hypothesis generation
+
+```
+❯ For an end user interested in a comprehensive analysis, would it make sense to give the option to query multiple LLMs for               
+hypotheses/suggestions and then combine/synthesize all suggestions at the end?                                                            
+
+● Yes, it makes sense and fits naturally into the existing architecture. A few angles worth considering:                                  
+
+  Why it could be valuable                                                                                                                
+
+  Different models have different training cutoffs, knowledge of GPU performance papers, and reasoning styles. Empirically, Claude tends  
+  toward structured causal reasoning; GPT-4o tends toward pattern matching against known benchmarks; Gemini can surface different       
+  memory-hierarchy intuitions. For a domain as specialized as GPU performance tuning, ensemble coverage could reduce the "blind spots" any
+   single model has.                                                                                                                    
+
+  The more concrete benefit: the evaluator agent (todo item 6) already needs to filter and score hypotheses. If you're running the        
+  evaluator anyway, the marginal cost of deduplicating and merging two hypothesis lists before passing them to the evaluator is low.
+
+  How it would fit the architecture                                                                                                     
+
+  The cleanest approach would be a new flag like --multi-model model1,model2 that runs run_agent() in parallel for each specified model,  
+  collects all hypothesis lists, merges them (deduplicate by semantic similarity or by exact description string), and then either:
+  - (a) passes the merged list directly to the evaluator for scoring/filtering, or                                                        
+  - (b) adds a synthesis step: a short LLM call (Haiku) that groups near-duplicate hypotheses and picks the best-worded version of each.
+
+  Option (a) is simpler and probably sufficient if demangled names and bottleneck types are consistent enough across models to cluster    
+  duplicates structurally.                                                                                                                
+
+  Caveats                                                                                                                                 
+
+  - Cost multiplies linearly with the number of models. On a large profile (565 MB, 80 queries), one Opus run costs non-trivially; three  
+  runs costs three times that.                                                                                                          
+  - You'd need a deduplication step before displaying results — showing 3× the hypotheses where 2/3 are near-duplicates would be worse UX 
+  than a single clean list.                                                                                                               
+  - The "best of N" value is highest when models genuinely disagree on what matters, not just phrasing. On a memory-bandwidth-bound
+  kernel, all three will likely say the same thing.                                                                                       
+
+  Verdict                                                                                                                                 
+
+  Worth adding as a future item, but lower priority than items 2 and 5 (demangled names + action categories), which improve output quality
+   for every run. The natural implementation slot is: after the evaluator (item 6) is working, since the evaluator handles
+  deduplication/filtering and could absorb the merged list without changes.                                                               
+
+  Want me to add this to todo_list.md?                                                                                                    
+
+❯ Yes, add it to todo_list.md  
+```
+
+## Estimating token cost and asking for permission
+
+```
+❯ Would it be possible to semi-accurately estimate token cost after the local analysis and before the LLM is queried, report this         
+estimate to the user and wait for confirmation to proceed? 
+
+● Yes, and it's more accurate than you might expect for the input side.                                                                   
+
+  Why input tokens are predictable                                                                                                        
+
+  The primary agent input is almost entirely determined before the first LLM call:                                                        
+  - The system prompt is a fixed string (known at import time)                                                                          
+  - The pre-seeded profile summary is the JSON from compute_profile_summary(), which is already computed                                  
+  - The tool schemas are fixed                                                                                                          
+
+  You can serialize both and count tokens exactly using Anthropic's token-counting API (client.messages.count_tokens()), or approximate 
+  with a character/4 heuristic (accurate to ~5% for English/JSON). Either way, you have the full input in hand before paying for it.      
+
+  Why output tokens are a rough estimate                                                                                                  
+
+  Output depends on how many tool calls the agent makes and how verbose its reasoning is — both variable. A reasonable heuristic:         
+  MAX_TURNS × ~600 tokens/turn for the agentic back-and-forth, plus ~800 tokens for the final hypothesis output. This gives a plausible
+  upper bound, not a precise figure. Showing it as a range (e.g., "estimated $0.04–$0.12") is more honest than a single number.           
+
+  Implementation
+
+  The natural place is in cmd_analyze, between the compute_profile_summary() call and run_agent():                                        
+
+  1. Serialize the system prompt + profile summary JSON                                                                                   
+  2. Count input tokens (local heuristic or a single count_tokens API call)                                                             
+  3. Apply a fixed output-token estimate                                                                                                  
+  4. Look up per-token prices from a small hardcoded table (with a "prices may be outdated" note)                                       
+  5. Print: "Estimated cost: $0.05–$0.15 (Xk input tokens, ~Yk output tokens). Proceed? [Y/n]"                                            
+  6. Skip confirmation if --yes / --quiet is passed
+
+  Caveats to document                                                                                                                     
+
+  - Prices are hardcoded and will drift; show them as approximate                                                                         
+  - Multi-model ensemble (item 7) multiplies the estimate by N models — the confirmation step is especially valuable there              
+  - Gemini doesn't expose a cheap local token counter; fall back to char/4                                                                
+
+  Worth adding to todo_list.md? Or implement it now since it's self-contained?                                                            
+
+❯ Add it to todo_list.md.
+```
+
+## Making it public
+
+```
+❯ If all the todo_list.md items were completed, what would remain to be done prior to making nsight-agent public and ready to use by the  
+end user?  
+
+● Here's what I see as remaining gaps, grouped by category:                                                                               
+                                                   
+  Testing                                                                                                                                 
+                                                                                                                                          
+  The test suite is currently integration-only, tied to a hardcoded absolute path (/home/ads.leonhost/Downloads/...). This means:         
+  - Tests cannot run in CI or on any other machine                                                                                        
+  - There are no unit tests for individual metric functions with synthetic data                                                           
+  - No mock-based tests for the agent loop (verifying tool dispatch, multi-turn logic, provider routing)                                  
+  - No tests for OpenAI or Gemini backends                                                                                                
+  - No regression tests for the schema-compatibility work from item 9                                                                     
+                                                                                                                                          
+  For a public release, you need at minimum a small synthetic SQLite fixture (a few hundred rows of fake kernel data) so the core metric  
+  tests can run anywhere without the real profile.                                                                                        
+                                                                                                                                          
+  Distribution                                                                                                                            
+                                                                                                                                        
+  - No LICENSE file — required before any public release                                                                                  
+  - No PyPI publishing setup (build, twine not in dev deps; no release workflow)
+  - No CHANGELOG                                                                                                                          
+  - No --version flag on the CLI                                                                                                        
+                                                                                                                                          
+  Repository hygiene                                                                                                                    
+                                                                                                                                          
+  - LEON.md is modified (shows in git status) — unclear if this is personal notes that shouldn't be public                                
+  - .gitignore should cover .venv/, *.sqlite exports, *_prompt.txt / *_response.txt agent output files, and __pycache__
+  - No CI configuration (GitHub Actions or equivalent) to run ruff and pytest on push                                                     
+                                                                                                                                          
+  User-facing error handling                                                                                                              
+                                                                                                                                          
+  - Missing API key: currently likely throws a raw SDK exception rather than a clean message                                              
+  - Profile not found or not a valid SQLite file: same
+  - No --version flag                                                                                                                     
+  - The nsys export prerequisite requires Nsight Systems installed — most users will want to analyze profiles on a laptop/workstation     
+  where nsys isn't available. The SQLite is portable; this workflow should be called out explicitly in the README                         
+                                                                                                                                          
+  Privacy and data disclosure                                                                                                             
+                                                                                                                                        
+  The README's Risks section covers hallucination and SQL injection but doesn't explicitly tell users that their profile data — including 
+  kernel names, NVTX annotations, and timing data — is sent to a third-party LLM API. For HPC users at institutions with data governance
+  policies, this needs to be clearly stated upfront, not buried in a risks section.                                                       
+                                                                                                                                        
+  Packaging completeness
+
+  pyproject.toml has no [project.urls] (homepage, issue tracker), no description, no authors, no classifiers. These are required for a    
+  proper PyPI listing and expected even for a GitHub-only release.
+                                                                                                                                          
+  ---                                                                                                                                   
+  In rough priority order: license → .gitignore / repo hygiene → portable test fixtures → clean error handling for missing API key / bad
+  profile → privacy disclosure → --version → CI → PyPI metadata. The README update (item 10) covers the rest.
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
