@@ -133,6 +133,18 @@ def _extract_hypotheses(text: str) -> list[dict[str, Any]]:
     return []
 
 
+def _trunc(s: str, n: int = 200) -> str:
+    return s[:n] + "..." if len(s) > n else s
+
+
+def _turn_header(turn: int, max_turns: int) -> None:
+    label = f" Turn {turn} / {max_turns} "
+    dashes = max(0, 60 - len(label))
+    left = dashes // 2
+    right = dashes - left
+    print(f"\n{'─' * left}{label}{'─' * right}")
+
+
 def _save_files(
     profile_path: Path,
     prompt: str,
@@ -151,8 +163,8 @@ def _save_files(
     response_path.write_text(response, encoding="utf-8")
 
     if verbose:
-        print(f"[agent] Prompt saved to:   {prompt_path}")
-        print(f"[agent] Response saved to: {response_path}")
+        print(f"[local] Prompt saved to:   {prompt_path}")
+        print(f"[local] Response saved to: {response_path}")
 
     return prompt_path, response_path
 
@@ -264,7 +276,7 @@ def _run_api(
     input_tokens = 0
     output_tokens = 0
 
-    for _ in range(max_turns):
+    for turn in range(1, max_turns + 1):
         response = client.messages.create(
             model=model,
             max_tokens=4096,
@@ -277,11 +289,12 @@ def _run_api(
         messages.append({"role": "assistant", "content": response.content})
 
         if verbose:
+            _turn_header(turn, max_turns)
             for block in response.content:
                 if hasattr(block, "text"):
-                    print(f"[agent] {block.text[:200]}{'...' if len(block.text) > 200 else ''}")
+                    print(f"[← llm] {_trunc(block.text)}")
                 elif hasattr(block, "name"):
-                    print(f"[tool ] {block.name}({json.dumps(block.input)[:120]})")
+                    print(f"[← llm:tool] {block.name}({_trunc(json.dumps(block.input), 120)})")
 
         if response.stop_reason == "end_turn":
             for block in reversed(response.content):
@@ -303,7 +316,7 @@ def _run_api(
                 continue
             result_json = dispatch(profile, block.name, block.input)
             if verbose:
-                print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
+                print(f"[local] {block.name} → {_trunc(result_json)}")
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -390,7 +403,7 @@ def _run_openai(
                 return client.chat.completions.create(**kwargs)
             raise
 
-    for _ in range(max_turns):
+    for turn in range(1, max_turns + 1):
         response = _create(messages)
         if response.usage:
             input_tokens += response.usage.prompt_tokens
@@ -412,11 +425,11 @@ def _run_openai(
         messages.append(msg_dict)
 
         if verbose:
+            _turn_header(turn, max_turns)
             if msg.content:
-                print(f"[agent] {msg.content[:200]}{'...' if len(msg.content) > 200 else ''}")
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    print(f"[tool ] {tc.function.name}({tc.function.arguments[:120]})")
+                print(f"[← llm] {_trunc(msg.content)}")
+            for tc in (msg.tool_calls or []):
+                print(f"[← llm:tool] {tc.function.name}({_trunc(tc.function.arguments, 120)})")
 
         if choice.finish_reason == "stop":
             hypotheses = _extract_hypotheses(msg.content or "")
@@ -433,7 +446,7 @@ def _run_openai(
         for tc in (msg.tool_calls or []):
             result_json = dispatch(profile, tc.function.name, json.loads(tc.function.arguments))
             if verbose:
-                print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
+                print(f"[local] {tc.function.name} → {_trunc(result_json)}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -517,15 +530,16 @@ def _run_gemini(
     response = chat.send_message(init_msg)
     _add_gemini_usage(response)
 
-    for _ in range(max_turns):
+    for turn in range(1, max_turns + 1):
         function_calls = response.function_calls or []
 
         if verbose:
+            _turn_header(turn, max_turns)
             text = response.text or ""
             if text:
-                print(f"[agent] {text[:200]}{'...' if len(text) > 200 else ''}")
+                print(f"[← llm] {_trunc(text)}")
             for fc in function_calls:
-                print(f"[tool ] {fc.name}({dict(fc.args)})")
+                print(f"[← llm:tool] {fc.name}({_trunc(str(dict(fc.args)), 120)})")
 
         if not function_calls:
             text = response.text or ""
@@ -543,7 +557,7 @@ def _run_gemini(
         for fc in function_calls:
             result_json = dispatch(profile, fc.name, dict(fc.args))
             if verbose:
-                print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
+                print(f"[local] {fc.name} → {_trunc(result_json)}")
             parts.append(
                 genai_types.Part.from_function_response(
                     name=fc.name,
@@ -567,18 +581,18 @@ def _run_claude_code(
     summary: ProfileSummary | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, float | None]:
     if verbose:
-        print("[agent] No API key found — falling back to Claude Code (claude -p)")
+        print("[local] No API key found — falling back to Claude Code (claude -p)")
 
     if summary is None:
         if verbose:
-            print("[agent] Computing profile summary...")
+            print("[local] Computing profile summary...")
         summary = compute_profile_summary(profile)
 
     summary_json = summary.model_dump_json(indent=2)
     prompt = _format_summary_prompt(summary_json, profile.path.name)
 
     if verbose:
-        print("[agent] Sending to Claude Code...")
+        print("[→ llm] Sending profile summary to Claude Code...")
 
     result = subprocess.run(
         ["claude", "-p", prompt, "--output-format", "json"],
@@ -605,7 +619,7 @@ def _run_claude_code(
     _save_files(profile.path, prompt, response_text, verbose)
 
     if verbose:
-        print(f"[agent] {response_text[:300]}{'...' if len(response_text) > 300 else ''}")
+        print(f"[← llm] {_trunc(response_text, 300)}")
 
     return _extract_hypotheses(response_text), inp, out, cost_usd
 
@@ -643,7 +657,7 @@ def run_agent(
     profile = NsysProfile(profile_path)
 
     if verbose:
-        print(f"[agent] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
+        print(f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
 
     try:
         if resolved_provider == "anthropic":
