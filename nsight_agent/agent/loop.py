@@ -49,7 +49,7 @@ _KNOWN_PROVIDERS = ("anthropic", "openai", "gemini")
 # Providers not listed here (e.g. anthropic, claude_code) are always available.
 _PROVIDER_PACKAGES: dict[str, tuple[str, str]] = {
     "openai": ("openai", "pip install openai"),
-    "gemini": ("google.generativeai", "pip install google-generativeai"),
+    "gemini": ("google.genai", "pip install google-genai"),
 }
 
 
@@ -456,33 +456,32 @@ def _run_gemini(
     summary: ProfileSummary | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     try:
-        import google.generativeai as genai
-        from google.generativeai.types import FunctionDeclaration, Tool as GeminiTool
+        from google import genai
+        from google.genai import types as genai_types
     except ImportError:
         raise ImportError(
-            "google-generativeai package is required for the Gemini backend: pip install google-generativeai"
+            "google-genai package is required for the Gemini backend: pip install google-genai"
         )
 
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY environment variable is not set for Gemini backend")
-    genai.configure(api_key=api_key)
+
+    client = genai.Client(api_key=api_key)
 
     schemas = tool_schemas()
     declarations = [
-        FunctionDeclaration(
+        genai_types.FunctionDeclaration(
             name=s["name"],
             description=s["description"],
             parameters=s["input_schema"],
         )
         for s in schemas
     ]
-    gemini_model = genai.GenerativeModel(
-        model_name=model,
-        tools=[GeminiTool(function_declarations=declarations)],
+    config = genai_types.GenerateContentConfig(
         system_instruction=_SYSTEM_PROMPT_API,
+        tools=[genai_types.Tool(function_declarations=declarations)],
     )
-    chat = gemini_model.start_chat()
 
     # Gemini doesn't support injecting pre-computed tool results into history;
     # include the pre-computed summary directly in the initial user message.
@@ -504,6 +503,7 @@ def _run_gemini(
     else:
         init_msg = "Begin analysis."
 
+    chat = client.chats.create(model=model, config=config)
     input_tokens = 0
     output_tokens = 0
 
@@ -518,23 +518,17 @@ def _run_gemini(
     _add_gemini_usage(response)
 
     for _ in range(max_turns):
-        function_calls = [
-            p.function_call for p in response.parts
-            if getattr(p, "function_call", None) and p.function_call.name
-        ]
+        function_calls = response.function_calls or []
 
         if verbose:
-            for p in response.parts:
-                if getattr(p, "text", None):
-                    print(f"[agent] {p.text[:200]}{'...' if len(p.text) > 200 else ''}")
-                fc = getattr(p, "function_call", None)
-                if fc and fc.name:
-                    print(f"[tool ] {fc.name}({dict(fc.args)})")
+            text = response.text or ""
+            if text:
+                print(f"[agent] {text[:200]}{'...' if len(text) > 200 else ''}")
+            for fc in function_calls:
+                print(f"[tool ] {fc.name}({dict(fc.args)})")
 
         if not function_calls:
-            text = "".join(
-                p.text for p in response.parts if getattr(p, "text", None)
-            )
+            text = response.text or ""
             hypotheses = _extract_hypotheses(text)
             if hypotheses:
                 prompt_record = (
@@ -545,20 +539,18 @@ def _run_gemini(
                 return hypotheses, input_tokens, output_tokens
             return [], input_tokens, output_tokens
 
-        function_responses = []
+        parts = []
         for fc in function_calls:
             result_json = dispatch(profile, fc.name, dict(fc.args))
             if verbose:
                 print(f"[tool ] → {result_json[:200]}{'...' if len(result_json) > 200 else ''}")
-            function_responses.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=fc.name,
-                        response={"result": json.loads(result_json)},
-                    )
+            parts.append(
+                genai_types.Part.from_function_response(
+                    name=fc.name,
+                    response={"result": json.loads(result_json)},
                 )
             )
-        response = chat.send_message(function_responses)
+        response = chat.send_message(parts)
         _add_gemini_usage(response)
 
     raise RuntimeError(f"Agent did not finish within {max_turns} turns")
