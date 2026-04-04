@@ -36,9 +36,32 @@ def _print_timings(timings: dict[str, float]) -> None:
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
-    from nsight_agent.agent.loop import run_agent
+    from nsight_agent.agent.loop import (
+        _parse_provider_and_model,
+        check_provider_available,
+        get_provider_availability,
+        run_agent,
+    )
     from nsight_agent.analysis.metrics import compute_profile_summary
     from nsight_agent.ingestion.profile import NsysProfile
+
+    # Resolve provider early so we can fail fast before any expensive work.
+    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.provider, args.model)
+
+    if not args.quiet:
+        console.print(f"Using AI provider = [cyan]{resolved_provider}[/cyan], model = [cyan]{resolved_model}[/cyan] (selected based on {reason})")
+
+    missing = check_provider_available(resolved_provider)
+    if missing:
+        console.print(f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}")
+        sys.exit(1)
+
+    # Warn about any other unavailable providers so the user knows what's on offer.
+    if not args.quiet:
+        availability = get_provider_availability()
+        unavailable = [(p, hint) for p, hint in availability.items() if hint and p != resolved_provider]
+        for p, hint in unavailable:
+            console.print(f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False)
 
     timings: dict[str, float] = {}
     with NsysProfile(args.profile) as profile:
@@ -178,9 +201,10 @@ def main() -> None:
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
     )
     p_analyze.add_argument(
-        "--model", default="claude-opus-4-6",
+        "--model", default=None,
         help=(
-            "Model for hypothesis generation (default: claude-opus-4-6). "
+            "Model for hypothesis generation (default: per-provider — "
+            "claude-opus-4-6 for anthropic, gpt-4o for openai, gemini-2.0-flash for gemini). "
             "Use a provider prefix to select the backend implicitly: "
             "openai:gpt-4o, gemini:gemini-2.0-flash, anthropic:claude-opus-4-6."
         ),

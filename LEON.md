@@ -985,15 +985,177 @@ Next, I had Claude implement a few more of the items on our todo list including 
 Please create a README.md for the end user. It should include an overview of how it works (highlighting which parts do or do not query the LLM), how to use it (including various use cases like different providers, setting the max phases, etc.). Include also information on token expenditure and how to minimize token expenditure if desired.
 ```
 
-After creating the README, I asked Claude to implement also token reporting to report the input and output tokens used after the end of a run.
+After creating the README, I asked Claude to implement also token reporting to report the input and output tokens used after the end of a run, and it did that.
 
+```
+For the calls to LLM, whether through API or Claude Code, do I need to be worried that those remote LLMs are saving memories of my      
+interactions and that those memories of past calls could influence the current call? For example, if I analyze a particular program once  
+and then analyze a second program later, I don't want any accumulated memories of the earlier calls to affect the current call. Don't     
+make any changes without asking. 
+```
 
+Claude responded with:
 
+```
+● No, you don't need to worry about this for any of the backends used here.                                                               
 
+  API backends (Anthropic, OpenAI, Gemini): These are stateless by design. Each call to client.messages.create() /                        
+  client.chat.completions.create() / chat.send_message() is fully self-contained. The entire conversation context is sent in the request  
+  body on every call — there is no server-side memory that persists between separate run_agent() invocations. A new analysis of a second  
+  profile starts with a completely clean slate.                                                                                           
 
+  Claude Code fallback (claude -p): This is a one-shot subprocess call with --output-format json. The -p flag means "non-interactive /    
+  print mode," which does not create or reuse a session. Each invocation is independent. (You can verify this: the JSON response you      
+  shared earlier has a session_id, but that ID is never reused — a new one is generated each time, and the subprocess exits immediately   
+  after.)                                                                                                                                 
 
+  The one nuance in the Claude Code response you shared: cache_creation_input_tokens: 6583 and cache_read_input_tokens: 10977. This is    
+  prompt caching — the provider caches the static parts of the current system prompt to reduce latency and cost on repeated calls within a
+   short time window (typically minutes). This is purely a performance optimization; it does not give the model any memory of prior       
+  conversations or prior profile contents. The cached tokens are just text that was already sent in the current or a very recent request. 
 
+  So in short: each nsight-agent analyze run is isolated. Past profile analyses cannot influence a future one.
+```
 
+## Multiple MPI ranks
+
+What about multiple ranks?
+
+```
+How much of a benefit would there be to be able to analyze multi-rank profiles (multiple files). How might this be implemented and      
+used. Don't make any changes yet.
+```
+
+I then added:
+
+```
+What about the following. We have "analyze" for the current approach of deep analysis and improvement hypothesis generation for a       
+single rank profile. We use "compare" for comparing two different profiles and have the LLM return a useful comparison rather than        
+hypotheses for performance improvement. And then we use "mpianalyze" as an extension to "analyze" which extracts MPI metrics from each    
+rank's file, pre-aggregates it, and then sends this data along with the ProfileSummary so that the LLM can also see relevant cross-rank   
+MPI data when generating its hypotheses? Don't make any changes yet.
+```
+
+Claude responded with:
+
+```
+● That's a clean separation of concerns. Let me reflect back my understanding and flag a few design questions.                            
+
+  analyze — unchanged. Single-rank deep analysis, hypothesis generation. Works today.                                                     
+
+  compare — takes two profiles, returns a structured comparison. The LLM output is a diff narrative rather than ranked improvement        
+  hypotheses: what changed, what got better, what got worse, what's unexplained. Natural use case: before/after an optimization, or ev0 vs
+   ev1024 on the same rank.                                                                                                               
+
+  mpianalyze — single entry point that accepts N rank files, runs the existing compute_profile_summary on one designated "primary" rank   
+  (rank 0 by default, or whichever the user specifies), pre-aggregates cross-rank MPI metrics into a compact structure, then sends both to
+   the LLM together. The agent generates hypotheses as usual, but now has cross-rank context to ground MPI-related ones.                  
+
+  ---
+  A few things worth deciding before implementation:
+
+  1. Which rank is the "primary" for mpianalyze?
+  The full per-rank ProfileSummary (kernel breakdown, occupancy, etc.) will only be computed for one rank — computing it for all N would  
+  be expensive and flood the context. The natural choice is rank 0, but the slow rank might be more informative. You could let the        
+  pre-aggregation step identify the outlier rank and make that the primary, or just let the user specify with --primary-rank.             
+
+  2. What exactly goes into the pre-aggregated MPI structure?                                                                             
+  At minimum: per-rank totals for GPU kernel time, MPI wait time, and top-kernel breakdown — plus cross-rank statistics (mean, std dev,
+  min/max with rank IDs). The imbalance score per collective operation (max − min / mean across ranks) is probably the highest-value      
+  derived metric. The question is whether to also include per-rank phase breakdowns or just global totals. Global totals are sufficient to
+   identify which rank is slow; phases would help if the imbalance is phase-specific (e.g., one rank is slow only in the solver phase).   
+
+  3. File selection UX                                                                                                                    
+  For 8 ranks this is manageable, but at 64+ ranks you don't want to list files manually. A glob pattern ("report.0.*.sqlite") with
+  automatic rank-ID parsing from the filename would be more practical. The Nsight per-rank naming convention is usually predictable enough
+   to support this.                                         
+
+  4. Does mpianalyze need its own agent prompt, or can it reuse analyze's?                                                                
+  The system prompt and hypothesis schema can stay the same — you'd just inject the cross-rank MPI summary as an additional pre-seeded
+  tool result alongside profile_summary and phase_summary. The agent doesn't need special instructions; the data speaks for itself. This  
+  keeps the implementation delta small.                     
+
+  ---                                                       
+  Overall the design is sound and the three commands have non-overlapping purposes. Does the above match your intent, and do you have
+  preferences on any of the four questions?
+```
+
+## Testing with Open AI
+
+I have a \$5 account with OpenAI API. Let me test that now. In my OpenAI account, I added a new API key.
+
+```
+export OPENAI_API_KEY=sk-proj-1t...
+python -m nsight_agent analyze /home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite 2>&1
+```
+
+This failed during the LLM-query part with an error message starting with:
+
+```
+  File "/home/ads.leonhost/Dropbox/AIProjects/2026_nsight_systems_performance/nsight_agent/agent/loop.py", line 320, in _run_openai
+    from openai import OpenAI
+ModuleNotFoundError: No module named 'openai'
+```
+
+I want nsight-agent to catch this kind of thing earlier and to be more informative. So after a couple iterations, it now shows the following at the beginning of a successful test using Claude Code:
+
+```
+Using AI provider = claude_code (selected based on no API keys found — falling back to claude subprocess)
+Warning: openai provider unavailable (pip install openai)
+Warning: gemini provider unavailable (pip install google-generativeai)
+```
+
+On an unsuccessful test using OpenAI, it shows:
+
+```
+Using AI provider = openai (selected based on presence of OPENAI_API_KEY)
+Error: openai provider requires a missing package: pip install openai
+```
+
+I made a new conda environment called `ai` and installed the `openai` and `google-generativeai` packages therein. The former I was able to install via conda, but the latter had to be installed via pip.
+
+Next, it failed because it tried to use `--provider=openai` but was still somehow defaulting to `model=claude-opus-4-6`. So I had Claude fix that issue.
+
+This finally worked. It defaulted to using the `gpt-4o` model. The suggestions it returned are laughably vague:
+
+```
+┏━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ #   ┃ Type                ┃ Impact ┃ Description                                       ┃ Suggestion                                         ┃
+┡━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 1   │ compute_bound       │ —      │ Kernel3D is the dominant kernel taking 92.5% of   │ Optimize Kernel3D by checking for redundant        │
+│     │                     │        │ total GPU time.                                   │ computations, improving data locality, and         │
+│     │                     │        │                                                   │ maximizing occupancy.                              │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 2   │ memory_bound        │ medium │ High P2P communication load could indicate        │ Evaluate the necessity of all P2P transfers and    │
+│     │                     │        │ limited memory bandwidth or sub-optimal routing.  │ attempt to reduce their frequency or volume.       │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 3   │ mpi_imbalance       │ high   │ MPI_Barrier operations are frequent and compute   │ Revisit algorithm design to reduce synchronization │
+│     │                     │        │ time-consuming.                                   │ points and enhance concurrency across ranks.       │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 4   │ cpu_launch_overhead │ low    │ Long launch times for some kernels indicate       │ Improve CPU-to-GPU task dispatching, use fewer     │
+│     │                     │        │ CPU-side bottlenecks.                             │ kernel launches, and batch work if possible.       │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 5   │ synchronization     │ high   │ Frequent MPI synchronizations resulting in        │ Analyze MPI operation patterns closely and         │
+│     │                     │        │ substantial idle time.                            │ minimize unnecessary synchronizations.             │
+├─────┼─────────────────────┼────────┼───────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ 6   │ io                  │ medium │ Significant time spent in MPI file operations at  │ Optimize file access, parallelize I/O, and         │
+│     │                     │        │ phase end.                                        │ investigate file system performance.               │
+└─────┴─────────────────────┴────────┴───────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+```
+
+I asked Claude for a list of openai models that I can use. It gave me a list of models but noted that its knowledge cuts off almost 9 months ago. It then provided me with a python command to get an updated list directly from openai:
+
+```bash
+python -c "from openai import OpenAI; [print(m.id) for m in OpenAI().models.list()]"
+```
+
+That returned a list of 120 models.
+
+When I tried to rerun with `--model gpt-5.4-pro`, it failed with error:
+
+```
+openai.NotFoundError: Error code: 404 - {'error': {'message': 'This is not a chat model and thus not supported in the v1/chat/completions endpoint. Did you mean to use v1/completions?', 'type': 'invalid_request_error', 'param': 'model', 'code': None}}
+```
 
 
 

@@ -20,6 +20,7 @@ Both prompt and raw response are saved next to the profile:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -33,9 +34,40 @@ from nsight_agent.agent.tools import dispatch, tool_schemas
 from nsight_agent.ingestion.profile import NsysProfile
 
 MODEL = "claude-opus-4-6"
+
+_DEFAULT_MODELS: dict[str, str] = {
+    "anthropic": "claude-opus-4-6",
+    "openai": "gpt-4o",
+    "gemini": "gemini-2.0-flash",
+    "claude_code": "claude-opus-4-6",
+}
 MAX_TURNS = 20
 
 _KNOWN_PROVIDERS = ("anthropic", "openai", "gemini")
+
+# Maps provider name -> (importable module, install hint).
+# Providers not listed here (e.g. anthropic, claude_code) are always available.
+_PROVIDER_PACKAGES: dict[str, tuple[str, str]] = {
+    "openai": ("openai", "pip install openai"),
+    "gemini": ("google.generativeai", "pip install google-generativeai"),
+}
+
+
+def check_provider_available(provider: str) -> str | None:
+    """Return an install hint string if the provider's package is missing, else None."""
+    if provider not in _PROVIDER_PACKAGES:
+        return None
+    module, hint = _PROVIDER_PACKAGES[provider]
+    try:
+        importlib.import_module(module)
+        return None
+    except ImportError:
+        return hint
+
+
+def get_provider_availability() -> dict[str, str | None]:
+    """Return {provider: None} if available or {provider: install_hint} if missing."""
+    return {p: check_provider_available(p) for p in _KNOWN_PROVIDERS}
 
 _HYPOTHESIS_SCHEMA = """\
 Each hypothesis object must have these fields:
@@ -125,8 +157,8 @@ def _save_files(
     return prompt_path, response_path
 
 
-def _parse_provider_and_model(provider: str | None, model: str) -> tuple[str, str]:
-    """Resolve (provider, model_id) from explicit --provider and model string.
+def _parse_provider_and_model(provider: str | None, model: str | None) -> tuple[str, str, str]:
+    """Resolve (provider, model_id, reason) from explicit --provider and model string.
 
     Model strings may carry a provider prefix: "openai:gpt-4o", "gemini:gemini-2.0-flash".
     Resolution order:
@@ -134,22 +166,28 @@ def _parse_provider_and_model(provider: str | None, model: str) -> tuple[str, st
       2. Explicit --provider flag
       3. Auto-detect from available API keys (ANTHROPIC > OPENAI > GOOGLE)
       4. Fall back to claude_code subprocess
+
+    If model is None, a sensible default is chosen for the resolved provider.
     """
-    for p in _KNOWN_PROVIDERS:
-        if model.startswith(f"{p}:"):
-            return p, model[len(p) + 1:]
+    if model:
+        for p in _KNOWN_PROVIDERS:
+            if model.startswith(f"{p}:"):
+                return p, model[len(p) + 1:], "provider prefix in --model"
+
+    def _default(p: str) -> str:
+        return model if model else _DEFAULT_MODELS[p]
 
     if provider:
-        return provider, model
+        return provider, _default(provider), "explicit --provider flag"
 
     if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic", model
+        return "anthropic", _default("anthropic"), "presence of ANTHROPIC_API_KEY"
     if os.environ.get("OPENAI_API_KEY"):
-        return "openai", model
+        return "openai", _default("openai"), "presence of OPENAI_API_KEY"
     if os.environ.get("GOOGLE_API_KEY"):
-        return "gemini", model
+        return "gemini", _default("gemini"), "presence of GOOGLE_API_KEY"
 
-    return "claude_code", model
+    return "claude_code", _default("claude_code"), "no API keys found — falling back to claude subprocess"
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +358,7 @@ def _run_openai(
         from openai import OpenAI
     except ImportError:
         raise ImportError(
-            "openai package is required for the OpenAI backend: "
-            "pip install 'nsight-agent[openai]'"
+            "openai package is required for the OpenAI backend: pip install openai"
         )
 
     client = OpenAI()
@@ -412,8 +449,7 @@ def _run_gemini(
         from google.generativeai.types import FunctionDeclaration, Tool as GeminiTool
     except ImportError:
         raise ImportError(
-            "google-generativeai package is required for the Gemini backend: "
-            "pip install 'nsight-agent[gemini]'"
+            "google-generativeai package is required for the Gemini backend: pip install google-generativeai"
         )
 
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -599,7 +635,7 @@ def run_agent(
     If `token_usage` is provided, it will be populated with `input_tokens` and
     `output_tokens` after the run (both None for the claude_code fallback).
     """
-    resolved_provider, resolved_model = _parse_provider_and_model(provider, model)
+    resolved_provider, resolved_model, _ = _parse_provider_and_model(provider, model)
 
     profile = NsysProfile(profile_path)
 
