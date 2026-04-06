@@ -76,7 +76,14 @@ Each hypothesis object must have these fields:
   - description: concise plain-English description of the bottleneck
   - evidence: specific numbers from the profile that support this hypothesis
   - suggestion: concrete, actionable recommendation
-  - expected_impact: estimated relative improvement (high / medium / low)\
+  - expected_impact: estimated relative improvement (high / medium / low)
+  - action_category: effort level required to act on this suggestion; one of:
+      runtime_config    — env vars, MPI params, driver flags, library options (no rebuild)
+      launch_config     — block/grid dims, shared memory, occupancy tuning (recompile only)
+      code_optimization — kernel rewrites, memory layout, stream pipelining, async transfers
+      algorithm         — solver change, preconditioner, deflation, mathematical reformulation
+    Boundary rule: if the change alters *what* is computed → algorithm;
+    if it changes only *how* → code_optimization or lower.\
 """
 
 _SYSTEM_PROMPT_API = f"""You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile.

@@ -32,6 +32,11 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 - `evidence` — specific numbers from the profile supporting the hypothesis
 - `suggestion` — a concrete, actionable recommendation
 - `expected_impact` — `high` / `medium` / `low`
+- `action_category` — effort required to act on the suggestion:
+  - `runtime_config` — env vars, MPI params, driver flags, library options (no rebuild needed)
+  - `launch_config` — block/grid dimensions, shared memory, occupancy tuning (recompile only)
+  - `code_optimization` — kernel rewrites, memory layout, stream pipelining, async transfers
+  - `algorithm` — solver change, preconditioner, deflation, mathematical reformulation
 
 **Tools available to the agent** (all read-only SQL queries against the local profile):
 

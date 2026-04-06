@@ -1,3 +1,9 @@
+# Presentation
+presentation/
+
+# Independent hypothesis evaluator (not part of nsight-agent)
+eval/
+
 # Personal / session notes
 CLAUDE.md
 LEON.md

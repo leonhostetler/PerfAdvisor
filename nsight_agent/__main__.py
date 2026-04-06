@@ -124,17 +124,28 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     table.add_column("#", style="dim", width=3)
     table.add_column("Type", style="cyan")
     table.add_column("Impact", style="bold")
+    table.add_column("Action", style="magenta")
     table.add_column("Description")
     table.add_column("Suggestion")
+
+    _ACTION_ABBREV = {
+        "runtime_config": "runtime",
+        "launch_config": "launch",
+        "code_optimization": "code",
+        "algorithm": "algorithm",
+    }
 
     for i, h in enumerate(hypotheses, 1):
         impact_color = {"high": "red", "medium": "yellow", "low": "green"}.get(
             str(h.get("expected_impact", "")).lower(), "white"
         )
+        action_raw = str(h.get("action_category", "")).lower()
+        action_str = _ACTION_ABBREV.get(action_raw, action_raw or "—")
         table.add_row(
             str(i),
             h.get("bottleneck_type", "—"),
             f"[{impact_color}]{h.get('expected_impact', '—')}[/{impact_color}]",
+            action_str,
             h.get("description", ""),
             h.get("suggestion", ""),
         )

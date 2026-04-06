@@ -1,6 +1,34 @@
 changelog — nsight_agent
 ========================
 
+2026-04-06
+----------
+- Add `action_category` field to hypothesis schema (todo item 5): enum of
+  `runtime_config` / `launch_config` / `code_optimization` / `algorithm`,
+  ordered by effort; boundary rule (what vs. how) included in system prompt
+- Add "Action" column (magenta, abbreviated) to hypotheses table in `cmd_analyze`
+- Update `README.md`: document `action_category` field in hypothesis output
+- Add `eval/score.py` — standalone independent hypothesis evaluator; scores
+  nsight-agent hypothesis JSON using gpt-5.4 on six criteria (bottleneck
+  alignment, addressability, mechanistic plausibility, specificity/actionability,
+  testability, generality) plus implementation-cost and correctness-risk flags
+  and a list-level redundancy score; writes `.eval.json` alongside input
+- Add `eval/context_example.yaml` — template for injecting application/phase
+  context into the evaluator prompt (critical for addressability scoring)
+- Add `eval/` to `.gitignore` — evaluator is intentionally separate from nsight-agent
+- Add rich terminal table to `eval/score.py` — displays per-hypothesis scores (color-coded
+  1–5), implementation-cost and correctness-risk flags, and per-hypothesis average; footer
+  shows redundancy score and overall aggregate
+- Update `eval/score.py` table and output files: rename column "Hypothesis" → "Suggestion"
+  (shows verbatim suggestion text truncated to 50 chars); save full LLM prompt to
+  *.eval.prompt.txt; save plain-text table + rationales to *.eval.table.txt
+- Add verdict + knowledge_source to `eval/score.py` — LLM now gives an explicit
+  strongly_recommended/recommended/uncertain/not_recommended verdict per hypothesis with
+  a 2-3 sentence rationale; knowledge_source field (context/model/both) flags when the
+  verdict draws on the model's own training knowledge of the application vs. injected context;
+  verdict column added to the rich table with rationales printed below; prompt strengthened
+  to be opinionated and treat injected context as authoritative
+
 2026-04-04
 ----------
 - Fix richer output table for phases/analysis in `cmd_analyze` (c8c6fba)

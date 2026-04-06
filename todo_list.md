@@ -62,24 +62,6 @@ Implement the "Verification" step described in CLAUDE.md:
 - Add a `diff` subcommand to `__main__.py` that loads two hypothesis JSON files and shows which bottlenecks were resolved, which worsened, and which are new.
 - This enables tracking improvement across profiling iterations without re-running the full agent.
 
-## 5. Hypothesis action categories
-
-Add an `action_category` field to each hypothesis so the engineer can triage by effort.
-
-Four categories, ordered by effort to try:
-
-- **`runtime_config`** — env vars, MPI params, CUDA driver flags, library runtime options (e.g. `NCCL_ALGO`, cuBLAS workspace). Try immediately, no rebuild.
-- **`launch_config`** — block/grid dimensions, shared memory allocation, occupancy tuning. Change a constant or auto-tune call; recompile but no logic change.
-- **`code_optimization`** — kernel rewrites, memory layout/coalescing, stream pipelining, async transfers, collective selection. Targeted source changes within the current algorithm.
-- **`algorithm`** — solver change, preconditioner, deflation, different parallelism strategy, mathematical reformulation. Changes the computational approach.
-
-Boundary rule: does the change alter *what* is computed, or just *how*? If *what* → `algorithm`; if *how* → `code_optimization` or lower.
-
-Changes needed:
-
-- **`loop.py`** — add `action_category` to the hypothesis JSON schema in the system prompt (enum of the four values); add to the structured-output/tool spec.
-- **`__main__.py`** — add `action_category` column to the hypothesis table; optionally add `--filter-category` to `p_analyze`.
-
 ## 6. Hypothesis evaluation agent
 
 A second agent pass that runs after the primary agent and scores/filters hypotheses for grounding, applicability, and whether the optimization is already implemented. Opt-in: only runs when at least one of `--build-log`, `--run-log`, or `--source-dir` is provided (unless lightweight mode is added — see open questions).
