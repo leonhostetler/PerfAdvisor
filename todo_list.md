@@ -17,35 +17,6 @@ Open design questions:
 3. **File selection UX:** A glob pattern (e.g., `report.0.*.sqlite`) with automatic rank-ID parsing from the filename would be more practical than listing 64+ files manually.
 4. **Does `mpianalyze` need its own system prompt?** Proposed answer: no — just inject the cross-rank summary as an additional pre-seeded tool result. The data speaks for itself.
 
-## 2. Full kernel name resolution (demangled vs. short)
-
-Currently all metrics are grouped by `shortName` (e.g. `Kernel3D`), which conflates many
-distinct template instantiations. On the test profile, `Kernel3D` covers: staggered Dslash
-interior (KernelType 5, ~16.3s), exterior boundary kernels (KernelTypes 1/2/3, ~3.8s
-combined), BLAS `axpyZpbx_` (1.6s), and packing — all with very different avg times,
-optimization strategies, and bottleneck types. The agent cannot distinguish them.
-
-Three options considered:
-
-- **Option 1 (recommended): Group by `demangledName`, light normalization.** Switch the GROUP
-  BY key from `k.shortName` to `COALESCE(k.demangledName, k.shortName)`. Apply two
-  normalization passes in Python: (1) strip the `std::enable_if<...>::type ` return-type prefix
-  (SFINAE boilerplate, present in QUDA and other CUDA template libraries), (2) strip trailing
-  `(T2)` argument placeholders. What remains is the actual template instantiation, which the
-  agent can read directly. General: for non-QUDA kernels, demangled names are already clean so
-  normalization is a no-op.
-
-- **Option 2: Keep `shortName` grouping, add `variants` subfield.** Backward-compatible, but
-  the most important structural information is still hidden at the top level.
-
-- **Option 3: Parse a logical name from the demangled string** (e.g.
-  `dslash_functor[KT=5,prec=short]`). Most readable but requires application-specific regex;
-  slides toward QUDA-specificity.
-
-**Open question:** Should `KernelSummary.name` store the full normalized demangled name
-(200+ chars sent to the agent), and carry a separate `short_name` field only for CLI table
-display? Or truncate the name stored in the model?
-
 ## 3. Iterative hypothesis refinement
 
 Extend the multi-turn API backend to perform a second reasoning pass:

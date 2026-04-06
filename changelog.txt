@@ -3,6 +3,11 @@ changelog — nsight_agent
 
 2026-04-06
 ----------
+- Full kernel name resolution (todo item 2): switch GROUP BY from shortName to
+  demangledName so each template instantiation is a distinct row; add
+  `_normalize_demangled()` to strip SFINAE prefix and `(T2)` suffix; add
+  `short_name` field to `KernelSummary` for CLI display; fall back to shortName
+  on older profiles that lack the demangledName column
 - Add `action_category` field to hypothesis schema (todo item 5): enum of
   `runtime_config` / `launch_config` / `code_optimization` / `algorithm`,
   ordered by effort; boundary rule (what vs. how) included in system prompt

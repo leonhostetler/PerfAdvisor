@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 class KernelSummary(BaseModel):
     name: str
+    short_name: str | None = Field(default=None, description="Short display name from StringIds (e.g. 'Kernel3D'); name holds the full normalized demangled name")
     calls: int
     total_s: float
     avg_ms: float

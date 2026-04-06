@@ -65,7 +65,9 @@ def test_top_kernels_returns_results(profile):
 
 def test_top_kernel_is_kernel3d(profile):
     kernels = compute_top_kernels(profile)
-    assert kernels[0].name == "Kernel3D"
+    # name is now the normalized demangled name; short_name holds the display label
+    assert kernels[0].short_name == "Kernel3D"
+    assert "dslash_functor" in kernels[0].name
 
 
 def test_kernel_pct_sums_near_100(profile):

@@ -81,7 +81,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             ph.add_column("Top MPI Op")
         for p in summary.phases:
             top_kernel = (
-                f"{p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
+                f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
                 if p.top_kernels else "—"
             )
             row = [
@@ -190,7 +190,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     for col in ("Kernel", "Calls", "Total (s)", "Avg (ms)", "% GPU"):
         t.add_column(col)
     for k in summary.top_kernels:
-        t.add_row(k.name, str(k.calls), str(k.total_s), str(k.avg_ms), f"{k.pct_of_gpu_time}%")
+        t.add_row(k.short_name or k.name, str(k.calls), str(k.total_s), str(k.avg_ms), f"{k.pct_of_gpu_time}%")
     console.print(t)
 
     if summary.mpi_ops:
@@ -206,7 +206,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
         for col in ("Phase", "Start (s)", "End (s)", "Duration (s)", "GPU Util %", "Top Kernel"):
             ph.add_column(col)
         for p in summary.phases:
-            top = p.top_kernels[0].name if p.top_kernels else "—"
+            top = (p.top_kernels[0].short_name or p.top_kernels[0].name) if p.top_kernels else "—"
             ph.add_row(
                 p.name,
                 str(p.start_s),

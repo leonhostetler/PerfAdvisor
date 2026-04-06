@@ -8,6 +8,7 @@ before querying, and optional tables (MPI, NVTX) degrade gracefully.
 from __future__ import annotations
 
 import math
+import re
 import time
 
 from nsight_agent.ingestion.profile import NsysProfile
@@ -23,6 +24,27 @@ from .models import (
     StreamSummary,
 )
 from .phases import PhaseWindow, detect_phases
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_demangled(name: str) -> str:
+    """Strip CUDA/QUDA template boilerplate from a demangled kernel name.
+
+    Two passes:
+    1. Strip SFINAE return-type prefix:
+       "std::enable_if<..., void>::type " — common in QUDA and other CUDA
+       template libraries that use enable_if to gate kernel instantiation.
+    2. Strip trailing "(T2)" argument placeholder injected by nvcc mangling.
+
+    For non-QUDA or already-clean names neither pass fires, so this is a
+    no-op for generic CUDA kernels.
+    """
+    name = re.sub(r'^.*?void>::type\s+', '', name)
+    name = re.sub(r'\s*\(T2\)\s*$', '', name)
+    return name.strip()
+
 
 # ---------------------------------------------------------------------------
 # Individual metric functions
@@ -84,9 +106,15 @@ def compute_top_kernels(
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
     total_gpu_s = compute_gpu_kernel_time(profile)
+    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
+    has_demangled = "demangledName" in kernel_cols
+    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
+    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
+    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
     rows = profile.query(f"""
         SELECT
-            s.value                                                         AS name,
+            {name_expr}                                                     AS name,
+            s.value                                                         AS short_name,
             COUNT(*)                                                        AS calls,
             SUM(k.end - k.start) / 1e9                                     AS total_s,
             AVG(k.end - k.start) / 1e6                                     AS avg_ms,
@@ -101,7 +129,8 @@ def compute_top_kernels(
                      k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN StringIds s ON k.shortName = s.id
-        GROUP BY k.shortName
+        {demangled_join}
+        GROUP BY {group_expr}
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
@@ -124,9 +153,12 @@ def compute_top_kernels(
             if avg_threads > 0:
                 occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
 
-        oh = (launch_overhead or {}).get(r["name"])
+        norm_name = _normalize_demangled(r["name"])
+        oh = (launch_overhead or {}).get(norm_name)
+        short = r["short_name"] if r["short_name"] != norm_name else None
         result.append(KernelSummary(
-            name=r["name"],
+            name=norm_name,
+            short_name=short,
             calls=n,
             total_s=round(r["total_s"], 4),
             avg_ms=round(avg_ms, 4),
@@ -316,19 +348,25 @@ def _compute_launch_overhead(profile: NsysProfile) -> dict[str, tuple[float, flo
     if "correlationId" not in runtime_cols or "correlationId" not in kernel_cols:
         return {}
 
-    rows = profile.query("""
+    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
+    has_demangled = "demangledName" in kernel_cols
+    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
+    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
+    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
+    rows = profile.query(f"""
         SELECT
-            s.value                                                  AS name,
+            {name_expr}                                              AS name,
             AVG(CAST(k.start - rt.start AS REAL)) / 1000.0         AS avg_launch_us,
             MAX(k.start - rt.start) / 1000.0                        AS max_launch_us
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN CUPTI_ACTIVITY_KIND_RUNTIME rt ON k.correlationId = rt.correlationId
         JOIN StringIds s ON k.shortName = s.id
+        {demangled_join}
         WHERE k.start >= rt.start
-        GROUP BY k.shortName
+        GROUP BY {group_expr}
     """)
     return {
-        r["name"]: (round(float(r["avg_launch_us"]), 2), round(float(r["max_launch_us"]), 2))
+        _normalize_demangled(r["name"]): (round(float(r["avg_launch_us"]), 2), round(float(r["max_launch_us"]), 2))
         for r in rows
         if r["avg_launch_us"] is not None and float(r["avg_launch_us"]) >= 0
     }
@@ -559,9 +597,15 @@ def _window_top_kernels(
     device_info: dict | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
+    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
+    has_demangled = "demangledName" in kernel_cols
+    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
+    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
+    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
     rows = profile.query(f"""
         SELECT
-            s.value                                                         AS name,
+            {name_expr}                                                     AS name,
+            s.value                                                         AS short_name,
             COUNT(*)                                                        AS calls,
             SUM(k.end - k.start) / 1e9                                     AS total_s,
             AVG(k.end - k.start) / 1e6                                     AS avg_ms,
@@ -576,8 +620,9 @@ def _window_top_kernels(
                      k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN StringIds s ON k.shortName = s.id
+        {demangled_join}
         WHERE k.start >= {start_ns} AND k.end <= {end_ns}
-        GROUP BY k.shortName
+        GROUP BY {group_expr}
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
@@ -600,9 +645,12 @@ def _window_top_kernels(
             if avg_threads > 0:
                 occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
 
-        oh = (launch_overhead or {}).get(r["name"])
+        norm_name = _normalize_demangled(r["name"])
+        oh = (launch_overhead or {}).get(norm_name)
+        short = r["short_name"] if r["short_name"] != norm_name else None
         result.append(KernelSummary(
-            name=r["name"],
+            name=norm_name,
+            short_name=short,
             calls=n,
             total_s=round(r["total_s"], 4),
             avg_ms=round(avg_ms, 4),

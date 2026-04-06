@@ -13,7 +13,7 @@ The pipeline has two distinct stages:
 `compute_profile_summary()` queries the SQLite profile directly and builds a structured `ProfileSummary`:
 
 - **Phase detection** — segments the timeline into non-overlapping execution phases (initialization, main compute, teardown, etc.) using kernel density clustering on the GPU utilization timeline
-- **Per-kernel metrics** — total/avg/min/max time, coefficient of variation, register usage, shared memory, estimated SM occupancy, CPU launch overhead
+- **Per-kernel metrics** — grouped by full demangled template name (e.g. `quda::Kernel3D<quda::dslash_functor, ...>`) rather than the short display name (`Kernel3D`), so each distinct template instantiation is tracked separately; total/avg/min/max time, coefficient of variation, register usage, shared memory, estimated SM occupancy, CPU launch overhead
 - **Memory transfer summary** — by direction (H2D/D2H/D2D), with effective bandwidth vs. peak
 - **MPI breakdown** — per-operation total and call count (collectives, P2P, wait)
 - **GPU idle histogram** — bucketed gap distribution (`<10µs` through `>100ms`)
