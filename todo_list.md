@@ -319,3 +319,31 @@ The README Risks section covers hallucination and SQL injection but does not exp
 ### Priority order
 
 License → `.gitignore` / `LEON.md` → portable test fixtures → CI → clean error handling → `--version` → privacy disclosure → PyPI metadata → distribution docs.
+
+## 12. Multi-profiler support (long-term)
+
+Extend nsight-agent to ingest profiles from HPC profilers other than Nsight Systems. The analysis and agent layers already work through `ProfileSummary` and would be largely unaffected; the work is in ingestion adapters and making the agent prompt architecture-aware.
+
+### Priority targets
+
+1. **AMD rocprof** — highest value first target. AMD GPUs dominate the current TOP500 (Frontier, El Capitan, LUMI). QUDA supports HIP. rocprof output formats (CSV, JSON, and SQLite-like format in ROCm 6+) are more tractable than most alternatives. Conceptual mapping to Nsight's data model is close: kernels, dispatches, memory transfers, hardware counters.
+
+2. **Score-P / OTF2** — covers European HPC sites and wraps CUDA, HIP, OpenMP, and MPI in a single trace. OTF2 binary format has a Python reader (`otf2` package).
+
+3. **Intel VTune** — for Intel GPU systems (Aurora/Ponte Vecchio). Proprietary directory structure; lower priority than the above two.
+
+### Main difficulties
+
+- **Format diversity**: Nsight's SQLite is unusually convenient to query directly. rocprof outputs flat CSV or JSON; OTF2 is a compact binary trace format. Each needs its own ingestion layer.
+
+- **Semantic gaps**: not every profiler exposes the same metrics. SM occupancy, shared memory usage, and launch overhead are Nsight-specific. rocprof has equivalent hardware counters but under different names and requiring explicit counter selection at collection time. Some `KernelSummary` fields (e.g., `estimated_occupancy`) would be absent or require a different derivation per profiler.
+
+- **Agent prompt coupling**: the system prompt and bottleneck taxonomy use NVIDIA terminology (SMs, warps, HBM bandwidth). For AMD this means wavefronts, CUs, and different memory hierarchy language. The prompt would need to be adapted per hardware architecture or the agent will produce lower-quality hypotheses.
+
+- **`sql_query` tool**: exposes raw Nsight SQL to the agent and is the tightest coupling point. For other profilers it must either be abstracted into a profiler-agnostic query interface or replaced with a per-profiler tool. This is the hardest part of the extension.
+
+### Architectural approach
+
+Introduce a `ProfileAdapter` abstraction: each profiler has an adapter that reads its native format and populates a normalized `ProfileSummary`. The analysis and agent layers are unchanged. The `sql_query` tool becomes optional or adapter-specific — adapters that can provide a queryable backend expose it; others do not.
+
+A `--profiler {nsight,rocprof,scorep}` flag on the CLI selects the adapter. Auto-detection from file extension is a nice-to-have.

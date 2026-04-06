@@ -1,0 +1,49 @@
+changelog — nsight_agent
+========================
+
+2026-04-04
+----------
+- Fix richer output table for phases/analysis in `cmd_analyze` (c8c6fba)
+- More useful information printed when running `analyze` command (bc95cb0)
+- Replace deprecated `google.generativeai` package with `google.genai` (dbf7144)
+- Add support for newer OpenAI models that report `max_completion_tokens`
+  instead of `max_tokens` (4b4f74b)
+- Check for existence of prerequisite packages (openai, google-genai) at
+  runtime and fix default model names per provider (4a0fc4f)
+
+2026-04-02
+----------
+- Add token reporting: track and display prompt/completion token counts
+  after each agent run (4748cfc)
+- Add README.md (fdb639e)
+- Multi-provider LLM support (OpenAI, Gemini) (73ed731)
+  - `_parse_provider_and_model()` resolves backend from model prefix, explicit
+    --provider flag, or env-var auto-detection (ANTHROPIC → OPENAI → GOOGLE)
+  - `_run_openai()` — function-calling loop via openai>=1.0
+  - `_run_gemini()` — Gemini start_chat() loop via google-genai
+  - `--provider {anthropic,openai,gemini}` flag added to CLI
+  - New optional extras: `pip install 'nsight-agent[openai]'` / `[gemini]`
+- CPU-GPU overlap metrics (4d6c67f)
+  - `KernelSummary`: avg/max launch overhead (µs) per kernel name
+  - `ProfileSummary`: `cpu_sync_blocked_s` / `cpu_sync_blocked_pct`
+  - Sample (A100 CG run): 20.5% of GPU kernel time spent in cuEventSynchronize
+- Per-phase gap histogram (f88088d)
+  - `PhaseSummary.gap_histogram` now scoped to phase window (6 buckets:
+    <10µs through >100ms); previously only a global histogram existed
+- Make PRAGMA cache_size and mmap_size adaptive based on profile file size (4676d36)
+- Richer GPU metrics (6329ff0)
+  - `KernelSummary`: std_dev_ms, cv, avg_registers_per_thread,
+    avg_shared_mem_bytes, estimated_occupancy
+  - `MemcpySummary`: pct_of_peak_bandwidth
+  - `ProfileSummary`: peak_memory_bandwidth_GBs (from TARGET_INFO_GPU)
+- Runtime performance improvements — analysis time reduced ~25% (200b108)
+  - Index creation on first open for kernel start and MPI tables
+  - Single-pass MPI stats with CASE-based conditional aggregation
+  - Self-profiling timers printed in timing breakdown table
+
+2026-04-01
+----------
+- Profile segmentation into logical compute phases (fcfedc3)
+- Save AI prompt and response to file for inspection / replay (22862cf)
+- Add --verbose flag to print ProfileSummary before sending to AI (19b8543)
+- Initial commit: ingestion, analysis, Claude agent loop, CLI (bcf1b2c)
