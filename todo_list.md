@@ -1,14 +1,8 @@
 # Todo List — nsight_agent Improvements
 
-## 1. Multi-rank MPI analysis and profile comparison
+## 1. Multi-rank MPI analysis
 
-Three subcommands with distinct purposes:
-
-- **`analyze`** — unchanged. Single-rank deep analysis producing ranked improvement hypotheses.
-
-- **`compare`** — takes two `.sqlite` profiles and returns a structured comparison narrative (what changed, what improved, what worsened, what's unexplained). Not improvement hypotheses. Natural use cases: before/after an optimization, or `ev0` vs `ev1024` on the same rank.
-
-- **`mpianalyze`** — accepts N rank files, runs `compute_profile_summary` on one "primary" rank (default: rank 0), pre-aggregates cross-rank MPI metrics into a compact structure, then sends both to the LLM together. The agent generates hypotheses as usual but now has cross-rank context to ground MPI-related ones. No new agent prompt needed — the cross-rank MPI summary is injected as an additional pre-seeded tool result.
+Add a `mpianalyze` subcommand that accepts N rank files, runs `compute_profile_summary` on one "primary" rank (default: rank 0), pre-aggregates cross-rank MPI metrics into a compact structure, then sends both to the LLM together. The agent generates hypotheses as usual but now has cross-rank context to ground MPI-related ones. No new agent prompt needed — the cross-rank MPI summary is injected as an additional pre-seeded tool result.
 
 Open design questions:
 
@@ -17,6 +11,10 @@ Open design questions:
 3. **File selection UX:** A glob pattern (e.g., `report.0.*.sqlite`) with automatic rank-ID parsing from the filename would be more practical than listing 64+ files manually.
 4. **Does `mpianalyze` need its own system prompt?** Proposed answer: no — just inject the cross-rank summary as an additional pre-seeded tool result. The data speaks for itself.
 
+## 2. Profile comparison
+
+Add a `compare` subcommand that takes two `.sqlite` profiles and returns a structured comparison narrative: what changed, what improved, what worsened, and what is unexplained. Not improvement hypotheses — just a clear before/after diff. Natural use cases: before/after an optimization, or `ev0` vs `ev1024` on the same rank.
+
 ## 3. Iterative hypothesis refinement
 
 Extend the multi-turn API backend to perform a second reasoning pass:
@@ -24,14 +22,6 @@ Extend the multi-turn API backend to perform a second reasoning pass:
 - After the agent produces its initial hypothesis JSON, inject a follow-up user turn: "For each hypothesis, identify what additional profile data would confirm or refute it, then issue those queries."
 - Increase `MAX_TURNS` accordingly and add a "confirmation" phase to the agent loop in `nsight_agent/agent/loop.py`.
 - This turns the current single-pass analysis into a two-stage reasoning loop: hypothesis generation → evidence gathering → final ranked output.
-
-## 4. Hypothesis persistence and diffing (verification)
-
-Implement the "Verification" step described in CLAUDE.md:
-
-- After a run, save hypotheses as a JSON file next to the profile (e.g., `{stem}_{timestamp}_hypotheses.json`).
-- Add a `diff` subcommand to `__main__.py` that loads two hypothesis JSON files and shows which bottlenecks were resolved, which worsened, and which are new.
-- This enables tracking improvement across profiling iterations without re-running the full agent.
 
 ## 6. Hypothesis evaluation agent
 
