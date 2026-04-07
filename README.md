@@ -138,6 +138,41 @@ nsight-agent analyze profile.sqlite --allow-app-knowledge
 # Limit phase detection (fewer phases = less context = fewer tokens)
 nsight-agent analyze profile.sqlite --max-phases 3
 nsight-agent analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely
+
+# Skip the pre-flight confirmation prompt (useful in scripts or batch jobs)
+nsight-agent analyze profile.sqlite --yes
+
+# Use Anthropic's count_tokens API for an exact input token count instead of the
+# char/4 heuristic (adds one small API call; falls back to heuristic for other providers)
+nsight-agent analyze profile.sqlite --exact-token-count
+```
+
+### Compare two profiles
+
+```bash
+nsight-agent compare profile_a.sqlite profile_b.sqlite
+```
+
+Produces a structured narrative and a key-differences table ordered by magnitude of change.
+Both profiles are summarized independently, then a pre-computed structural diff is injected
+into a single LLM prompt (no tool-use loop). Three comparison modes are selected automatically:
+
+- **`phase_aware`** — same phase count and names; full per-phase analysis
+- **`summary`** — phases differ but kernel overlap ≥ 20%; per-kernel diff included
+- **`summary_no_kernel`** — phases differ and overlap < 20%; top-level metrics only
+
+```bash
+# Suppress verbose output
+nsight-agent compare profile_a.sqlite profile_b.sqlite --quiet
+
+# Output raw JSON
+nsight-agent compare profile_a.sqlite profile_b.sqlite --json
+
+# Skip the pre-flight confirmation prompt
+nsight-agent compare profile_a.sqlite profile_b.sqlite --yes
+
+# Exact token count via Anthropic API
+nsight-agent compare profile_a.sqlite profile_b.sqlite --exact-token-count
 ```
 
 ---
@@ -184,6 +219,23 @@ If no API key is set and `claude` is on your PATH, the agent falls back to a sin
 ---
 
 ## Token expenditure
+
+### Pre-flight estimate
+
+Before every `analyze` and `compare` run, nsight-agent prints an input/output token estimate and prompts for confirmation:
+
+```
+Token estimate:
+  Input:  ~12,400 (heuristic)
+  Output: ~3,800 – 12,800 (5 – 20 turns estimated)
+  Model:  claude-opus-4-6 (anthropic)
+Proceed? [Y/n]
+```
+
+- The estimate is skipped (and the prompt suppressed) in `--quiet` and `--json` modes.
+- Pass `--yes` to skip the confirmation automatically (useful in scripts).
+- Pass `--exact-token-count` to use Anthropic's `count_tokens` API for a precise input count instead of the character-count heuristic. No-ops with a note for other providers.
+- The confirmation prompt is also skipped when stdin is not a TTY (piped or batch environments).
 
 ### What drives token usage
 

@@ -3,6 +3,24 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Improve pre-flight token estimate accuracy: replace single char/4 heuristic
+  with content-aware `estimate_prose_tokens` (4 chars/token) and
+  `estimate_json_tokens` (2.5 chars/token) in `preflight.py`; `analyze` applies
+  prose ratio to the system prompt and JSON ratio to summary + tool schemas;
+  `compare` applies prose ratio to the system prompt and JSON ratio to the
+  compare prompt (which is ~95% JSON); reduces underestimate from ~34% to ~5%
+  on a real profile comparison run (13k estimated → 21k vs 19,771 actual)
+- Add pre-flight token estimate to `analyze` and `compare` subcommands: after
+  `compute_profile_summary()` (analyze) or `compute_profile_diff()` (compare) and
+  before the LLM call, print input/output token estimates and prompt for confirmation;
+  confirmation is skipped when `--yes`, `--quiet`, `--json`, or stdin is non-interactive;
+  estimate is suppressed only by `--quiet` or `--json`
+- Add `--yes` flag to `analyze` and `compare`: skip confirmation prompt
+- Add `--exact-token-count` flag to `analyze` and `compare`: use Anthropic's
+  `client.messages.count_tokens()` API for an exact input count instead of the char/4
+  heuristic; no-ops with a note for non-Anthropic providers
+- Add `nsight_agent/agent/preflight.py`: `estimate_tokens_heuristic(*texts)` and
+  `count_tokens_exact(provider, model, system_prompt, *user_texts, tools=None)`
 - Consolidate `--provider` flag into `--model`: `_parse_provider_and_model` now
   accepts only the model string; a bare provider name (e.g. `--model=openai`)
   is treated as a provider-only shorthand that selects the default model for

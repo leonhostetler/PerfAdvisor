@@ -37,11 +37,19 @@ def _print_timings(timings: dict[str, float]) -> None:
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.agent.loop import (
+        MAX_TURNS,
+        _build_system_prompt,
         _parse_provider_and_model,
         check_provider_available,
         get_provider_availability,
         run_agent,
     )
+    from nsight_agent.agent.preflight import (
+        count_tokens_exact,
+        estimate_json_tokens,
+        estimate_prose_tokens,
+    )
+    from nsight_agent.agent.tools import tool_schemas
     from nsight_agent.analysis.metrics import compute_profile_summary
     from nsight_agent.ingestion.profile import NsysProfile
 
@@ -107,6 +115,59 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print("\n[bold]── ProfileSummary sent to AI ──[/bold]")
         console.print(summary.model_dump_json(indent=2))
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
+
+    # Pre-flight token estimate
+    _system_prompt = _build_system_prompt(grounded=not args.allow_app_knowledge)
+    _summary_json = summary.model_dump_json(indent=2)
+    _schemas = tool_schemas()
+    _schemas_json = json.dumps(_schemas)
+
+    if args.exact_token_count:
+        _input_tokens = count_tokens_exact(
+            resolved_provider, resolved_model,
+            _system_prompt, _summary_json,
+            tools=_schemas,
+        )
+        if _input_tokens is None:
+            if not args.quiet and not args.json:
+                console.print(
+                    f"[dim](exact count unavailable for {resolved_provider}"
+                    " — using heuristic)[/dim]"
+                )
+            _input_tokens = (
+                estimate_prose_tokens(_system_prompt)
+                + estimate_json_tokens(_summary_json)
+                + estimate_json_tokens(_schemas_json)
+            )
+            _input_label = "heuristic"
+        else:
+            _input_label = "exact"
+    else:
+        _input_tokens = (
+            estimate_prose_tokens(_system_prompt)
+            + estimate_json_tokens(_summary_json)
+            + estimate_json_tokens(_schemas_json)
+        )
+        _input_label = "heuristic"
+
+    _output_lo = 5 * 600 + 800   # 3,800 — optimistic (5 turns)
+    _output_hi = MAX_TURNS * 600 + 800  # pessimistic (max turns)
+
+    if not args.quiet and not args.json:
+        console.print(
+            f"\n[bold]Token estimate:[/bold]\n"
+            f"  Input:  ~{_input_tokens:,} ({_input_label})\n"
+            f"  Output: ~{_output_lo:,} – {_output_hi:,} (5 – {MAX_TURNS} turns estimated)\n"
+            f"  Model:  {resolved_model} ({resolved_provider})"
+        )
+        if not args.yes and sys.stdin.isatty():
+            try:
+                _answer = input("\nProceed? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
+            if _answer in ("n", "no"):
+                console.print("[yellow]Aborted.[/yellow]")
+                sys.exit(0)
 
     log = lambda msg: console.print(msg, markup=False, highlight=False)
 
@@ -205,11 +266,16 @@ def _print_phase_table(summary, title: str) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
-    from nsight_agent.agent.compare import run_compare
+    from nsight_agent.agent.compare import _COMPARE_SYSTEM_PROMPT, _build_prompt, run_compare
     from nsight_agent.agent.loop import (
         _parse_provider_and_model,
         check_provider_available,
         get_provider_availability,
+    )
+    from nsight_agent.agent.preflight import (
+        count_tokens_exact,
+        estimate_json_tokens,
+        estimate_prose_tokens,
     )
     from nsight_agent.analysis.diff import compute_profile_diff
     from nsight_agent.analysis.metrics import compute_profile_summary
@@ -266,6 +332,50 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"and kernel name overlap is {diff.kernel_overlap_pct:.0f}% — "
             f"proceeding with summary analysis and skipping per-kernel comparison.[/yellow]"
         )
+
+    # Pre-flight token estimate
+    _compare_prompt = _build_prompt(summary_a, summary_b, diff)
+
+    if args.exact_token_count:
+        _input_tokens = count_tokens_exact(
+            resolved_provider, resolved_model,
+            _COMPARE_SYSTEM_PROMPT, _compare_prompt,
+        )
+        if _input_tokens is None:
+            if not args.quiet and not args.json:
+                console.print(
+                    f"[dim](exact count unavailable for {resolved_provider}"
+                    " — using heuristic)[/dim]"
+                )
+            _input_tokens = (
+                estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT)
+                + estimate_json_tokens(_compare_prompt)
+            )
+            _input_label = "heuristic"
+        else:
+            _input_label = "exact"
+    else:
+        _input_tokens = (
+            estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT)
+            + estimate_json_tokens(_compare_prompt)
+        )
+        _input_label = "heuristic"
+
+    if not args.quiet and not args.json:
+        console.print(
+            f"\n[bold]Token estimate:[/bold]\n"
+            f"  Input:  ~{_input_tokens:,} ({_input_label})\n"
+            f"  Output: ~1,000 – 3,000 (single LLM call)\n"
+            f"  Model:  {resolved_model} ({resolved_provider})"
+        )
+        if not args.yes and sys.stdin.isatty():
+            try:
+                _answer = input("\nProceed? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
+            if _answer in ("n", "no"):
+                console.print("[yellow]Aborted.[/yellow]")
+                sys.exit(0)
 
     log = lambda msg: console.print(msg, markup=False, highlight=False)
     token_usage: dict[str, int | None] = {}
@@ -419,6 +529,18 @@ def main() -> None:
             "By default suggestions are grounded strictly in the profile data."
         ),
     )
+    p_analyze.add_argument(
+        "--yes", action="store_true",
+        help="Skip the pre-flight confirmation prompt and proceed automatically.",
+    )
+    p_analyze.add_argument(
+        "--exact-token-count", action="store_true",
+        help=(
+            "Use the provider's token counting API for an exact input token count instead of "
+            "the character-count heuristic (Anthropic only; adds one small API call before the "
+            "main run). Falls back to heuristic for other providers."
+        ),
+    )
 
     p_compare = sub.add_parser("compare", help="Compare two profiles and summarize differences")
     p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
@@ -434,6 +556,18 @@ def main() -> None:
         help=(
             "Model for comparison. Same format as analyze --model: "
             "'openai:gpt-4o', 'openai', or a bare model ID."
+        ),
+    )
+    p_compare.add_argument(
+        "--yes", action="store_true",
+        help="Skip the pre-flight confirmation prompt and proceed automatically.",
+    )
+    p_compare.add_argument(
+        "--exact-token-count", action="store_true",
+        help=(
+            "Use the provider's token counting API for an exact input token count "
+            "(Anthropic only; adds one small API call). "
+            "Falls back to heuristic for other providers."
         ),
     )
 
