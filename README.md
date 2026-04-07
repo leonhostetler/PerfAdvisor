@@ -139,6 +139,14 @@ nsight-agent analyze profile.sqlite --allow-app-knowledge
 nsight-agent analyze profile.sqlite --max-phases 3
 nsight-agent analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely
 
+# Override the agent turn limit (default: 20).
+# Lower values reduce cost and risk of runaway tool calls; higher values give
+# the model more room on complex profiles. A wrap-up warning is injected 3 turns
+# before the limit; if the limit is still hit, one extra no-tool turn is made to
+# extract whatever the model has gathered rather than discarding it.
+nsight-agent analyze profile.sqlite --max-turns 10   # tighter limit for cheaper models
+nsight-agent analyze profile.sqlite --max-turns 30   # more room for complex profiles
+
 # Skip the pre-flight confirmation prompt (useful in scripts or batch jobs)
 nsight-agent analyze profile.sqlite --yes
 
@@ -236,6 +244,7 @@ Proceed? [Y/n]
 - Pass `--yes` to skip the confirmation automatically (useful in scripts).
 - Pass `--exact-token-count` to use Anthropic's `count_tokens` API for a precise input count instead of the character-count heuristic. No-ops with a note for other providers.
 - The confirmation prompt is also skipped when stdin is not a TTY (piped or batch environments).
+- The output range reflects the `--max-turns` value (default 20): `~3,800 – 12,800` tokens at 20 turns. Pass `--max-turns` to adjust both the actual limit and the displayed range.
 
 ### What drives token usage
 
@@ -262,6 +271,15 @@ nsight-agent analyze profile.sqlite --max-phases 1   # global metrics only, no p
 ```
 
 Each phase adds its own per-phase kernel table, MPI breakdown, and gap histogram to the pre-seeded context. Reducing from 6 to 1 can cut pre-seed size by 60–80%.
+
+**Cap the turn count** (reduces worst-case cost and avoids runaway tool loops):
+
+```bash
+nsight-agent analyze profile.sqlite --max-turns 10   # good default for Haiku
+nsight-agent analyze profile.sqlite --max-turns 5    # cheapest, summarizes after 5 tool calls
+```
+
+Smaller models like Haiku tend to use more turns for the same analysis. A lower `--max-turns` bounds the cost while the built-in wrap-up warning and forced final turn ensure you still get output rather than an error.
 
 **Use a smaller model:**
 

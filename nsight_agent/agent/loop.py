@@ -46,6 +46,19 @@ _DEFAULT_MODELS: dict[str, str] = {
     "claude_code": "claude-opus-4-6",
 }
 MAX_TURNS = 20
+# Inject a wrap-up warning this many turns before the limit so the model has
+# a chance to produce output before it's cut off.
+WARN_TURNS_BEFORE_LIMIT = 3
+
+_WRAP_UP_WARNING = (
+    "You have {remaining} turns remaining. "
+    "If you have gathered sufficient evidence, output your final hypothesis JSON array now. "
+    "Avoid calling tools unless they would meaningfully change your conclusions."
+)
+_FINAL_FORCED_PROMPT = (
+    "Turn limit reached. Output your final hypothesis JSON array immediately "
+    "based on all evidence gathered so far. Do not call any more tools."
+)
 
 _KNOWN_PROVIDERS = ("anthropic", "openai", "gemini")
 
@@ -353,9 +366,45 @@ def _run_api(
                 "tool_use_id": block.id,
                 "content": result_json,
             })
+
+        turns_left = max_turns - turn
+        if turns_left == WARN_TURNS_BEFORE_LIMIT:
+            tool_results.append({
+                "type": "text",
+                "text": _WRAP_UP_WARNING.format(remaining=turns_left),
+            })
+            if verbose:
+                log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
+        elif turns_left == 0:
+            tool_results.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
+
         messages.append({"role": "user", "content": tool_results})
 
-    raise RuntimeError(f"Agent did not finish within {max_turns} turns")
+    # All turns exhausted — make one final call without tools to force text output.
+    if verbose:
+        log("[local] Turn limit reached — forcing final output (no tool calls).")
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=_build_system_prompt(grounded),
+        messages=messages,
+    )
+    input_tokens += response.usage.input_tokens
+    output_tokens += response.usage.output_tokens
+    for block in reversed(response.content):
+        if hasattr(block, "text"):
+            hypotheses = _extract_hypotheses(block.text)
+            if hypotheses:
+                prompt_record = (
+                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
+                    f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
+                    f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
+                )
+                _save_files(profile.path, prompt_record, block.text, verbose, log)
+                return hypotheses, input_tokens, output_tokens
+    if verbose:
+        log("[local] Warning: no hypotheses extracted after forced output turn.")
+    return [], input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +535,44 @@ def _run_openai(
                 "content": result_json,
             })
 
-    raise RuntimeError(f"Agent did not finish within {max_turns} turns")
+        turns_left = max_turns - turn
+        if turns_left == WARN_TURNS_BEFORE_LIMIT:
+            messages.append({
+                "role": "user",
+                "content": _WRAP_UP_WARNING.format(remaining=turns_left),
+            })
+            if verbose:
+                log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
+        elif turns_left == 0:
+            messages.append({"role": "user", "content": _FINAL_FORCED_PROMPT})
+
+    # All turns exhausted — make one final call without tools to force text output.
+    if verbose:
+        log("[local] Turn limit reached — forcing final output (no tool calls).")
+    try:
+        response_forced = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            **{_token_limit_param: 4096},
+        )
+        if response_forced.usage:
+            input_tokens += response_forced.usage.prompt_tokens
+            output_tokens += response_forced.usage.completion_tokens
+        forced_content = response_forced.choices[0].message.content or ""
+        hypotheses = _extract_hypotheses(forced_content)
+        if hypotheses:
+            prompt_record = (
+                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
+                f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
+            )
+            _save_files(profile.path, prompt_record, forced_content, verbose, log)
+            return hypotheses, input_tokens, output_tokens
+    except Exception as exc:
+        if verbose:
+            log(f"[local] Forced output turn failed: {exc}")
+    if verbose:
+        log("[local] Warning: no hypotheses extracted after forced output turn.")
+    return [], input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +685,41 @@ def _run_gemini(
                     response={"result": json.loads(result_json)},
                 )
             )
+
+        turns_left = max_turns - turn
+        if turns_left == WARN_TURNS_BEFORE_LIMIT:
+            parts.append(genai_types.Part.from_text(
+                _WRAP_UP_WARNING.format(remaining=turns_left)
+            ))
+            if verbose:
+                log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
+        elif turns_left == 0:
+            parts.append(genai_types.Part.from_text(_FINAL_FORCED_PROMPT))
+
         response = chat.send_message(parts)
         _add_gemini_usage(response)
 
-    raise RuntimeError(f"Agent did not finish within {max_turns} turns")
+    # All turns exhausted — send one final text-only message to force output.
+    if verbose:
+        log("[local] Turn limit reached — forcing final output (no tool calls).")
+    try:
+        response_forced = chat.send_message(_FINAL_FORCED_PROMPT)
+        _add_gemini_usage(response_forced)
+        text = response_forced.text or ""
+        hypotheses = _extract_hypotheses(text)
+        if hypotheses:
+            prompt_record = (
+                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
+                f"=== INITIAL MESSAGE ===\n{init_msg}"
+            )
+            _save_files(profile.path, prompt_record, text, verbose, log)
+            return hypotheses, input_tokens, output_tokens
+    except Exception as exc:
+        if verbose:
+            log(f"[local] Forced output turn failed: {exc}")
+    if verbose:
+        log("[local] Warning: no hypotheses extracted after forced output turn.")
+    return [], input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------

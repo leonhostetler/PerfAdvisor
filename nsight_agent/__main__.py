@@ -11,6 +11,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from nsight_agent.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
+
 console = Console(record=True)
 
 
@@ -38,6 +40,7 @@ def _print_timings(timings: dict[str, float]) -> None:
 def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.agent.loop import (
         MAX_TURNS,
+        WARN_TURNS_BEFORE_LIMIT,
         _build_system_prompt,
         _parse_provider_and_model,
         check_provider_available,
@@ -150,14 +153,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         )
         _input_label = "heuristic"
 
+    _max_turns = args.max_turns
     _output_lo = 5 * 600 + 800   # 3,800 — optimistic (5 turns)
-    _output_hi = MAX_TURNS * 600 + 800  # pessimistic (max turns)
+    _output_hi = _max_turns * 600 + 800  # pessimistic (max turns)
 
     if not args.quiet and not args.json:
         console.print(
             f"\n[bold]Token estimate:[/bold]\n"
             f"  Input:  ~{_input_tokens:,} ({_input_label})\n"
-            f"  Output: ~{_output_lo:,} – {_output_hi:,} (5 – {MAX_TURNS} turns estimated)\n"
+            f"  Output: ~{_output_lo:,} – {_output_hi:,} (5 – {_max_turns} turns estimated)\n"
             f"  Model:  {resolved_model} ({resolved_provider})"
         )
         if not args.yes and sys.stdin.isatty():
@@ -175,7 +179,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     t_agent = time.perf_counter()
     hypotheses = run_agent(
         args.profile, summary=summary, verbose=not args.quiet,
-        model=args.model, token_usage=token_usage,
+        model=args.model, max_turns=args.max_turns, token_usage=token_usage,
         grounded=not args.allow_app_knowledge, log=log,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
@@ -510,6 +514,14 @@ def main() -> None:
     p_analyze.add_argument(
         "--max-phases", type=int, default=6,
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+    )
+    p_analyze.add_argument(
+        "--max-turns", type=int, default=MAX_TURNS,
+        help=(
+            f"Maximum number of agent tool-call turns before forcing output "
+            f"(default: {MAX_TURNS}). A wrap-up warning is injected {WARN_TURNS_BEFORE_LIMIT} "
+            f"turns before the limit; a forced no-tool output turn fires if the limit is hit."
+        ),
     )
     p_analyze.add_argument(
         "--model", default=None,

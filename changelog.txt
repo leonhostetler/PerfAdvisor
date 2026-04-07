@@ -3,6 +3,22 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Update README: document `--max-turns` flag, wrap-up warning, and forced final
+  turn behavior in Useful Flags and Minimizing Token Expenditure sections;
+  add note to Pre-flight Estimate section that output range reflects `--max-turns`
+- Add turn-limit safety net to agent loop (`loop.py`): instead of raising
+  `RuntimeError` when `max_turns` is exhausted, inject a wrap-up warning
+  `WARN_TURNS_BEFORE_LIMIT` (3) turns before the limit (bundled with tool
+  results so no extra API call); on the final turn, bundle the forced-output
+  prompt with tool results; after the loop, make one additional API call
+  without tools to extract whatever hypotheses the model has accumulated;
+  applies to all three backends (Anthropic, OpenAI, Gemini); Gemini uses
+  `Part.from_text` for the warning and a standalone `chat.send_message` for
+  the forced turn; returns `[]` (with a warning log) rather than raising if
+  no hypotheses are produced even after the forced turn
+- Add `--max-turns` flag to `analyze` subcommand: overrides `MAX_TURNS=20`
+  default; wired through to `run_agent`; preflight output/range display
+  uses the resolved value rather than the hardcoded constant
 - Improve pre-flight token estimate accuracy: replace single char/4 heuristic
   with content-aware `estimate_prose_tokens` (4 chars/token) and
   `estimate_json_tokens` (2.5 chars/token) in `preflight.py`; `analyze` applies
