@@ -71,6 +71,8 @@ class PhaseSummary(BaseModel):
     start_s: float              # seconds from profile start
     end_s: float
     duration_s: float
+    start_ns: int               # absolute CUPTI timestamp (nanoseconds); pass to windowed tools
+    end_ns: int
     gpu_utilization_pct: float
     gpu_kernel_s: float
     gpu_memcpy_s: float

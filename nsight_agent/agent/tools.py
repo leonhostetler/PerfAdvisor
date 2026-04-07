@@ -18,6 +18,13 @@ from nsight_agent.analysis.metrics import (
     compute_profile_span,
     compute_streams,
     compute_top_kernels,
+    _window_idle_time,
+    _window_kernel_time,
+    _window_memcpy_by_kind,
+    _window_mpi_ops,
+    _window_nvtx_ranges,
+    _window_streams,
+    _window_top_kernels,
 )
 from nsight_agent.ingestion.profile import NsysProfile
 
@@ -44,41 +51,73 @@ def tool_profile_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
 def tool_top_kernels(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return the top GPU kernels by total execution time."""
     limit = int(args.get("limit", 15))
-    kernels = compute_top_kernels(profile, limit=limit)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        start_ns, end_ns = int(start_ns), int(end_ns)
+        total_kernel_s = _window_kernel_time(profile, start_ns, end_ns)
+        kernels = _window_top_kernels(profile, start_ns, end_ns, total_kernel_s, limit=limit)
+    else:
+        kernels = compute_top_kernels(profile, limit=limit)
     return {"kernels": [k.model_dump() for k in kernels]}
 
 
-def tool_gap_histogram(profile: NsysProfile, _args: dict[str, Any]) -> dict:
+def tool_gap_histogram(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return a histogram of GPU idle gaps between kernel launches."""
-    total_idle_s, buckets = compute_gap_histogram(profile)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        total_idle_s, buckets = _window_idle_time(profile, int(start_ns), int(end_ns))
+    else:
+        total_idle_s, buckets = compute_gap_histogram(profile)
     return {
         "total_idle_s": round(total_idle_s, 3),
         "buckets": [b.model_dump() for b in buckets],
     }
 
 
-def tool_memcpy_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
+def tool_memcpy_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return memory transfer summary broken down by direction/kind."""
-    transfers = compute_memcpy_by_kind(profile)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        transfers = _window_memcpy_by_kind(profile, int(start_ns), int(end_ns))
+    else:
+        transfers = compute_memcpy_by_kind(profile)
     return {"transfers": [t.model_dump() for t in transfers]}
 
 
-def tool_mpi_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
+def tool_mpi_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return MPI operation summary. Returns empty list if no MPI data."""
-    ops = compute_mpi_ops(profile)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        ops = _window_mpi_ops(profile, int(start_ns), int(end_ns))
+    else:
+        ops = compute_mpi_ops(profile)
     return {"mpi_present": profile.has_mpi(), "ops": [o.model_dump() for o in ops]}
 
 
 def tool_nvtx_ranges(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return top NVTX annotation ranges by total time."""
     limit = int(args.get("limit", 20))
-    ranges = compute_nvtx_ranges(profile, limit=limit)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        ranges = _window_nvtx_ranges(profile, int(start_ns), int(end_ns), limit=limit)
+    else:
+        ranges = compute_nvtx_ranges(profile, limit=limit)
     return {"nvtx_present": profile.has_nvtx(), "ranges": [r.model_dump() for r in ranges]}
 
 
-def tool_stream_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
+def tool_stream_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return per-stream GPU utilization."""
-    streams = compute_streams(profile)
+    start_ns = args.get("start_ns")
+    end_ns = args.get("end_ns")
+    if start_ns is not None and end_ns is not None:
+        streams = _window_streams(profile, int(start_ns), int(end_ns))
+    else:
+        streams = compute_streams(profile)
     return {"streams": [s.model_dump() for s in streams]}
 
 
@@ -118,6 +157,25 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
 # Registry: maps tool name -> (function, schema)
 # ---------------------------------------------------------------------------
 
+# Optional time-window parameters shared by most tools.
+_WINDOW_SCHEMA_PROPS: dict[str, Any] = {
+    "start_ns": {
+        "type": "integer",
+        "description": (
+            "Start of time window as an absolute CUPTI timestamp in nanoseconds. "
+            "Each phase in the pre-seeded phase summary includes start_ns and end_ns "
+            "fields — pass them directly to scope this tool to that phase."
+        ),
+    },
+    "end_ns": {
+        "type": "integer",
+        "description": (
+            "End of time window as an absolute CUPTI timestamp in nanoseconds. "
+            "Must be provided together with start_ns."
+        ),
+    },
+}
+
 TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
     "profile_summary": (
         tool_profile_summary,
@@ -135,14 +193,18 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
         tool_top_kernels,
         {
             "name": "top_kernels",
-            "description": "Return the top GPU kernels ranked by total execution time.",
+            "description": (
+                "Return the top GPU kernels ranked by total execution time. "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of kernels to return (default 15).",
-                    }
+                    },
+                    **_WINDOW_SCHEMA_PROPS,
                 },
                 "required": [],
             },
@@ -154,17 +216,29 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "name": "gap_histogram",
             "description": (
                 "Return a histogram of GPU idle gaps between kernel launches. "
-                "Large gaps (>1ms) often indicate CPU-side bottlenecks or MPI wait time."
+                "Large gaps (>1ms) often indicate CPU-side bottlenecks or MPI wait time. "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
             ),
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {
+                "type": "object",
+                "properties": {**_WINDOW_SCHEMA_PROPS},
+                "required": [],
+            },
         },
     ),
     "memcpy_summary": (
         tool_memcpy_summary,
         {
             "name": "memcpy_summary",
-            "description": "Return memory transfer summary by kind (H2D, D2H, P2P, etc.).",
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "description": (
+                "Return memory transfer summary by kind (H2D, D2H, P2P, etc.). "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {**_WINDOW_SCHEMA_PROPS},
+                "required": [],
+            },
         },
     ),
     "mpi_summary": (
@@ -173,9 +247,14 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "name": "mpi_summary",
             "description": (
                 "Return MPI operation breakdown by total time and call count. "
-                "Returns empty if the profile has no MPI instrumentation."
+                "Returns empty if the profile has no MPI instrumentation. "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
             ),
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {
+                "type": "object",
+                "properties": {**_WINDOW_SCHEMA_PROPS},
+                "required": [],
+            },
         },
     ),
     "nvtx_ranges": (
@@ -185,7 +264,8 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "description": (
                 "Return top NVTX annotation ranges by total wall-clock time. "
                 "These are application-defined labels and give semantic context "
-                "to what the GPU and CPU were doing."
+                "to what the GPU and CPU were doing. "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
             ),
             "input_schema": {
                 "type": "object",
@@ -193,7 +273,8 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of ranges to return (default 20).",
-                    }
+                    },
+                    **_WINDOW_SCHEMA_PROPS,
                 },
                 "required": [],
             },
@@ -205,9 +286,14 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "name": "stream_summary",
             "description": (
                 "Return per-CUDA-stream GPU utilization. "
-                "A single dominant stream indicates no concurrent kernel execution."
+                "A single dominant stream indicates no concurrent kernel execution. "
+                "Pass start_ns/end_ns to scope the results to a specific phase."
             ),
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {
+                "type": "object",
+                "properties": {**_WINDOW_SCHEMA_PROPS},
+                "required": [],
+            },
         },
     ),
     "phase_summary": (

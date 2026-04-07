@@ -770,6 +770,100 @@ def _window_mpi_ops(
     return sorted(seen.values(), key=lambda x: x.total_s, reverse=True)[:limit]
 
 
+def _window_memcpy_by_kind(
+    profile: NsysProfile,
+    start_ns: int,
+    end_ns: int,
+    peak_bandwidth_GBs: float | None = None,
+) -> list[MemcpySummary]:
+    rows = profile.query(f"""
+        SELECT
+            e.label                              AS kind,
+            COUNT(*)                             AS transfers,
+            SUM(m.bytes)                         AS total_bytes,
+            SUM(m.end - m.start) / 1e9          AS total_s,
+            CAST(SUM(m.bytes) AS REAL) / NULLIF(SUM(m.end - m.start), 0)
+                                                 AS effective_GBs
+        FROM CUPTI_ACTIVITY_KIND_MEMCPY m
+        JOIN ENUM_CUDA_MEMCPY_OPER e ON m.copyKind = e.id
+        WHERE m.start >= {start_ns} AND m.end <= {end_ns}
+        GROUP BY m.copyKind
+        ORDER BY total_s DESC
+    """)
+    return [
+        MemcpySummary(
+            kind=r["kind"],
+            transfers=r["transfers"],
+            total_bytes=r["total_bytes"] or 0,
+            total_s=round(r["total_s"], 4),
+            effective_GBs=round(r["effective_GBs"] or 0.0, 2),
+            pct_of_peak_bandwidth=(
+                round(100.0 * (r["effective_GBs"] or 0.0) / peak_bandwidth_GBs, 1)
+                if peak_bandwidth_GBs and (r["effective_GBs"] or 0.0) > 0
+                else None
+            ),
+        )
+        for r in rows
+    ]
+
+
+def _window_streams(
+    profile: NsysProfile, start_ns: int, end_ns: int
+) -> list[StreamSummary]:
+    total_gpu_s = _window_kernel_time(profile, start_ns, end_ns)
+    rows = profile.query(f"""
+        SELECT
+            streamId                        AS stream_id,
+            COUNT(*)                        AS kernel_calls,
+            SUM(end - start) / 1e9         AS total_gpu_s
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE start >= {start_ns} AND end <= {end_ns}
+        GROUP BY streamId
+        ORDER BY total_gpu_s DESC
+    """)
+    return [
+        StreamSummary(
+            stream_id=r["stream_id"],
+            kernel_calls=r["kernel_calls"],
+            total_gpu_s=round(r["total_gpu_s"], 4),
+            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1) if total_gpu_s else 0.0,
+        )
+        for r in rows
+    ]
+
+
+def _window_nvtx_ranges(
+    profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 20
+) -> list[NvtxRangeSummary]:
+    if not profile.has_nvtx():
+        return []
+    rows = profile.query(f"""
+        SELECT
+            text                            AS name,
+            COUNT(*)                        AS calls,
+            SUM(end - start) / 1e9         AS total_s,
+            AVG(end - start) / 1e6         AS avg_ms
+        FROM NVTX_EVENTS
+        WHERE eventType = 59
+          AND end IS NOT NULL
+          AND end > start
+          AND text IS NOT NULL
+          AND start >= {start_ns} AND end <= {end_ns}
+        GROUP BY text
+        ORDER BY total_s DESC
+        LIMIT {limit}
+    """)
+    return [
+        NvtxRangeSummary(
+            name=r["name"],
+            calls=r["calls"],
+            total_s=round(r["total_s"], 3),
+            avg_ms=round(r["avg_ms"], 3),
+        )
+        for r in rows
+    ]
+
+
 def compute_phase_summary(
     profile: NsysProfile,
     phase: PhaseWindow,
@@ -801,6 +895,8 @@ def compute_phase_summary(
         start_s=round(start_s, 3),
         end_s=round(start_s + duration_s, 3),
         duration_s=round(duration_s, 3),
+        start_ns=phase.start_ns,
+        end_ns=phase.end_ns,
         gpu_utilization_pct=round(100.0 * kernel_s / duration_s, 1) if duration_s else 0.0,
         gpu_kernel_s=round(kernel_s, 3),
         gpu_memcpy_s=round(memcpy_s, 3),

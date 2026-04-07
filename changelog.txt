@@ -3,6 +3,16 @@ changelog — nsight_agent
 
 2026-04-06
 ----------
+- Add phase-scoped time window support to agent tools: `top_kernels`, `gap_histogram`,
+  `memcpy_summary`, `mpi_summary`, `nvtx_ranges`, and `stream_summary` now accept optional
+  `start_ns`/`end_ns` parameters; when provided they query only within that window using
+  existing internal `_window_*` helpers; tool schemas updated with parameter descriptions
+  that direct the agent to use phase timestamps from the pre-seeded context
+- Add `_window_memcpy_by_kind`, `_window_streams`, `_window_nvtx_ranges` to `metrics.py`
+  (windowed counterparts for the three functions that previously lacked them)
+- Add `start_ns`/`end_ns` fields to `PhaseSummary` (absolute CUPTI nanosecond timestamps);
+  the pre-seeded phase summary previously only had `start_s`/`end_s` (seconds), which the
+  agent could not use directly as tool window arguments
 - Add `--allow-app-knowledge` flag to `analyze`: by default the system prompt
   now constrains the model to ground all suggestions in profile data only;
   `--allow-app-knowledge` restores the previous behavior where the model may
