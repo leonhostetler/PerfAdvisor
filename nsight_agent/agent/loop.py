@@ -10,8 +10,11 @@ Three backends are supported:
   - claude_code (fallback): pre-computes the full ProfileSummary and sends it to
     `claude -p` via subprocess. No API key required.
 
-Select a provider explicitly with --provider, or prefix the model ID:
-  openai:gpt-4o, gemini:gemini-2.0-flash, anthropic:claude-opus-4-6
+Select a provider via --model:
+  openai:gpt-4o          (provider prefix + model)
+  openai                 (provider only, uses default model)
+  gemini:gemini-2.0-flash
+  anthropic:claude-opus-4-6
 
 Both prompt and raw response are saved next to the profile:
   {profile_stem}_{timestamp}_prompt.txt
@@ -193,28 +196,30 @@ def _save_files(
     return prompt_path, response_path
 
 
-def _parse_provider_and_model(provider: str | None, model: str | None) -> tuple[str, str, str]:
-    """Resolve (provider, model_id, reason) from explicit --provider and model string.
+def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
+    """Resolve (provider, model_id, reason) from the --model string.
 
-    Model strings may carry a provider prefix: "openai:gpt-4o", "gemini:gemini-2.0-flash".
+    Model strings may carry a provider prefix or be a bare provider name:
+      "openai:gpt-4o"     → provider=openai,   model=gpt-4o
+      "openai"            → provider=openai,   model=<default>
+      "claude-opus-4-6"   → provider auto-detected from env vars
+      None                → provider auto-detected from env vars
+
     Resolution order:
       1. Provider prefix in model string (e.g. "openai:gpt-4o")
-      2. Explicit --provider flag
+      2. Bare provider name in model string (e.g. "openai")
       3. Auto-detect from available API keys (ANTHROPIC > OPENAI > GOOGLE)
       4. Fall back to claude_code subprocess
-
-    If model is None, a sensible default is chosen for the resolved provider.
     """
     if model:
         for p in _KNOWN_PROVIDERS:
             if model.startswith(f"{p}:"):
                 return p, model[len(p) + 1:], "provider prefix in --model"
+        if model in _KNOWN_PROVIDERS:
+            return model, _DEFAULT_MODELS[model], "provider name in --model"
 
     def _default(p: str) -> str:
         return model if model else _DEFAULT_MODELS[p]
-
-    if provider:
-        return provider, _default(provider), "explicit --provider flag"
 
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic", _default("anthropic"), "presence of ANTHROPIC_API_KEY"
@@ -664,7 +669,6 @@ def run_agent(
     profile_path: str | Path,
     *,
     model: str = MODEL,
-    provider: str | None = None,
     max_turns: int = MAX_TURNS,
     verbose: bool = True,
     summary: ProfileSummary | None = None,
@@ -676,7 +680,7 @@ def run_agent(
 
     Provider selection order:
       1. Provider prefix in model string (e.g. "openai:gpt-4o")
-      2. Explicit `provider` argument (or --provider CLI flag)
+      2. Bare provider name in model string (e.g. "openai")
       3. Auto-detect from ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY
       4. Fall back to `claude -p` subprocess (no API key required)
 
@@ -686,7 +690,7 @@ def run_agent(
     If `token_usage` is provided, it will be populated with `input_tokens` and
     `output_tokens` after the run (both None for the claude_code fallback).
     """
-    resolved_provider, resolved_model, _ = _parse_provider_and_model(provider, model)
+    resolved_provider, resolved_model, _ = _parse_provider_and_model(model)
 
     profile = NsysProfile(profile_path)
 

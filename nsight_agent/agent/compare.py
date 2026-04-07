@@ -221,7 +221,6 @@ def run_compare(
     summary_b: ProfileSummary,
     diff: ProfileDiff,
     model: str | None = None,
-    provider: str | None = None,
     verbose: bool = True,
     token_usage: dict[str, Any] | None = None,
     log: Callable[[str], None] = print,
@@ -236,7 +235,7 @@ def run_compare(
     """
     from nsight_agent.agent.loop import _parse_provider_and_model
 
-    resolved_provider, resolved_model, _ = _parse_provider_and_model(provider, model)
+    resolved_provider, resolved_model, _ = _parse_provider_and_model(model)
 
     prompt = _build_prompt(summary_a, summary_b, diff)
 

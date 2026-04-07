@@ -3,6 +3,15 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Consolidate `--provider` flag into `--model`: `_parse_provider_and_model` now
+  accepts only the model string; a bare provider name (e.g. `--model=openai`)
+  is treated as a provider-only shorthand that selects the default model for
+  that provider; the explicit `--provider` flag is removed from both `analyze`
+  and `compare` subparsers; `run_agent` and `run_compare` signatures updated
+  accordingly; README Provider Selection section updated with new examples
+
+2026-04-07
+----------
 - Add `compare` subcommand: single-shot LLM comparison of two `.sqlite` profiles
   producing a structured `ComparisonReport` (narrative + key differences table
   ordered by magnitude); no tool-use loop — both summaries and a pre-computed

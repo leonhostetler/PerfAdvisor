@@ -146,8 +146,8 @@ nsight-agent analyze profile.sqlite --max-phases 1   # disable phase segmentatio
 
 Provider resolution order (first match wins):
 
-1. Provider prefix in the model string: `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `anthropic:claude-opus-4-6`
-2. `--provider {anthropic,openai,gemini}` flag
+1. Provider prefix in `--model`: `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `anthropic:claude-opus-4-6`
+2. Bare provider name in `--model`: `openai`, `gemini`, `anthropic` (uses that provider's default model)
 3. Auto-detect from environment: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY`
 4. Fallback to `claude -p` subprocess (Claude Code CLI, no API key required)
 
@@ -164,7 +164,8 @@ nsight-agent analyze profile.sqlite --model claude-haiku-4-5-20251001   # faster
 ```bash
 export OPENAI_API_KEY=sk-...
 nsight-agent analyze profile.sqlite --model openai:gpt-4o
-nsight-agent analyze profile.sqlite --provider openai --model gpt-4o-mini
+nsight-agent analyze profile.sqlite --model openai:gpt-4o-mini
+nsight-agent analyze profile.sqlite --model openai   # uses gpt-4o (default)
 ```
 
 ### Google Gemini
@@ -172,7 +173,8 @@ nsight-agent analyze profile.sqlite --provider openai --model gpt-4o-mini
 ```bash
 export GOOGLE_API_KEY=...
 nsight-agent analyze profile.sqlite --model gemini:gemini-2.0-flash
-nsight-agent analyze profile.sqlite --provider gemini --model gemini-1.5-pro
+nsight-agent analyze profile.sqlite --model gemini:gemini-1.5-pro
+nsight-agent analyze profile.sqlite --model gemini   # uses gemini-2.0-flash (default)
 ```
 
 ### Claude Code fallback (no API key)

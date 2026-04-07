@@ -46,7 +46,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.ingestion.profile import NsysProfile
 
     # Resolve provider early so we can fail fast before any expensive work.
-    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.provider, args.model)
+    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
 
     if not args.quiet:
         console.print(f"Using AI provider = [cyan]{resolved_provider}[/cyan], model = [cyan]{resolved_model}[/cyan] (selected based on {reason})")
@@ -114,7 +114,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     t_agent = time.perf_counter()
     hypotheses = run_agent(
         args.profile, summary=summary, verbose=not args.quiet,
-        model=args.model, provider=args.provider, token_usage=token_usage,
+        model=args.model, token_usage=token_usage,
         grounded=not args.allow_app_knowledge, log=log,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
@@ -215,7 +215,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     from nsight_agent.analysis.metrics import compute_profile_summary
     from nsight_agent.ingestion.profile import NsysProfile
 
-    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.provider, args.model)
+    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
 
     if not args.quiet:
         console.print(
@@ -273,7 +273,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     report = run_compare(
         args.profile_a, args.profile_b,
         summary_a=summary_a, summary_b=summary_b,
-        diff=diff, model=args.model, provider=args.provider,
+        diff=diff, model=args.model,
         verbose=not args.quiet, token_usage=token_usage, log=log,
     )
 
@@ -404,18 +404,11 @@ def main() -> None:
     p_analyze.add_argument(
         "--model", default=None,
         help=(
-            "Model for hypothesis generation (default: per-provider — "
-            "claude-opus-4-6 for anthropic, gpt-4o for openai, gemini-2.0-flash for gemini). "
-            "Use a provider prefix to select the backend implicitly: "
-            "openai:gpt-4o, gemini:gemini-2.0-flash, anthropic:claude-opus-4-6."
-        ),
-    )
-    p_analyze.add_argument(
-        "--provider", default=None,
-        choices=["anthropic", "openai", "gemini"],
-        help=(
-            "LLM provider to use (default: auto-detected from available API keys). "
-            "Overridden by a provider prefix in --model."
+            "Model for hypothesis generation. Examples: "
+            "'openai:gpt-4o' (provider prefix + model), "
+            "'openai' (provider only, uses default model), "
+            "'claude-haiku-4-5-20251001' (model only, provider auto-detected). "
+            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai), gemini-2.0-flash (gemini)."
         ),
     )
     p_analyze.add_argument(
@@ -439,14 +432,9 @@ def main() -> None:
     p_compare.add_argument(
         "--model", default=None,
         help=(
-            "Model for comparison (default: per-provider). "
-            "Same format as analyze --model."
+            "Model for comparison. Same format as analyze --model: "
+            "'openai:gpt-4o', 'openai', or a bare model ID."
         ),
-    )
-    p_compare.add_argument(
-        "--provider", default=None,
-        choices=["anthropic", "openai", "gemini"],
-        help="LLM provider to use (default: auto-detected from available API keys).",
     )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
