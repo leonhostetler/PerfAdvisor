@@ -1,6 +1,22 @@
 changelog — nsight_agent
 ========================
 
+2026-04-07
+----------
+- Remove `_ensure_indexes` and the writable connection in `NsysProfile`: the tool
+  previously opened a writable connection on first use to add query-accelerating
+  indexes to the profile file; SQLite does not support temporary indexes on
+  non-temporary tables, so there is no non-modifying alternative; the ~25% local
+  analysis speedup was not worth the hidden file modification given that runtime
+  is dominated by LLM round-trips
+- Add `has_table` guards to `compute_gpu_sync_time` and `compute_gpu_memcpy_time`:
+  previously both would crash with `OperationalError` on profiles that lack
+  `CUPTI_ACTIVITY_KIND_SYNCHRONIZATION` or `CUPTI_ACTIVITY_KIND_MEMCPY`
+- Add docstring note to `PhaseSummary` clarifying that `total_gpu_idle_s` counts
+  only inter-kernel gaps, not leading/trailing idle at phase boundaries
+- Add "Provenance" section to README noting the tool was vibe coded and that
+  metrics should be treated as starting points rather than ground truth
+
 2026-04-06
 ----------
 - Add phase-scoped time window support to agent tools: `top_kernels`, `gap_histogram`,

@@ -86,6 +86,8 @@ def compute_gpu_kernel_time(profile: NsysProfile) -> float:
 
 
 def compute_gpu_memcpy_time(profile: NsysProfile) -> float:
+    if not profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
+        return 0.0
     row = profile.query(
         "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_MEMCPY"
     )[0]
@@ -93,6 +95,8 @@ def compute_gpu_memcpy_time(profile: NsysProfile) -> float:
 
 
 def compute_gpu_sync_time(profile: NsysProfile) -> float:
+    if not profile.has_table("CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"):
+        return 0.0
     row = profile.query(
         "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"
     )[0]

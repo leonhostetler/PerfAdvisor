@@ -4,6 +4,12 @@ An agentic performance analyzer for NVIDIA Nsight Systems profiles. It extracts 
 
 ---
 
+## Provenance
+
+This tool was built with heavy AI coding assistance ("vibe coded"). The SQL queries, metric calculations, and analysis logic have not been exhaustively validated — they look plausible but may contain subtle errors in unit conversions, aggregations, or edge-case handling. Treat the numbers as starting points for investigation rather than ground truth, and verify anything surprising directly against the SQLite database or the Nsight Systems GUI.
+
+---
+
 ## How it works
 
 The pipeline has two distinct stages:

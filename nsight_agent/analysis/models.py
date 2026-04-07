@@ -65,7 +65,13 @@ class StreamSummary(BaseModel):
 
 
 class PhaseSummary(BaseModel):
-    """Metrics for a single execution phase within a profile."""
+    """Metrics for a single execution phase within a profile.
+
+    Note: ``total_gpu_idle_s`` counts only inter-kernel gaps within the phase
+    window (kernel-end to next-kernel-start). Idle time before the first kernel
+    or after the last kernel in the phase is not included — it contributes to
+    the denominator of ``gpu_utilization_pct`` but not to ``total_gpu_idle_s``.
+    """
 
     name: str
     start_s: float              # seconds from profile start
