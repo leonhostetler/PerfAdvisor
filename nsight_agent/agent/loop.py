@@ -26,6 +26,7 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from nsight_agent.analysis.metrics import compute_profile_summary
@@ -159,12 +160,12 @@ def _trunc(s: str, n: int = 200) -> str:
     return s[:n] + "..." if len(s) > n else s
 
 
-def _turn_header(turn: int, max_turns: int) -> None:
+def _turn_header(turn: int, max_turns: int, log: Callable[[str], None] = print) -> None:
     label = f" Turn {turn} / {max_turns} "
     dashes = max(0, 60 - len(label))
     left = dashes // 2
     right = dashes - left
-    print(f"\n{'─' * left}{label}{'─' * right}")
+    log(f"\n{'─' * left}{label}{'─' * right}")
 
 
 def _save_files(
@@ -172,6 +173,7 @@ def _save_files(
     prompt: str,
     response: str,
     verbose: bool,
+    log: Callable[[str], None] = print,
 ) -> tuple[Path, Path]:
     """Save prompt and response to files next to the profile."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -185,8 +187,8 @@ def _save_files(
     response_path.write_text(response, encoding="utf-8")
 
     if verbose:
-        print(f"[local] Prompt saved to:   {prompt_path}")
-        print(f"[local] Response saved to: {response_path}")
+        log(f"[local] Prompt saved to:   {prompt_path}")
+        log(f"[local] Response saved to: {response_path}")
 
     return prompt_path, response_path
 
@@ -290,6 +292,7 @@ def _run_api(
     verbose: bool,
     summary: ProfileSummary | None = None,
     grounded: bool = True,
+    log: Callable[[str], None] = print,
 ) -> tuple[list[dict[str, Any]], int, int]:
     import anthropic
 
@@ -312,12 +315,12 @@ def _run_api(
         messages.append({"role": "assistant", "content": response.content})
 
         if verbose:
-            _turn_header(turn, max_turns)
+            _turn_header(turn, max_turns, log)
             for block in response.content:
                 if hasattr(block, "text"):
-                    print(f"[← llm] {_trunc(block.text)}")
+                    log(f"[← llm] {_trunc(block.text)}")
                 elif hasattr(block, "name"):
-                    print(f"[← llm:tool] {block.name}({_trunc(json.dumps(block.input), 120)})")
+                    log(f"[← llm:tool] {block.name}({_trunc(json.dumps(block.input), 120)})")
 
         if response.stop_reason == "end_turn":
             for block in reversed(response.content):
@@ -329,7 +332,7 @@ def _run_api(
                             f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
                             f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                         )
-                        _save_files(profile.path, prompt_record, block.text, verbose)
+                        _save_files(profile.path, prompt_record, block.text, verbose, log)
                         return hypotheses, input_tokens, output_tokens
             return [], input_tokens, output_tokens
 
@@ -339,7 +342,7 @@ def _run_api(
                 continue
             result_json = dispatch(profile, block.name, block.input)
             if verbose:
-                print(f"[local] {block.name} → {_trunc(result_json)}")
+                log(f"[local] {block.name} → {_trunc(result_json)}")
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -390,6 +393,7 @@ def _run_openai(
     verbose: bool,
     summary: ProfileSummary | None = None,
     grounded: bool = True,
+    log: Callable[[str], None] = print,
 ) -> tuple[list[dict[str, Any]], int, int]:
     try:
         from openai import OpenAI
@@ -449,11 +453,11 @@ def _run_openai(
         messages.append(msg_dict)
 
         if verbose:
-            _turn_header(turn, max_turns)
+            _turn_header(turn, max_turns, log)
             if msg.content:
-                print(f"[← llm] {_trunc(msg.content)}")
+                log(f"[← llm] {_trunc(msg.content)}")
             for tc in (msg.tool_calls or []):
-                print(f"[← llm:tool] {tc.function.name}({_trunc(tc.function.arguments, 120)})")
+                log(f"[← llm:tool] {tc.function.name}({_trunc(tc.function.arguments, 120)})")
 
         if choice.finish_reason == "stop":
             hypotheses = _extract_hypotheses(msg.content or "")
@@ -462,7 +466,7 @@ def _run_openai(
                     f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
                     f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                 )
-                _save_files(profile.path, prompt_record, msg.content or "", verbose)
+                _save_files(profile.path, prompt_record, msg.content or "", verbose, log)
                 return hypotheses, input_tokens, output_tokens
             return [], input_tokens, output_tokens
 
@@ -470,7 +474,7 @@ def _run_openai(
         for tc in (msg.tool_calls or []):
             result_json = dispatch(profile, tc.function.name, json.loads(tc.function.arguments))
             if verbose:
-                print(f"[local] {tc.function.name} → {_trunc(result_json)}")
+                log(f"[local] {tc.function.name} → {_trunc(result_json)}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -492,6 +496,7 @@ def _run_gemini(
     verbose: bool,
     summary: ProfileSummary | None = None,
     grounded: bool = True,
+    log: Callable[[str], None] = print,
 ) -> tuple[list[dict[str, Any]], int, int]:
     try:
         from google import genai
@@ -559,12 +564,12 @@ def _run_gemini(
         function_calls = response.function_calls or []
 
         if verbose:
-            _turn_header(turn, max_turns)
+            _turn_header(turn, max_turns, log)
             text = response.text or ""
             if text:
-                print(f"[← llm] {_trunc(text)}")
+                log(f"[← llm] {_trunc(text)}")
             for fc in function_calls:
-                print(f"[← llm:tool] {fc.name}({_trunc(str(dict(fc.args)), 120)})")
+                log(f"[← llm:tool] {fc.name}({_trunc(str(dict(fc.args)), 120)})")
 
         if not function_calls:
             text = response.text or ""
@@ -574,7 +579,7 @@ def _run_gemini(
                     f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
                     f"=== INITIAL MESSAGE ===\n{init_msg}"
                 )
-                _save_files(profile.path, prompt_record, text, verbose)
+                _save_files(profile.path, prompt_record, text, verbose, log)
                 return hypotheses, input_tokens, output_tokens
             return [], input_tokens, output_tokens
 
@@ -582,7 +587,7 @@ def _run_gemini(
         for fc in function_calls:
             result_json = dispatch(profile, fc.name, dict(fc.args))
             if verbose:
-                print(f"[local] {fc.name} → {_trunc(result_json)}")
+                log(f"[local] {fc.name} → {_trunc(result_json)}")
             parts.append(
                 genai_types.Part.from_function_response(
                     name=fc.name,
@@ -605,20 +610,21 @@ def _run_claude_code(
     verbose: bool,
     summary: ProfileSummary | None = None,
     grounded: bool = True,
+    log: Callable[[str], None] = print,
 ) -> tuple[list[dict[str, Any]], int, int, float | None]:
     if verbose:
-        print("[local] No API key found — falling back to Claude Code (claude -p)")
+        log("[local] No API key found — falling back to Claude Code (claude -p)")
 
     if summary is None:
         if verbose:
-            print("[local] Computing profile summary...")
+            log("[local] Computing profile summary...")
         summary = compute_profile_summary(profile)
 
     summary_json = summary.model_dump_json(indent=2)
     prompt = _format_summary_prompt(summary_json, profile.path.name, grounded=grounded)
 
     if verbose:
-        print("[→ llm] Sending profile summary to Claude Code...")
+        log("[→ llm] Sending profile summary to Claude Code...")
 
     result = subprocess.run(
         ["claude", "-p", prompt, "--output-format", "json"],
@@ -642,10 +648,10 @@ def _run_claude_code(
     out = usage.get("output_tokens") or 0
     cost_usd: float | None = data.get("total_cost_usd")
 
-    _save_files(profile.path, prompt, response_text, verbose)
+    _save_files(profile.path, prompt, response_text, verbose, log)
 
     if verbose:
-        print(f"[← llm] {_trunc(response_text, 300)}")
+        log(f"[← llm] {_trunc(response_text, 300)}")
 
     return _extract_hypotheses(response_text), inp, out, cost_usd
 
@@ -664,6 +670,7 @@ def run_agent(
     summary: ProfileSummary | None = None,
     token_usage: dict[str, int | None] | None = None,
     grounded: bool = True,
+    log: Callable[[str], None] = print,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
@@ -684,27 +691,27 @@ def run_agent(
     profile = NsysProfile(profile_path)
 
     if verbose:
-        print(f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
+        log(f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
 
     try:
         if resolved_provider == "anthropic":
             hypotheses, inp, out = _run_api(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded,
+                verbose=verbose, summary=summary, grounded=grounded, log=log,
             )
         elif resolved_provider == "openai":
             hypotheses, inp, out = _run_openai(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded,
+                verbose=verbose, summary=summary, grounded=grounded, log=log,
             )
         elif resolved_provider == "gemini":
             hypotheses, inp, out = _run_gemini(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded,
+                verbose=verbose, summary=summary, grounded=grounded, log=log,
             )
         else:
             hypotheses, inp, out, cost_usd = _run_claude_code(
-                profile, verbose=verbose, summary=summary, grounded=grounded,
+                profile, verbose=verbose, summary=summary, grounded=grounded, log=log,
             )
             if token_usage is not None and cost_usd is not None:
                 token_usage["cost_usd"] = cost_usd

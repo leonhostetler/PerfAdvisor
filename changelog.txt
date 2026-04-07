@@ -3,6 +3,12 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Save terminal output to `{stem}_{ts}_output.txt` alongside prompt/response files
+  after each `analyze` run: `Console(record=True)` captures all Rich table output;
+  a `log` callable is threaded through `run_agent` and all four backends so the
+  turn-by-turn agent output (previously raw `print()`) is routed through the same
+  console and captured; output file is not written in `--json` mode
+
 - Remove `_ensure_indexes` and the writable connection in `NsysProfile`: the tool
   previously opened a writable connection on first use to add query-accelerating
   indexes to the profile file; SQLite does not support temporary indexes on

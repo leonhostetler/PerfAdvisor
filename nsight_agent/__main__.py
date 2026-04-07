@@ -11,7 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+console = Console(record=True)
 
 
 def _print_timings(timings: dict[str, float]) -> None:
@@ -108,12 +108,14 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print(summary.model_dump_json(indent=2))
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
+    log = lambda msg: console.print(msg, markup=False, highlight=False)
+
     token_usage: dict[str, int | None] = {}
     t_agent = time.perf_counter()
     hypotheses = run_agent(
         args.profile, summary=summary, verbose=not args.quiet,
         model=args.model, provider=args.provider, token_usage=token_usage,
-        grounded=not args.allow_app_knowledge,
+        grounded=not args.allow_app_knowledge, log=log,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
 
@@ -166,6 +168,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             )
         else:
             console.print("  Tokens: [dim]N/A[/dim]")
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    output_path = Path(args.profile).parent / f"{Path(args.profile).stem}_{ts}_output.txt"
+    output_path.write_text(console.export_text(clear=False), encoding="utf-8")
+    if not args.quiet:
+        console.print(f"  Output saved to: {output_path}")
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
