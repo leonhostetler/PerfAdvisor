@@ -113,6 +113,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     hypotheses = run_agent(
         args.profile, summary=summary, verbose=not args.quiet,
         model=args.model, provider=args.provider, token_usage=token_usage,
+        grounded=not args.allow_app_knowledge,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
 
@@ -246,6 +247,14 @@ def main() -> None:
         help=(
             "LLM provider to use (default: auto-detected from available API keys). "
             "Overridden by a provider prefix in --model."
+        ),
+    )
+    p_analyze.add_argument(
+        "--allow-app-knowledge", action="store_true",
+        help=(
+            "Allow the model to draw on application-specific knowledge from training data "
+            "(e.g. suggest named environment variables or library options inferred from kernel names). "
+            "By default suggestions are grounded strictly in the profile data."
         ),
     )
 

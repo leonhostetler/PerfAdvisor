@@ -120,6 +120,15 @@ nsight-agent analyze profile.sqlite --quiet
 # Output raw hypothesis JSON (suitable for piping or scripting)
 nsight-agent analyze profile.sqlite --json
 
+# Allow the model to draw on application-specific knowledge from training data.
+# By default, suggestions are grounded strictly in the profile data, which reduces
+# hallucinations (e.g. suggested environment variables that do not exist). With
+# --allow-app-knowledge the model may produce more specific, targeted suggestions
+# by drawing on its training knowledge of the application — but it may also
+# confidently suggest configuration options, environment variables, or tuning
+# parameters that are incorrect or do not exist.
+nsight-agent analyze profile.sqlite --allow-app-knowledge
+
 # Limit phase detection (fewer phases = less context = fewer tokens)
 nsight-agent analyze profile.sqlite --max-phases 3
 nsight-agent analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely

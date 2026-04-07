@@ -86,7 +86,15 @@ Each hypothesis object must have these fields:
     if it changes only *how* → code_optimization or lower.\
 """
 
-_SYSTEM_PROMPT_API = f"""You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile.
+_GROUNDING_CONSTRAINT = """\
+Ground all suggestions strictly in the profile data provided.
+Do not suggest application-specific environment variables, compiler flags, library options, or \
+algorithmic changes unless the profile data explicitly demonstrates the relevant behavior \
+(e.g. do not infer the application's name and then suggest configuration options from memory). \
+If you are uncertain whether a specific option exists or applies, omit it or phrase the \
+suggestion in generic terms that any engineer could verify."""
+
+_SYSTEM_PROMPT_API_BASE = f"""You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile.
 
 Your goal is to identify the most significant performance bottlenecks and produce a ranked list of
 actionable hypotheses.
@@ -106,13 +114,20 @@ objects (not wrapped in markdown fences) and nothing else after it.
 """
 
 
-def _format_summary_prompt(summary_json: str, profile_name: str) -> str:
+def _build_system_prompt(grounded: bool = True) -> str:
+    if grounded:
+        return _SYSTEM_PROMPT_API_BASE + "\n" + _GROUNDING_CONSTRAINT
+    return _SYSTEM_PROMPT_API_BASE
+
+
+def _format_summary_prompt(summary_json: str, profile_name: str, grounded: bool = True) -> str:
+    grounding_section = f"\n{_GROUNDING_CONSTRAINT}\n" if grounded else ""
     return f"""\
 You are an expert GPU performance engineer. Analyze the following Nsight Systems profile summary
 for '{profile_name}' and produce a ranked list of actionable performance hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
-
+{grounding_section}
 The summary includes a 'phases' field that partitions the profile into sequential, non-overlapping
 execution phases (e.g., initialization, solvers, teardown). Each phase has its own GPU utilization,
 top kernels, and MPI breakdown. Analyze phases independently — global averages can be misleading
@@ -274,6 +289,7 @@ def _run_api(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    grounded: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
     import anthropic
 
@@ -287,7 +303,7 @@ def _run_api(
         response = client.messages.create(
             model=model,
             max_tokens=4096,
-            system=_SYSTEM_PROMPT_API,
+            system=_build_system_prompt(grounded),
             tools=schemas,
             messages=messages,
         )
@@ -309,7 +325,7 @@ def _run_api(
                     hypotheses = _extract_hypotheses(block.text)
                     if hypotheses:
                         prompt_record = (
-                            f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                            f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
                             f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
                             f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                         )
@@ -373,6 +389,7 @@ def _run_openai(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    grounded: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
     try:
         from openai import OpenAI
@@ -389,7 +406,7 @@ def _run_openai(
         else [{"role": "user", "content": "Begin analysis."}]
     )
     # Prepend system prompt as a system message
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT_API}] + messages
+    messages = [{"role": "system", "content": _build_system_prompt(grounded)}] + messages
     input_tokens = 0
     output_tokens = 0
     # Older models use max_tokens; newer models (o-series, gpt-4.1+) require max_completion_tokens.
@@ -442,7 +459,7 @@ def _run_openai(
             hypotheses = _extract_hypotheses(msg.content or "")
             if hypotheses:
                 prompt_record = (
-                    f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
                     f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                 )
                 _save_files(profile.path, prompt_record, msg.content or "", verbose)
@@ -474,6 +491,7 @@ def _run_gemini(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    grounded: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
     try:
         from google import genai
@@ -499,7 +517,7 @@ def _run_gemini(
         for s in schemas
     ]
     config = genai_types.GenerateContentConfig(
-        system_instruction=_SYSTEM_PROMPT_API,
+        system_instruction=_build_system_prompt(grounded),
         tools=[genai_types.Tool(function_declarations=declarations)],
     )
 
@@ -553,7 +571,7 @@ def _run_gemini(
             hypotheses = _extract_hypotheses(text)
             if hypotheses:
                 prompt_record = (
-                    f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT_API}\n\n"
+                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
                     f"=== INITIAL MESSAGE ===\n{init_msg}"
                 )
                 _save_files(profile.path, prompt_record, text, verbose)
@@ -586,6 +604,7 @@ def _run_claude_code(
     *,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    grounded: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int, float | None]:
     if verbose:
         print("[local] No API key found — falling back to Claude Code (claude -p)")
@@ -596,7 +615,7 @@ def _run_claude_code(
         summary = compute_profile_summary(profile)
 
     summary_json = summary.model_dump_json(indent=2)
-    prompt = _format_summary_prompt(summary_json, profile.path.name)
+    prompt = _format_summary_prompt(summary_json, profile.path.name, grounded=grounded)
 
     if verbose:
         print("[→ llm] Sending profile summary to Claude Code...")
@@ -644,6 +663,7 @@ def run_agent(
     verbose: bool = True,
     summary: ProfileSummary | None = None,
     token_usage: dict[str, int | None] | None = None,
+    grounded: bool = True,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
@@ -670,20 +690,22 @@ def run_agent(
         if resolved_provider == "anthropic":
             hypotheses, inp, out = _run_api(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary,
+                verbose=verbose, summary=summary, grounded=grounded,
             )
         elif resolved_provider == "openai":
             hypotheses, inp, out = _run_openai(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary,
+                verbose=verbose, summary=summary, grounded=grounded,
             )
         elif resolved_provider == "gemini":
             hypotheses, inp, out = _run_gemini(
                 profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary,
+                verbose=verbose, summary=summary, grounded=grounded,
             )
         else:
-            hypotheses, inp, out, cost_usd = _run_claude_code(profile, verbose=verbose, summary=summary)
+            hypotheses, inp, out, cost_usd = _run_claude_code(
+                profile, verbose=verbose, summary=summary, grounded=grounded,
+            )
             if token_usage is not None and cost_usd is not None:
                 token_usage["cost_usd"] = cost_usd
     finally:
