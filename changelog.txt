@@ -3,6 +3,26 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Add `compare` subcommand: single-shot LLM comparison of two `.sqlite` profiles
+  producing a structured `ComparisonReport` (narrative + key differences table
+  ordered by magnitude); no tool-use loop — both summaries and a pre-computed
+  structural diff are injected into one prompt
+- Add `nsight_agent/analysis/diff.py`: `compute_profile_diff()` aligns two
+  `ProfileSummary` objects and determines comparison mode:
+    - `phase_aware` — same phase count + names; full per-phase analysis
+    - `summary` — phases differ but Jaccard kernel overlap >= 20%; per-kernel diff included
+    - `summary_no_kernel` — phases differ and overlap < 20%; top-level metrics only
+  Jaccard similarity used for kernel overlap; status message shown before LLM call
+  (e.g. "Phases do not match (A has 4, B has 6) and kernel overlap is 8%...")
+- Add `nsight_agent/agent/compare.py`: `run_compare()` single-shot backends for
+  Anthropic, OpenAI, Gemini, and claude_code; saves `{stem_a}_vs_{stem_b}_{ts}_prompt.txt`
+  and `_response.txt` alongside the profile
+- Add `ScalarDiff`, `KernelDiff`, `MemcpyDiff`, `MpiDiff`, `ProfileDiff`,
+  `ComparisonDiff`, `ComparisonReport` Pydantic models to `analysis/models.py`
+- Add `_print_phase_table()` helper to `__main__.py`; `compare` always prints both
+  phase tables before the LLM call; key differences table color-codes by magnitude
+- Output saved to `{stem_a}_vs_{stem_b}_{ts}_output.txt` next to profile A
+
 - Save terminal output to `{stem}_{ts}_output.txt` alongside prompt/response files
   after each `analyze` run: `Console(record=True)` captures all Rich table output;
   a `log` callable is threaded through `run_agent` and all four backends so the

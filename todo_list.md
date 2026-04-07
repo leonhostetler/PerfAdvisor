@@ -11,10 +11,6 @@ Open design questions:
 3. **File selection UX:** A glob pattern (e.g., `report.0.*.sqlite`) with automatic rank-ID parsing from the filename would be more practical than listing 64+ files manually.
 4. **Does `mpianalyze` need its own system prompt?** Proposed answer: no — just inject the cross-rank summary as an additional pre-seeded tool result. The data speaks for itself.
 
-## 2. Profile comparison
-
-Add a `compare` subcommand that takes two `.sqlite` profiles and returns a structured comparison narrative: what changed, what improved, what worsened, and what is unexplained. Not improvement hypotheses — just a clear before/after diff. Natural use cases: before/after an optimization, or `ev0` vs `ev1024` on the same rank.
-
 ## 3. Iterative hypothesis refinement
 
 Extend the multi-turn API backend to perform a second reasoning pass:

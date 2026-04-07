@@ -84,7 +84,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
                 if p.top_kernels else "—"
             )
-            row = [
+            row: list[str] = [
                 p.name,
                 str(p.start_s),
                 str(p.end_s),
@@ -171,6 +171,167 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     output_path = Path(args.profile).parent / f"{Path(args.profile).stem}_{ts}_output.txt"
+    output_path.write_text(console.export_text(clear=False), encoding="utf-8")
+    if not args.quiet:
+        console.print(f"  Output saved to: {output_path}")
+
+
+def _print_phase_table(summary, title: str) -> None:
+    """Print a phases table for one profile, or a note if no phases were detected."""
+    if not summary.phases:
+        console.print(f"[dim]{title}: no phases detected[/dim]")
+        return
+    ph = Table(title=title)
+    ph.add_column("Phase")
+    ph.add_column("Start (s)", justify="right")
+    ph.add_column("End (s)", justify="right")
+    ph.add_column("Duration (s)", justify="right")
+    ph.add_column("GPU Util %", justify="right")
+    ph.add_column("Top Kernel")
+    for p in summary.phases:
+        top_kernel = (
+            f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
+            if p.top_kernels else "—"
+        )
+        ph.add_row(
+            p.name,
+            str(p.start_s),
+            str(p.end_s),
+            str(p.duration_s),
+            f"{p.gpu_utilization_pct}%",
+            top_kernel,
+        )
+    console.print(ph)
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    from nsight_agent.agent.compare import run_compare
+    from nsight_agent.agent.loop import (
+        _parse_provider_and_model,
+        check_provider_available,
+        get_provider_availability,
+    )
+    from nsight_agent.analysis.diff import compute_profile_diff
+    from nsight_agent.analysis.metrics import compute_profile_summary
+    from nsight_agent.ingestion.profile import NsysProfile
+
+    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.provider, args.model)
+
+    if not args.quiet:
+        console.print(
+            f"Using AI provider = [cyan]{resolved_provider}[/cyan], "
+            f"model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
+        )
+
+    missing = check_provider_available(resolved_provider)
+    if missing:
+        console.print(f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}")
+        sys.exit(1)
+
+    if not args.quiet:
+        availability = get_provider_availability()
+        unavailable = [(p, hint) for p, hint in availability.items() if hint and p != resolved_provider]
+        for p, hint in unavailable:
+            console.print(f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False)
+
+    with NsysProfile(args.profile_a) as pa:
+        summary_a = compute_profile_summary(pa, max_phases=args.max_phases)
+    with NsysProfile(args.profile_b) as pb:
+        summary_b = compute_profile_summary(pb, max_phases=args.max_phases)
+
+    # Always print both phase tables first
+    _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}")
+    _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}")
+
+    # Compute diff — also determines comparison_mode
+    diff = compute_profile_diff(summary_a, summary_b)
+
+    # Print status message
+    n_a = len(summary_a.phases)
+    n_b = len(summary_b.phases)
+    if diff.comparison_mode == "phase_aware":
+        console.print(
+            f"\n[green]Phases match ({n_a} phases) — "
+            f"proceeding with in-depth per-phase analysis.[/green]"
+        )
+    elif diff.comparison_mode == "summary":
+        console.print(
+            f"\n[yellow]Phases do not match (Profile A has {n_a}, Profile B has {n_b}) — "
+            f"proceeding with summary comparison "
+            f"(kernel overlap: {diff.kernel_overlap_pct:.0f}%).[/yellow]"
+        )
+    else:  # summary_no_kernel
+        console.print(
+            f"\n[yellow]Phases do not match (Profile A has {n_a}, Profile B has {n_b}) "
+            f"and kernel name overlap is {diff.kernel_overlap_pct:.0f}% — "
+            f"proceeding with summary analysis and skipping per-kernel comparison.[/yellow]"
+        )
+
+    log = lambda msg: console.print(msg, markup=False, highlight=False)
+    token_usage: dict[str, int | None] = {}
+
+    report = run_compare(
+        args.profile_a, args.profile_b,
+        summary_a=summary_a, summary_b=summary_b,
+        diff=diff, model=args.model, provider=args.provider,
+        verbose=not args.quiet, token_usage=token_usage, log=log,
+    )
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    # Display narrative
+    narrative = report.get("narrative", "")
+    if narrative:
+        console.print(f"\n[bold]Analysis[/bold]\n{narrative}")
+
+    # Display key differences table
+    key_diffs = report.get("key_differences", [])
+    if key_diffs:
+        name_a = Path(args.profile_a).name
+        name_b = Path(args.profile_b).name
+        t = Table(title="Key Differences", show_lines=True)
+        t.add_column("Metric")
+        t.add_column(f"A: {name_a}", justify="right")
+        t.add_column(f"B: {name_b}", justify="right")
+        t.add_column("Delta %", justify="right")
+        t.add_column("Note")
+        for d in key_diffs:
+            mag = d.get("magnitude_pct")
+            if mag is None:
+                delta_str = "—"
+                delta_color = "dim"
+            else:
+                delta_str = f"{mag:+.1f}%"
+                abs_mag = abs(mag)
+                delta_color = "bold" if abs_mag >= 50 else "yellow" if abs_mag >= 20 else "dim"
+            t.add_row(
+                d.get("metric", ""),
+                d.get("profile_a", ""),
+                d.get("profile_b", ""),
+                f"[{delta_color}]{delta_str}[/{delta_color}]",
+                d.get("note", ""),
+            )
+        console.print(t)
+
+    if not args.quiet:
+        inp = token_usage.get("input_tokens")
+        out = token_usage.get("output_tokens")
+        if inp is not None and out is not None:
+            cost = token_usage.get("cost_usd")
+            cost_str = f"  Cost: [yellow]${cost:.4f}[/yellow]" if cost is not None else ""
+            console.print(
+                f"  Tokens: [cyan]{inp:,}[/cyan] in / [cyan]{out:,}[/cyan] out"
+                f"  ([dim]{inp + out:,} total[/dim]){cost_str}"
+            )
+        else:
+            console.print("  Tokens: [dim]N/A[/dim]")
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    stem_a = Path(args.profile_a).stem
+    stem_b = Path(args.profile_b).stem
+    output_path = Path(args.profile_a).parent / f"{stem_a}_vs_{stem_b}_{ts}_output.txt"
     output_path.write_text(console.export_text(clear=False), encoding="utf-8")
     if not args.quiet:
         console.print(f"  Output saved to: {output_path}")
@@ -266,6 +427,28 @@ def main() -> None:
         ),
     )
 
+    p_compare = sub.add_parser("compare", help="Compare two profiles and summarize differences")
+    p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
+    p_compare.add_argument("profile_b", help="Path to second .sqlite profile")
+    p_compare.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_compare.add_argument("--quiet", action="store_true", help="Suppress verbose output")
+    p_compare.add_argument(
+        "--max-phases", type=int, default=6,
+        help="Maximum number of execution phases to detect per profile (default: 6; use 1 to disable)",
+    )
+    p_compare.add_argument(
+        "--model", default=None,
+        help=(
+            "Model for comparison (default: per-provider). "
+            "Same format as analyze --model."
+        ),
+    )
+    p_compare.add_argument(
+        "--provider", default=None,
+        choices=["anthropic", "openai", "gemini"],
+        help="LLM provider to use (default: auto-detected from available API keys).",
+    )
+
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
     p_summary.add_argument("profile", help="Path to .sqlite profile")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
@@ -277,6 +460,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "analyze":
         cmd_analyze(args)
+    elif args.command == "compare":
+        cmd_compare(args)
     elif args.command == "summary":
         cmd_summary(args)
     else:

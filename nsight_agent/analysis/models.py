@@ -125,3 +125,94 @@ class ProfileSummary(BaseModel):
     mpi_ops: list[MpiOpSummary] = Field(default_factory=list)
     mpi_present: bool = False
     phases: list[PhaseSummary] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Profile comparison models
+# ---------------------------------------------------------------------------
+
+
+class ScalarDiff(BaseModel):
+    a: float
+    b: float
+    delta_pct: float | None = Field(default=None, description="(b-a)/a*100; None when a==0")
+
+
+class KernelDiff(BaseModel):
+    name: str
+    short_name: str | None = None
+    only_in_a: bool = False
+    only_in_b: bool = False
+    calls_a: int | None = None
+    calls_b: int | None = None
+    total_s_a: float | None = None
+    total_s_b: float | None = None
+    avg_ms_a: float | None = None
+    avg_ms_b: float | None = None
+    pct_gpu_time_a: float | None = None
+    pct_gpu_time_b: float | None = None
+    total_s_delta_pct: float | None = None
+
+
+class MemcpyDiff(BaseModel):
+    kind: str
+    only_in_a: bool = False
+    only_in_b: bool = False
+    total_s_a: float | None = None
+    total_s_b: float | None = None
+    effective_GBs_a: float | None = None
+    effective_GBs_b: float | None = None
+    total_s_delta_pct: float | None = None
+
+
+class MpiDiff(BaseModel):
+    op: str
+    only_in_a: bool = False
+    only_in_b: bool = False
+    calls_a: int | None = None
+    calls_b: int | None = None
+    total_s_a: float | None = None
+    total_s_b: float | None = None
+    avg_ms_a: float | None = None
+    avg_ms_b: float | None = None
+    total_s_delta_pct: float | None = None
+
+
+class ProfileDiff(BaseModel):
+    """Structured comparison between two ProfileSummary objects."""
+
+    profile_a_name: str
+    profile_b_name: str
+    comparison_mode: str = Field(
+        description="'phase_aware' | 'summary' | 'summary_no_kernel'"
+    )
+    phases_match: bool
+    kernel_overlap_pct: float = Field(
+        description="Jaccard similarity of kernel names (|intersection|/|union| * 100)"
+    )
+    # Top-level scalar diffs
+    profile_span_s: ScalarDiff
+    gpu_utilization_pct: ScalarDiff
+    gpu_kernel_s: ScalarDiff
+    gpu_memcpy_s: ScalarDiff
+    gpu_sync_s: ScalarDiff
+    total_gpu_idle_s: ScalarDiff
+    # Per-entity diffs (kernel_diffs empty for summary_no_kernel mode)
+    kernel_diffs: list[KernelDiff] = Field(default_factory=list)
+    memcpy_diffs: list[MemcpyDiff] = Field(default_factory=list)
+    mpi_diffs: list[MpiDiff] = Field(default_factory=list)
+
+
+class ComparisonDiff(BaseModel):
+    metric: str
+    profile_a: str
+    profile_b: str
+    magnitude_pct: float | None = None
+    note: str
+
+
+class ComparisonReport(BaseModel):
+    """LLM output schema for profile comparison."""
+
+    narrative: str
+    key_differences: list[ComparisonDiff] = Field(default_factory=list)
