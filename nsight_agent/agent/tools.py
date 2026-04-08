@@ -142,6 +142,7 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     Use this for targeted follow-up questions not covered by other tools.
     The database is opened read-only; any write attempt will fail.
     Returns up to 200 rows.
+    Note: SQLite only — PERCENTILE_CONT, MEDIAN, STDDEV are not supported.
     """
     sql = args.get("sql", "").strip()
     if not sql:
@@ -151,6 +152,19 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
         return {"rows": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
         return {"error": str(e)}
+
+
+def tool_get_table_schema(profile: NsysProfile, args: dict[str, Any]) -> dict:
+    """Return the column names for a table in the profile SQLite database."""
+    table = args.get("table", "").strip()
+    if not table:
+        return {"error": "No table name provided"}
+    if not profile.has_table(table):
+        return {
+            "error": f"Table '{table}' not found.",
+            "available_tables": sorted(profile.tables),
+        }
+    return {"table": table, "columns": profile.columns(table)}
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +341,9 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                 "database. Use this for targeted follow-up analysis not covered by other tools. "
                 "Tables include: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_MEMCPY, "
                 "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION, NVTX_EVENTS, MPI_COLLECTIVES_EVENTS, "
-                "MPI_P2P_EVENTS, StringIds (resolves integer name IDs), ENUM_* (resolve "
-                "integer kind/type codes). Returns up to 200 rows."
+                "MPI_P2P_EVENTS, MPI_START_WAIT_EVENTS, StringIds (resolves integer name IDs), "
+                "ENUM_* (resolve integer kind/type codes). Returns up to 200 rows. "
+                "SQLite only — PERCENTILE_CONT, MEDIAN, and STDDEV are not supported."
             ),
             "input_schema": {
                 "type": "object",
@@ -339,6 +354,30 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                     }
                 },
                 "required": ["sql"],
+            },
+        },
+    ),
+    "get_table_schema": (
+        tool_get_table_schema,
+        {
+            "name": "get_table_schema",
+            "description": (
+                "Return the column names for a specific table in the profile SQLite database. "
+                "Use this before writing a sql_query if you are unsure of a table's exact "
+                "column names. More efficient than SELECT * LIMIT 1."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": (
+                            "The table name to inspect "
+                            "(e.g. CUPTI_ACTIVITY_KIND_KERNEL, MPI_COLLECTIVES_EVENTS)."
+                        ),
+                    }
+                },
+                "required": ["table"],
             },
         },
     ),

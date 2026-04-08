@@ -111,6 +111,41 @@ algorithmic changes unless the profile data explicitly demonstrates the relevant
 If you are uncertain whether a specific option exists or applies, omit it or phrase the \
 suggestion in generic terms that any engineer could verify."""
 
+_SQL_SCHEMA_REFERENCE = """\
+## SQLite Schema Reference
+
+The profile is a SQLite database — only standard SQLite functions are available.
+Do NOT use PERCENTILE_CONT, MEDIAN, or STDDEV (they are PostgreSQL/standard SQL extensions
+and will fail). Use AVG, MIN, MAX, and manual percentile approximations instead.
+
+Key column names for sql_query (all timestamps are in nanoseconds):
+
+  CUPTI_ACTIVITY_KIND_KERNEL:
+    start, end, shortName (FK→StringIds), demangledName (FK→StringIds, may be absent),
+    gridX, gridY, gridZ, blockX, blockY, blockZ, registersPerThread,
+    sharedMemoryExecuted, staticSharedMemory, dynamicSharedMemory, streamId, correlationId
+
+  CUPTI_ACTIVITY_KIND_MEMCPY:
+    start, end, bytes, copyKind (FK→ENUM_CUDA_MEMCPY_OPER)
+
+  CUPTI_ACTIVITY_KIND_SYNCHRONIZATION:
+    start, end
+
+  CUPTI_ACTIVITY_KIND_RUNTIME:
+    start, end, nameId (FK→StringIds), correlationId
+
+  MPI_COLLECTIVES_EVENTS, MPI_P2P_EVENTS, MPI_START_WAIT_EVENTS:
+    start, end, textId (FK→StringIds)   ← textId holds the MPI operation name
+
+  NVTX_EVENTS:
+    start, end, text (literal string, not a FK), eventType (use eventType = 59 for ranges)
+
+  StringIds: id, value   ← join with: JOIN StringIds s ON s.id = <fk_column>
+
+Not all tables are present in every profile. The profile_summary tool lists available tables.
+Use the get_table_schema tool (or PRAGMA table_info(<table>)) to inspect an unfamiliar table.\
+"""
+
 _SYSTEM_PROMPT_API_BASE = f"""You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile.
 
 Your goal is to identify the most significant performance bottlenecks and produce a ranked list of
@@ -125,9 +160,13 @@ Work systematically within the dominant phases: kernels → memory → MPI (if p
 Use sql_query for any targeted follow-up that the structured tools don't cover.
 
 You may call multiple tools in a single response to gather data in parallel.
+Before calling a tool, check whether you have already called it with the same arguments earlier
+in this conversation — do not issue duplicate tool calls.
 
 When you have gathered enough evidence, output your final answer as a JSON array of hypothesis
 objects (not wrapped in markdown fences) and nothing else after it.
+
+{_SQL_SCHEMA_REFERENCE}
 """
 
 

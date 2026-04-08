@@ -3,6 +3,23 @@ changelog — nsight_agent
 
 2026-04-08
 ----------
+- Add SQL schema reference block (_SQL_SCHEMA_REFERENCE) to the multi-turn system
+  prompt: lists exact column names for CUPTI_ACTIVITY_KIND_KERNEL (start/end/shortName/
+  demangledName/grid/block/registers/sharedMem/streamId/correlationId),
+  CUPTI_ACTIVITY_KIND_MEMCPY (start/end/bytes/copyKind), CUPTI_ACTIVITY_KIND_RUNTIME
+  (start/end/nameId/correlationId), all three MPI tables (start/end/textId),
+  NVTX_EVENTS (start/end/text/eventType), and StringIds (id/value); eliminates
+  the schema-discovery turns observed in log analysis
+- Add SQLite-compatibility note to system prompt and sql_query tool description:
+  PERCENTILE_CONT, MEDIAN, STDDEV are not supported; prevents wasted calls observed
+  in log (model tried PERCENTILE_CONT which failed)
+- Add no-duplicate-calls instruction to system prompt: "before calling a tool, check
+  whether you have already called it with the same arguments"
+- Add get_table_schema tool (wraps PRAGMA table_info): returns column list for any
+  profile table; more efficient than SELECT * LIMIT 1 for schema discovery
+- All four changes apply only to multi-turn backends (Anthropic/OpenAI/Gemini) via
+  _SYSTEM_PROMPT_API_BASE and tool_schemas(); the single-shot claude_code fallback
+  is unaffected
 - Replace unconditional *_prompt.txt / *_response.txt / *_output.txt file saving
   with opt-in --log / --log-file and --transcript / --transcript-file flags on
   analyze and compare subcommands; no files are written to disk unless requested
