@@ -3,6 +3,35 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Fix `cache_control` 4-block limit error and restore true sliding cache in `_run_api`:
+  keep the 2 most-recent per-turn user messages marked (`_cache_prev` + `_cache_pprev`),
+  stripping only the oldest on each advance; total markers stay at 4 (system + preseed +
+  2 floating), which is Anthropic's maximum; this gives true sliding cache where turn N
+  reads everything through turn N-1 from cache (0.10×) rather than only the pre-seeded
+  content
+- Add Anthropic sliding prompt cache to `_run_api` in `loop.py`: system prompt and
+  pre-seeded profile summary marked with `cache_control: ephemeral` on turn 1 (cache
+  write at 1.25×); each subsequent turn marks the last tool-result block to extend the
+  cached prefix (cache read at 0.10× for all prior content, cache write for the new
+  increment); result is ~75–80% reduction in billable input tokens on a typical multi-turn
+  run; `cache_creation_tokens` and `cache_read_tokens` tracked per turn and summed
+- Return `_run_api`, `_run_openai`, `_run_gemini` as 5-tuples
+  `(hypotheses, input, cache_creation, cache_read, output)`; `run_agent` populates
+  `token_usage` with `cache_creation_tokens` and `cache_read_tokens`; OpenAI and
+  Gemini return 0 for both cache fields
+- Add `estimate_total_session_tokens` and `estimate_cache_breakdown` to `preflight.py`:
+  `estimate_total_session_tokens` computes total input across N stateless turns
+  (N×initial + increment×N(N-1)/2); `estimate_cache_breakdown` computes expected
+  cache_creation, cache_read, and cost-equivalent for Anthropic sliding cache
+- Update `cmd_analyze` preflight display: Anthropic shows cache_write / cache_read /
+  cost-equiv breakdown; other providers show total session estimate with a note that
+  OpenAI applies automatic ~50% caching
+- Update `cmd_analyze` post-run token display: when cache fields are non-zero, show
+  non-cached / cache-write / cache-read / out separately with total and cost-equivalent;
+  fall back to existing `in / out` display for non-caching providers
+- Update README: add "Prompt caching" subsection explaining per-provider caching
+  behavior; update "Pre-flight estimate" with new display format examples; add note to
+  "Minimizing token expenditure" that Anthropic caching is automatic
 - Update README: document `--max-turns` flag, wrap-up warning, and forced final
   turn behavior in Useful Flags and Minimizing Token Expenditure sections;
   add note to Pre-flight Estimate section that output range reflects `--max-turns`

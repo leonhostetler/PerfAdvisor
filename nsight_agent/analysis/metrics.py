@@ -29,6 +29,7 @@ from .phases import PhaseWindow, detect_phases
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _normalize_demangled(name: str) -> str:
     """Strip CUDA/QUDA template boilerplate from a demangled kernel name.
 
@@ -41,8 +42,8 @@ def _normalize_demangled(name: str) -> str:
     For non-QUDA or already-clean names neither pass fires, so this is a
     no-op for generic CUDA kernels.
     """
-    name = re.sub(r'^.*?void>::type\s+', '', name)
-    name = re.sub(r'\s*\(T2\)\s*$', '', name)
+    name = re.sub(r"^.*?void>::type\s+", "", name)
+    name = re.sub(r"\s*\(T2\)\s*$", "", name)
     return name.strip()
 
 
@@ -72,9 +73,7 @@ def compute_profile_span(profile: NsysProfile) -> float:
             "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
         )
     union_sql = " UNION ALL ".join(sources)
-    row = profile.query(
-        f"SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s FROM ({union_sql})"
-    )[0]
+    row = profile.query(f"SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s FROM ({union_sql})")[0]
     return float(row["span_s"] or 0.0)
 
 
@@ -146,7 +145,7 @@ def compute_top_kernels(
         sum_ns = r["sum_ns"] or 0
         sum_sq_ns = r["sum_sq_ns"] or 0.0
         mean_ns = sum_ns / n if n else 0.0
-        variance = (sum_sq_ns / n - mean_ns ** 2) if n > 1 else 0.0
+        variance = (sum_sq_ns / n - mean_ns**2) if n > 1 else 0.0
         std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
         avg_ms = r["avg_ms"] or 0.0
         cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
@@ -160,23 +159,27 @@ def compute_top_kernels(
         norm_name = _normalize_demangled(r["name"])
         oh = (launch_overhead or {}).get(norm_name)
         short = r["short_name"] if r["short_name"] != norm_name else None
-        result.append(KernelSummary(
-            name=norm_name,
-            short_name=short,
-            calls=n,
-            total_s=round(r["total_s"], 4),
-            avg_ms=round(avg_ms, 4),
-            min_ms=round(r["min_ms"], 4),
-            max_ms=round(r["max_ms"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_s"] / total_gpu_s, 1) if total_gpu_s else 0.0,
-            std_dev_ms=round(std_dev_ms, 4),
-            cv=cv,
-            avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
-            avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
-            estimated_occupancy=occupancy,
-            avg_launch_overhead_us=oh[0] if oh else None,
-            max_launch_overhead_us=oh[1] if oh else None,
-        ))
+        result.append(
+            KernelSummary(
+                name=norm_name,
+                short_name=short,
+                calls=n,
+                total_s=round(r["total_s"], 4),
+                avg_ms=round(avg_ms, 4),
+                min_ms=round(r["min_ms"], 4),
+                max_ms=round(r["max_ms"], 4),
+                pct_of_gpu_time=round(100.0 * r["total_s"] / total_gpu_s, 1)
+                if total_gpu_s
+                else 0.0,
+                std_dev_ms=round(std_dev_ms, 4),
+                cv=cv,
+                avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
+                avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
+                estimated_occupancy=occupancy,
+                avg_launch_overhead_us=oh[0] if oh else None,
+                max_launch_overhead_us=oh[1] if oh else None,
+            )
+        )
     return result
 
 
@@ -243,8 +246,7 @@ def compute_gap_histogram(profile: NsysProfile) -> tuple[float, list[GapBucket]]
         ORDER BY MIN(gap_ns)
     """)
     buckets = [
-        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3))
-        for r in rows
+        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3)) for r in rows
     ]
     total_idle_s = sum(b.total_s for b in buckets)
     return total_idle_s, buckets
@@ -266,7 +268,9 @@ def compute_streams(profile: NsysProfile) -> list[StreamSummary]:
             stream_id=r["stream_id"],
             kernel_calls=r["kernel_calls"],
             total_gpu_s=round(r["total_gpu_s"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1) if total_gpu_s else 0.0,
+            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1)
+            if total_gpu_s
+            else 0.0,
         )
         for r in rows
     ]
@@ -370,13 +374,18 @@ def _compute_launch_overhead(profile: NsysProfile) -> dict[str, tuple[float, flo
         GROUP BY {group_expr}
     """)
     return {
-        _normalize_demangled(r["name"]): (round(float(r["avg_launch_us"]), 2), round(float(r["max_launch_us"]), 2))
+        _normalize_demangled(r["name"]): (
+            round(float(r["avg_launch_us"]), 2),
+            round(float(r["max_launch_us"]), 2),
+        )
         for r in rows
         if r["avg_launch_us"] is not None and float(r["avg_launch_us"]) >= 0
     }
 
 
-def compute_cpu_sync_time(profile: NsysProfile, gpu_kernel_s: float) -> tuple[float | None, float | None]:
+def compute_cpu_sync_time(
+    profile: NsysProfile, gpu_kernel_s: float
+) -> tuple[float | None, float | None]:
     """Return (total_sync_s, pct_of_gpu_kernel_time) for CUDA synchronization API calls.
 
     Sums the CPU wall time spent in *Synchronize calls (cuEventSynchronize,
@@ -525,8 +534,7 @@ def _compute_all_mpi_stats(
 
     global_ops = sorted(global_seen.values(), key=lambda x: x.total_s, reverse=True)[:global_limit]
     per_phase = [
-        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:phase_limit]
-        for d in phase_ops
+        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:phase_limit] for d in phase_ops
     ]
     return global_ops, per_phase
 
@@ -586,8 +594,7 @@ def _window_idle_time(
         ORDER BY MIN(gap_ns)
     """)
     buckets = [
-        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3))
-        for r in rows
+        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3)) for r in rows
     ]
     return sum(b.total_s for b in buckets), buckets
 
@@ -638,7 +645,7 @@ def _window_top_kernels(
         sum_ns = r["sum_ns"] or 0
         sum_sq_ns = r["sum_sq_ns"] or 0.0
         mean_ns = sum_ns / n if n else 0.0
-        variance = (sum_sq_ns / n - mean_ns ** 2) if n > 1 else 0.0
+        variance = (sum_sq_ns / n - mean_ns**2) if n > 1 else 0.0
         std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
         avg_ms = r["avg_ms"] or 0.0
         cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
@@ -652,23 +659,27 @@ def _window_top_kernels(
         norm_name = _normalize_demangled(r["name"])
         oh = (launch_overhead or {}).get(norm_name)
         short = r["short_name"] if r["short_name"] != norm_name else None
-        result.append(KernelSummary(
-            name=norm_name,
-            short_name=short,
-            calls=n,
-            total_s=round(r["total_s"], 4),
-            avg_ms=round(avg_ms, 4),
-            min_ms=round(r["min_ms"], 4),
-            max_ms=round(r["max_ms"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_s"] / total_kernel_s, 1) if total_kernel_s else 0.0,
-            std_dev_ms=round(std_dev_ms, 4),
-            cv=cv,
-            avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
-            avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
-            estimated_occupancy=occupancy,
-            avg_launch_overhead_us=oh[0] if oh else None,
-            max_launch_overhead_us=oh[1] if oh else None,
-        ))
+        result.append(
+            KernelSummary(
+                name=norm_name,
+                short_name=short,
+                calls=n,
+                total_s=round(r["total_s"], 4),
+                avg_ms=round(avg_ms, 4),
+                min_ms=round(r["min_ms"], 4),
+                max_ms=round(r["max_ms"], 4),
+                pct_of_gpu_time=round(100.0 * r["total_s"] / total_kernel_s, 1)
+                if total_kernel_s
+                else 0.0,
+                std_dev_ms=round(std_dev_ms, 4),
+                cv=cv,
+                avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
+                avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
+                estimated_occupancy=occupancy,
+                avg_launch_overhead_us=oh[0] if oh else None,
+                max_launch_overhead_us=oh[1] if oh else None,
+            )
+        )
     return result
 
 
@@ -728,10 +739,7 @@ def _batch_window_mpi_ops(
                     max_ms=round(r["max_ms"], 3),
                 )
 
-    return [
-        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:limit]
-        for d in phase_ops
-    ]
+    return [sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:limit] for d in phase_ops]
 
 
 def _window_mpi_ops(
@@ -811,9 +819,7 @@ def _window_memcpy_by_kind(
     ]
 
 
-def _window_streams(
-    profile: NsysProfile, start_ns: int, end_ns: int
-) -> list[StreamSummary]:
+def _window_streams(profile: NsysProfile, start_ns: int, end_ns: int) -> list[StreamSummary]:
     total_gpu_s = _window_kernel_time(profile, start_ns, end_ns)
     rows = profile.query(f"""
         SELECT
@@ -830,7 +836,9 @@ def _window_streams(
             stream_id=r["stream_id"],
             kernel_calls=r["kernel_calls"],
             total_gpu_s=round(r["total_gpu_s"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1) if total_gpu_s else 0.0,
+            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1)
+            if total_gpu_s
+            else 0.0,
         )
         for r in rows
     ]
@@ -907,8 +915,12 @@ def compute_phase_summary(
         total_gpu_idle_s=round(idle_s, 3),
         gap_histogram=gap_histogram,
         top_kernels=_window_top_kernels(
-            profile, phase.start_ns, phase.end_ns, kernel_s,
-            device_info=device_info, launch_overhead=launch_overhead,
+            profile,
+            phase.start_ns,
+            phase.end_ns,
+            kernel_s,
+            device_info=device_info,
+            launch_overhead=launch_overhead,
         ),
         mpi_ops=mpi_ops,
     )
@@ -951,8 +963,12 @@ def compute_profile_summary(
     global_mpi_ops, all_phase_mpi = _compute_all_mpi_stats(profile, phases_windows)
     phase_summaries = [
         compute_phase_summary(
-            profile, pw, profile_start_ns,
-            mpi_ops=all_phase_mpi[i], device_info=device_info, launch_overhead=launch_overhead,
+            profile,
+            pw,
+            profile_start_ns,
+            mpi_ops=all_phase_mpi[i],
+            device_info=device_info,
+            launch_overhead=launch_overhead,
         )
         for i, pw in enumerate(phases_windows)
     ]
@@ -971,7 +987,9 @@ def compute_profile_summary(
         gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
         total_gpu_idle_s=round(total_idle_s, 3),
         gap_histogram=gap_histogram,
-        top_kernels=compute_top_kernels(profile, device_info=device_info, launch_overhead=launch_overhead),
+        top_kernels=compute_top_kernels(
+            profile, device_info=device_info, launch_overhead=launch_overhead
+        ),
         memcpy_by_kind=compute_memcpy_by_kind(profile, peak_bandwidth_GBs=peak_bw),
         streams=compute_streams(profile),
         nvtx_ranges=compute_nvtx_ranges(profile),

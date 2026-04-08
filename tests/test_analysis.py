@@ -29,6 +29,7 @@ def profile():
 
 # --- Time budget ---
 
+
 def test_profile_span(profile):
     span = compute_profile_span(profile)
     assert 95.0 < span < 115.0, f"Expected ~102s (true wall-clock span), got {span}"
@@ -58,6 +59,7 @@ def test_gpu_sync_time(profile):
 
 # --- Kernels ---
 
+
 def test_top_kernels_returns_results(profile):
     kernels = compute_top_kernels(profile)
     assert len(kernels) > 0
@@ -78,6 +80,7 @@ def test_kernel_pct_sums_near_100(profile):
 
 # --- Memory ---
 
+
 def test_memcpy_has_p2p(profile):
     kinds = compute_memcpy_by_kind(profile)
     kind_names = {m.kind for m in kinds}
@@ -91,6 +94,7 @@ def test_memcpy_total_bytes_positive(profile):
 
 # --- Gaps ---
 
+
 def test_gap_histogram(profile):
     total_idle, buckets = compute_gap_histogram(profile)
     assert total_idle > 0
@@ -101,12 +105,14 @@ def test_gap_histogram(profile):
 
 # --- Streams ---
 
+
 def test_single_dominant_stream(profile):
     streams = compute_streams(profile)
     assert streams[0].pct_of_gpu_time > 90.0
 
 
 # --- NVTX ---
+
 
 def test_nvtx_ranges(profile):
     ranges = compute_nvtx_ranges(profile)
@@ -116,6 +122,7 @@ def test_nvtx_ranges(profile):
 
 
 # --- MPI ---
+
 
 def test_mpi_ops_present(profile):
     ops = compute_mpi_ops(profile)
@@ -131,6 +138,7 @@ def test_mpi_barrier_dominates(profile):
 
 
 # --- Full summary ---
+
 
 def test_compute_profile_summary(profile):
     summary = compute_profile_summary(profile)

@@ -49,8 +49,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     )
     from nsight_agent.agent.preflight import (
         count_tokens_exact,
+        estimate_cache_breakdown,
         estimate_json_tokens,
         estimate_prose_tokens,
+        estimate_total_session_tokens,
     )
     from nsight_agent.agent.tools import tool_schemas
     from nsight_agent.analysis.metrics import compute_profile_summary
@@ -60,19 +62,27 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
 
     if not args.quiet:
-        console.print(f"Using AI provider = [cyan]{resolved_provider}[/cyan], model = [cyan]{resolved_model}[/cyan] (selected based on {reason})")
+        console.print(
+            f"Using AI provider = [cyan]{resolved_provider}[/cyan], model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
+        )
 
     missing = check_provider_available(resolved_provider)
     if missing:
-        console.print(f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}")
+        console.print(
+            f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}"
+        )
         sys.exit(1)
 
     # Warn about any other unavailable providers so the user knows what's on offer.
     if not args.quiet:
         availability = get_provider_availability()
-        unavailable = [(p, hint) for p, hint in availability.items() if hint and p != resolved_provider]
+        unavailable = [
+            (p, hint) for p, hint in availability.items() if hint and p != resolved_provider
+        ]
         for p, hint in unavailable:
-            console.print(f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False)
+            console.print(
+                f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False
+            )
 
     timings: dict[str, float] = {}
     with NsysProfile(args.profile) as profile:
@@ -93,7 +103,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         for p in summary.phases:
             top_kernel = (
                 f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
-                if p.top_kernels else "—"
+                if p.top_kernels
+                else "—"
             )
             row: list[str] = [
                 p.name,
@@ -106,10 +117,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 top_kernel,
             ]
             if summary.mpi_present:
-                top_mpi = (
-                    f"{p.mpi_ops[0].op} ({p.mpi_ops[0].total_s}s)"
-                    if p.mpi_ops else "—"
-                )
+                top_mpi = f"{p.mpi_ops[0].op} ({p.mpi_ops[0].total_s}s)" if p.mpi_ops else "—"
                 row.append(top_mpi)
             ph.add_row(*row)
         console.print(ph)
@@ -127,8 +135,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     if args.exact_token_count:
         _input_tokens = count_tokens_exact(
-            resolved_provider, resolved_model,
-            _system_prompt, _summary_json,
+            resolved_provider,
+            resolved_model,
+            _system_prompt,
+            _summary_json,
             tools=_schemas,
         )
         if _input_tokens is None:
@@ -154,16 +164,35 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         _input_label = "heuristic"
 
     _max_turns = args.max_turns
-    _output_lo = 5 * 600 + 800   # 3,800 — optimistic (5 turns)
+    _output_lo = 5 * 600 + 800  # 3,800 — optimistic (5 turns)
     _output_hi = _max_turns * 600 + 800  # pessimistic (max turns)
 
     if not args.quiet and not args.json:
-        console.print(
-            f"\n[bold]Token estimate:[/bold]\n"
-            f"  Input:  ~{_input_tokens:,} ({_input_label})\n"
-            f"  Output: ~{_output_lo:,} – {_output_hi:,} (5 – {_max_turns} turns estimated)\n"
-            f"  Model:  {resolved_model} ({resolved_provider})"
-        )
+        if resolved_provider == "anthropic":
+            _cache_est = estimate_cache_breakdown(_input_tokens, _max_turns)
+            console.print(
+                f"\n[bold]Token estimate (Anthropic, sliding prompt cache):[/bold]\n"
+                f"  Cache write: ~{_cache_est['cache_creation']:,} tokens  (billed at 1.25×)\n"
+                f"  Cache read:  ~{_cache_est['cache_read']:,} tokens  (billed at 0.10×)\n"
+                f"  Non-cached:  ~0 tokens\n"
+                f"  Output:      ~{_output_lo:,} – {_output_hi:,}"
+                f" (5 – {_max_turns} turns)\n"
+                f"  Cost-equiv:  ~{_cache_est['cost_equivalent']:,} tokens  ({_input_label})\n"
+                f"  Model:       {resolved_model} ({resolved_provider})"
+            )
+        else:
+            _total_tokens = estimate_total_session_tokens(_input_tokens, _max_turns)
+            _cache_note = (
+                "\n  [dim](OpenAI applies automatic ~50% caching to repeated prefixes)[/dim]"
+                if resolved_provider == "openai"
+                else ""
+            )
+            console.print(
+                f"\n[bold]Token estimate (total across up to {_max_turns} turns):[/bold]\n"
+                f"  Input:  ~{_total_tokens:,} ({_input_label}){_cache_note}\n"
+                f"  Output: ~{_output_lo:,} – {_output_hi:,}\n"
+                f"  Model:  {resolved_model} ({resolved_provider})"
+            )
         if not args.yes and sys.stdin.isatty():
             try:
                 _answer = input("\nProceed? [Y/n] ").strip().lower()
@@ -178,9 +207,14 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     token_usage: dict[str, int | None] = {}
     t_agent = time.perf_counter()
     hypotheses = run_agent(
-        args.profile, summary=summary, verbose=not args.quiet,
-        model=args.model, max_turns=args.max_turns, token_usage=token_usage,
-        grounded=not args.allow_app_knowledge, log=log,
+        args.profile,
+        summary=summary,
+        verbose=not args.quiet,
+        model=args.model,
+        max_turns=args.max_turns,
+        token_usage=token_usage,
+        grounded=not args.allow_app_knowledge,
+        log=log,
     )
     timings["agent_s"] = time.perf_counter() - t_agent
 
@@ -224,13 +258,27 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         _print_timings(timings)
         inp = token_usage.get("input_tokens")
         out = token_usage.get("output_tokens")
+        cache_write = token_usage.get("cache_creation_tokens") or 0
+        cache_read = token_usage.get("cache_read_tokens") or 0
         if inp is not None and out is not None:
             cost = token_usage.get("cost_usd")
             cost_str = f"  Cost: [yellow]${cost:.4f}[/yellow]" if cost is not None else ""
-            console.print(
-                f"  Tokens: [cyan]{inp:,}[/cyan] in / [cyan]{out:,}[/cyan] out"
-                f"  ([dim]{inp + out:,} total[/dim]){cost_str}"
-            )
+            if cache_write or cache_read:
+                _total = inp + cache_write + cache_read + out
+                _cost_equiv = int(cache_write * 1.25 + cache_read * 0.10 + inp)
+                console.print(
+                    f"  Tokens: [cyan]{inp:,}[/cyan] non-cached"
+                    f" / [cyan]{cache_write:,}[/cyan] cache-write"
+                    f" / [cyan]{cache_read:,}[/cyan] cache-read"
+                    f" / [cyan]{out:,}[/cyan] out"
+                    f"  ([dim]{_total:,} total |"
+                    f" ~{_cost_equiv:,} cost-equiv input[/dim]){cost_str}"
+                )
+            else:
+                console.print(
+                    f"  Tokens: [cyan]{inp:,}[/cyan] in / [cyan]{out:,}[/cyan] out"
+                    f"  ([dim]{inp + out:,} total[/dim]){cost_str}"
+                )
         else:
             console.print("  Tokens: [dim]N/A[/dim]")
 
@@ -256,7 +304,8 @@ def _print_phase_table(summary, title: str) -> None:
     for p in summary.phases:
         top_kernel = (
             f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
-            if p.top_kernels else "—"
+            if p.top_kernels
+            else "—"
         )
         ph.add_row(
             p.name,
@@ -295,14 +344,20 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     missing = check_provider_available(resolved_provider)
     if missing:
-        console.print(f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}")
+        console.print(
+            f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}"
+        )
         sys.exit(1)
 
     if not args.quiet:
         availability = get_provider_availability()
-        unavailable = [(p, hint) for p, hint in availability.items() if hint and p != resolved_provider]
+        unavailable = [
+            (p, hint) for p, hint in availability.items() if hint and p != resolved_provider
+        ]
         for p, hint in unavailable:
-            console.print(f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False)
+            console.print(
+                f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False
+            )
 
     with NsysProfile(args.profile_a) as pa:
         summary_a = compute_profile_summary(pa, max_phases=args.max_phases)
@@ -342,8 +397,10 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     if args.exact_token_count:
         _input_tokens = count_tokens_exact(
-            resolved_provider, resolved_model,
-            _COMPARE_SYSTEM_PROMPT, _compare_prompt,
+            resolved_provider,
+            resolved_model,
+            _COMPARE_SYSTEM_PROMPT,
+            _compare_prompt,
         )
         if _input_tokens is None:
             if not args.quiet and not args.json:
@@ -351,17 +408,15 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     f"[dim](exact count unavailable for {resolved_provider}"
                     " — using heuristic)[/dim]"
                 )
-            _input_tokens = (
-                estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT)
-                + estimate_json_tokens(_compare_prompt)
+            _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
+                _compare_prompt
             )
             _input_label = "heuristic"
         else:
             _input_label = "exact"
     else:
-        _input_tokens = (
-            estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT)
-            + estimate_json_tokens(_compare_prompt)
+        _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
+            _compare_prompt
         )
         _input_label = "heuristic"
 
@@ -385,10 +440,15 @@ def cmd_compare(args: argparse.Namespace) -> None:
     token_usage: dict[str, int | None] = {}
 
     report = run_compare(
-        args.profile_a, args.profile_b,
-        summary_a=summary_a, summary_b=summary_b,
-        diff=diff, model=args.model,
-        verbose=not args.quiet, token_usage=token_usage, log=log,
+        args.profile_a,
+        args.profile_b,
+        summary_a=summary_a,
+        summary_b=summary_b,
+        diff=diff,
+        model=args.model,
+        verbose=not args.quiet,
+        token_usage=token_usage,
+        log=log,
     )
 
     if args.json:
@@ -464,7 +524,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
 
     console.print(f"\n[bold]Profile:[/bold] {summary.profile_path}")
     console.print(f"  Span:            {summary.profile_span_s:.1f}s")
-    console.print(f"  GPU kernel time: {summary.gpu_kernel_s:.1f}s  ({summary.gpu_utilization_pct:.1f}% utilization)")
+    console.print(
+        f"  GPU kernel time: {summary.gpu_kernel_s:.1f}s  ({summary.gpu_utilization_pct:.1f}% utilization)"
+    )
     console.print(f"  GPU memcpy time: {summary.gpu_memcpy_s:.1f}s")
     console.print(f"  GPU sync time:   {summary.gpu_sync_s:.1f}s")
     console.print(f"  GPU idle time:   {summary.total_gpu_idle_s:.1f}s")
@@ -474,7 +536,13 @@ def cmd_summary(args: argparse.Namespace) -> None:
     for col in ("Kernel", "Calls", "Total (s)", "Avg (ms)", "% GPU"):
         t.add_column(col)
     for k in summary.top_kernels:
-        t.add_row(k.short_name or k.name, str(k.calls), str(k.total_s), str(k.avg_ms), f"{k.pct_of_gpu_time}%")
+        t.add_row(
+            k.short_name or k.name,
+            str(k.calls),
+            str(k.total_s),
+            str(k.avg_ms),
+            f"{k.pct_of_gpu_time}%",
+        )
     console.print(t)
 
     if summary.mpi_ops:
@@ -509,14 +577,20 @@ def main() -> None:
     p_analyze = sub.add_parser("analyze", help="Run agent hypothesis generation on a profile")
     p_analyze.add_argument("profile", help="Path to .sqlite profile")
     p_analyze.add_argument("--json", action="store_true", help="Output raw JSON")
-    p_analyze.add_argument("--verbose", action="store_true", help="Print the ProfileSummary sent to the AI")
+    p_analyze.add_argument(
+        "--verbose", action="store_true", help="Print the ProfileSummary sent to the AI"
+    )
     p_analyze.add_argument("--quiet", action="store_true", help="Suppress agent turn logging")
     p_analyze.add_argument(
-        "--max-phases", type=int, default=6,
+        "--max-phases",
+        type=int,
+        default=6,
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
     )
     p_analyze.add_argument(
-        "--max-turns", type=int, default=MAX_TURNS,
+        "--max-turns",
+        type=int,
+        default=MAX_TURNS,
         help=(
             f"Maximum number of agent tool-call turns before forcing output "
             f"(default: {MAX_TURNS}). A wrap-up warning is injected {WARN_TURNS_BEFORE_LIMIT} "
@@ -524,7 +598,8 @@ def main() -> None:
         ),
     )
     p_analyze.add_argument(
-        "--model", default=None,
+        "--model",
+        default=None,
         help=(
             "Model for hypothesis generation. Examples: "
             "'openai:gpt-4o' (provider prefix + model), "
@@ -534,7 +609,8 @@ def main() -> None:
         ),
     )
     p_analyze.add_argument(
-        "--allow-app-knowledge", action="store_true",
+        "--allow-app-knowledge",
+        action="store_true",
         help=(
             "Allow the model to draw on application-specific knowledge from training data "
             "(e.g. suggest named environment variables or library options inferred from kernel names). "
@@ -542,11 +618,13 @@ def main() -> None:
         ),
     )
     p_analyze.add_argument(
-        "--yes", action="store_true",
+        "--yes",
+        action="store_true",
         help="Skip the pre-flight confirmation prompt and proceed automatically.",
     )
     p_analyze.add_argument(
-        "--exact-token-count", action="store_true",
+        "--exact-token-count",
+        action="store_true",
         help=(
             "Use the provider's token counting API for an exact input token count instead of "
             "the character-count heuristic (Anthropic only; adds one small API call before the "
@@ -560,22 +638,27 @@ def main() -> None:
     p_compare.add_argument("--json", action="store_true", help="Output raw JSON")
     p_compare.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     p_compare.add_argument(
-        "--max-phases", type=int, default=6,
+        "--max-phases",
+        type=int,
+        default=6,
         help="Maximum number of execution phases to detect per profile (default: 6; use 1 to disable)",
     )
     p_compare.add_argument(
-        "--model", default=None,
+        "--model",
+        default=None,
         help=(
             "Model for comparison. Same format as analyze --model: "
             "'openai:gpt-4o', 'openai', or a bare model ID."
         ),
     )
     p_compare.add_argument(
-        "--yes", action="store_true",
+        "--yes",
+        action="store_true",
         help="Skip the pre-flight confirmation prompt and proceed automatically.",
     )
     p_compare.add_argument(
-        "--exact-token-count", action="store_true",
+        "--exact-token-count",
+        action="store_true",
         help=(
             "Use the provider's token counting API for an exact input token count "
             "(Anthropic only; adds one small API call). "
@@ -587,7 +670,9 @@ def main() -> None:
     p_summary.add_argument("profile", help="Path to .sqlite profile")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
     p_summary.add_argument(
-        "--max-phases", type=int, default=6,
+        "--max-phases",
+        type=int,
+        default=6,
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
     )
 

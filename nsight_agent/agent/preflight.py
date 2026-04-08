@@ -57,3 +57,61 @@ def count_tokens_exact(
         return resp.input_tokens
     except Exception:
         return None
+
+
+# Average tokens added to the conversation per agent turn (tool result + assistant reasoning).
+# Range in practice: 500 (small structured call) – 3,000 (large sql_query result).
+_AVG_INCREMENT_TOKENS = 1500
+
+
+def estimate_total_session_tokens(
+    initial_tokens: int,
+    max_turns: int,
+    avg_increment: int = _AVG_INCREMENT_TOKENS,
+) -> int:
+    """Estimate total input tokens across a multi-turn session without caching.
+
+    All three provider backends (Anthropic, OpenAI, Gemini) are stateless: each
+    API call resends the full conversation history from the beginning.  The total
+    across N turns is:
+
+        Σ(k=1..N) [initial + (k-1) * increment]
+        = N * initial + increment * N * (N-1) / 2
+    """
+    return initial_tokens * max_turns + avg_increment * max_turns * (max_turns - 1) // 2
+
+
+def estimate_cache_breakdown(
+    initial_tokens: int,
+    max_turns: int,
+    avg_increment: int = _AVG_INCREMENT_TOKENS,
+) -> dict[str, int]:
+    """Estimate Anthropic prompt-cache token breakdown for a sliding-cache multi-turn run.
+
+    With sliding cache, every turn extends the cache boundary to include the latest
+    tool-result exchange.  The breakdown across N turns is:
+
+      Turn 1:   cache_creation = initial_tokens,         cache_read = 0
+      Turn k≥2: cache_creation = avg_increment,          cache_read = initial + (k-2)*increment
+
+    Returns a dict with:
+      cache_creation  — total tokens written to cache (billed at 1.25×)
+      cache_read      — total tokens read from cache (billed at 0.10×)
+      input           — non-cached input tokens (≈ 0 with full prefix coverage)
+      cost_equivalent — weighted total: creation×1.25 + read×0.10
+    """
+    # Turn 1 writes initial_tokens; each subsequent turn writes avg_increment
+    cache_creation = initial_tokens + max(0, max_turns - 1) * avg_increment
+    # Sum of cache reads: Σ(k=2..N) [initial + (k-2)*increment]
+    if max_turns >= 2:
+        n = max_turns - 1
+        cache_read = n * initial_tokens + avg_increment * n * (n - 1) // 2
+    else:
+        cache_read = 0
+    cost_equivalent = int(cache_creation * 1.25 + cache_read * 0.10)
+    return {
+        "cache_creation": cache_creation,
+        "cache_read": cache_read,
+        "input": 0,
+        "cost_equivalent": cost_equivalent,
+    }

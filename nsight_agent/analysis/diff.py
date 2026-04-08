@@ -80,6 +80,7 @@ def compute_profile_diff(
     if comparison_mode != "summary_no_kernel":
         kernels_a = {k.name: k for k in summary_a.top_kernels}
         kernels_b = {k.name: k for k in summary_b.top_kernels}
+
         # Sort by descending total time in whichever profile has the kernel
         def _sort_key(name: str) -> float:
             ka = kernels_a.get(name)
@@ -89,24 +90,26 @@ def compute_profile_diff(
         for name in sorted(union, key=_sort_key):
             ka = kernels_a.get(name)
             kb = kernels_b.get(name)
-            kernel_diffs.append(KernelDiff(
-                name=name,
-                short_name=(ka or kb).short_name,  # type: ignore[union-attr]
-                only_in_a=kb is None,
-                only_in_b=ka is None,
-                calls_a=ka.calls if ka else None,
-                calls_b=kb.calls if kb else None,
-                total_s_a=ka.total_s if ka else None,
-                total_s_b=kb.total_s if kb else None,
-                avg_ms_a=ka.avg_ms if ka else None,
-                avg_ms_b=kb.avg_ms if kb else None,
-                pct_gpu_time_a=ka.pct_of_gpu_time if ka else None,
-                pct_gpu_time_b=kb.pct_of_gpu_time if kb else None,
-                total_s_delta_pct=_delta_pct(
-                    ka.total_s if ka else None,
-                    kb.total_s if kb else None,
-                ),
-            ))
+            kernel_diffs.append(
+                KernelDiff(
+                    name=name,
+                    short_name=(ka or kb).short_name,  # type: ignore[union-attr]
+                    only_in_a=kb is None,
+                    only_in_b=ka is None,
+                    calls_a=ka.calls if ka else None,
+                    calls_b=kb.calls if kb else None,
+                    total_s_a=ka.total_s if ka else None,
+                    total_s_b=kb.total_s if kb else None,
+                    avg_ms_a=ka.avg_ms if ka else None,
+                    avg_ms_b=kb.avg_ms if kb else None,
+                    pct_gpu_time_a=ka.pct_of_gpu_time if ka else None,
+                    pct_gpu_time_b=kb.pct_of_gpu_time if kb else None,
+                    total_s_delta_pct=_delta_pct(
+                        ka.total_s if ka else None,
+                        kb.total_s if kb else None,
+                    ),
+                )
+            )
 
     # ------------------------------------------------------------------
     # Memcpy diffs
@@ -117,19 +120,21 @@ def compute_profile_diff(
     for kind in sorted(memcpy_a.keys() | memcpy_b.keys()):
         ma = memcpy_a.get(kind)
         mb = memcpy_b.get(kind)
-        memcpy_diffs.append(MemcpyDiff(
-            kind=kind,
-            only_in_a=mb is None,
-            only_in_b=ma is None,
-            total_s_a=ma.total_s if ma else None,
-            total_s_b=mb.total_s if mb else None,
-            effective_GBs_a=ma.effective_GBs if ma else None,
-            effective_GBs_b=mb.effective_GBs if mb else None,
-            total_s_delta_pct=_delta_pct(
-                ma.total_s if ma else None,
-                mb.total_s if mb else None,
-            ),
-        ))
+        memcpy_diffs.append(
+            MemcpyDiff(
+                kind=kind,
+                only_in_a=mb is None,
+                only_in_b=ma is None,
+                total_s_a=ma.total_s if ma else None,
+                total_s_b=mb.total_s if mb else None,
+                effective_GBs_a=ma.effective_GBs if ma else None,
+                effective_GBs_b=mb.effective_GBs if mb else None,
+                total_s_delta_pct=_delta_pct(
+                    ma.total_s if ma else None,
+                    mb.total_s if mb else None,
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------
     # MPI diffs
@@ -140,21 +145,23 @@ def compute_profile_diff(
     for op in sorted(mpi_a.keys() | mpi_b.keys()):
         opa = mpi_a.get(op)
         opb = mpi_b.get(op)
-        mpi_diffs.append(MpiDiff(
-            op=op,
-            only_in_a=opb is None,
-            only_in_b=opa is None,
-            calls_a=opa.calls if opa else None,
-            calls_b=opb.calls if opb else None,
-            total_s_a=opa.total_s if opa else None,
-            total_s_b=opb.total_s if opb else None,
-            avg_ms_a=opa.avg_ms if opa else None,
-            avg_ms_b=opb.avg_ms if opb else None,
-            total_s_delta_pct=_delta_pct(
-                opa.total_s if opa else None,
-                opb.total_s if opb else None,
-            ),
-        ))
+        mpi_diffs.append(
+            MpiDiff(
+                op=op,
+                only_in_a=opb is None,
+                only_in_b=opa is None,
+                calls_a=opa.calls if opa else None,
+                calls_b=opb.calls if opb else None,
+                total_s_a=opa.total_s if opa else None,
+                total_s_b=opb.total_s if opb else None,
+                avg_ms_a=opa.avg_ms if opa else None,
+                avg_ms_b=opb.avg_ms if opb else None,
+                total_s_delta_pct=_delta_pct(
+                    opa.total_s if opa else None,
+                    opb.total_s if opb else None,
+                ),
+            )
+        )
 
     return ProfileDiff(
         profile_a_name=Path(summary_a.profile_path).name,

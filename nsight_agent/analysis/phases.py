@@ -123,20 +123,14 @@ def _nvtx_phase_boundaries(
     top_level: list[tuple[int, int, str]] = []
     for i, (s, e, n) in enumerate(all_long):
         contained = any(
-            j != i and all_long[j][0] <= s and all_long[j][1] >= e
-            for j in range(len(all_long))
+            j != i and all_long[j][0] <= s and all_long[j][1] >= e for j in range(len(all_long))
         )
         if not contained:
             top_level.append((s, e, n))
 
     # Only use boundaries from ranges that are rare (appear <= max_phases times)
     name_counts: Counter[str] = Counter(n for _, _, n in top_level)
-    boundaries = [
-        ts
-        for s, e, n in top_level
-        if name_counts[n] <= max_phases
-        for ts in (s, e)
-    ]
+    boundaries = [ts for s, e, n in top_level if name_counts[n] <= max_phases for ts in (s, e)]
     return boundaries, all_long
 
 
@@ -190,7 +184,9 @@ def _fingerprint(profile: NsysProfile, start_ns: int, end_ns: int) -> _Seg:
     """)
     kernel_ns = int(rows[0]["kernel_ns"]) if rows else 0
     dominant_kernel = rows[0]["name"] if rows else None
-    return _Seg(start_ns=start_ns, end_ns=end_ns, kernel_ns=kernel_ns, dominant_kernel=dominant_kernel)
+    return _Seg(
+        start_ns=start_ns, end_ns=end_ns, kernel_ns=kernel_ns, dominant_kernel=dominant_kernel
+    )
 
 
 def _similarity(a: _Seg, b: _Seg) -> float:
@@ -302,7 +298,7 @@ def detect_phases(profile: NsysProfile, max_phases: int = 6) -> list[PhaseWindow
     while len(segs) > max_phases:
         scores = [_similarity(segs[i], segs[i + 1]) for i in range(len(segs) - 1)]
         best_i = scores.index(max(scores))
-        segs = segs[:best_i] + [_merge_segs(segs[best_i], segs[best_i + 1])] + segs[best_i + 2:]
+        segs = segs[:best_i] + [_merge_segs(segs[best_i], segs[best_i + 1])] + segs[best_i + 2 :]
 
     # --- Label and return ---
     phases = [PhaseWindow(_label(s, all_nvtx), s.start_ns, s.end_ns) for s in segs]

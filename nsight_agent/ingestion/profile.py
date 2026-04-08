@@ -28,7 +28,7 @@ class NsysProfile:
         # Cache: up to 25% of file size, capped at 512 MB, minimum 16 MB
         cache_kb = max(16 * 1024, min(file_size // (1024 * 4), 512 * 1024))
         # mmap: full file size, capped at 16 GB
-        mmap_size = min(file_size, 16 * 1024 ** 3)
+        mmap_size = min(file_size, 16 * 1024**3)
         self._conn.execute(f"PRAGMA cache_size = -{cache_kb}")
         self._conn.execute(f"PRAGMA mmap_size = {mmap_size}")
         self._tables: set[str] | None = None
@@ -75,9 +75,7 @@ class NsysProfile:
 
     def resolve_enum(self, table: str, id_value: int) -> str:
         """Resolve an integer from an ENUM_* table to its human-readable label."""
-        row = self._conn.execute(
-            f"SELECT label FROM {table} WHERE id = ?", (id_value,)
-        ).fetchone()
+        row = self._conn.execute(f"SELECT label FROM {table} WHERE id = ?", (id_value,)).fetchone()
         return row[0] if row else f"<{id_value}>"
 
     # ------------------------------------------------------------------

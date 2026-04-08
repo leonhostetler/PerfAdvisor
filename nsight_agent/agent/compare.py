@@ -110,8 +110,10 @@ def _extract_report(text: str) -> dict[str, Any]:
 # Provider backends (all single-shot, no tool-use loop)
 # ---------------------------------------------------------------------------
 
+
 def _call_anthropic(prompt: str, model: str) -> tuple[str, int, int]:
     import anthropic
+
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=model,
@@ -139,6 +141,7 @@ def _call_openai(prompt: str, model: str) -> tuple[str, int, int]:
     def _create() -> Any:
         nonlocal _limit_param
         from openai import BadRequestError
+
         kwargs: dict[str, Any] = dict(
             model=model,
             messages=[
@@ -213,6 +216,7 @@ def _call_claude_code(full_prompt: str) -> tuple[str, int, int, float | None]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def run_compare(
     profile_path_a: str | Path,
     profile_path_b: str | Path,
@@ -253,12 +257,11 @@ def run_compare(
     elif resolved_provider == "gemini":
         text, inp, out = _call_gemini(prompt, resolved_model)
     else:
-        text, inp, out, cost_usd = _call_claude_code(
-            f"{_COMPARE_SYSTEM_PROMPT}\n\n{prompt}"
-        )
+        text, inp, out, cost_usd = _call_claude_code(f"{_COMPARE_SYSTEM_PROMPT}\n\n{prompt}")
 
     if verbose:
         from nsight_agent.agent.loop import _trunc
+
         log(f"[← llm] {_trunc(text, 200)}")
 
     # Save prompt and response files next to profile A

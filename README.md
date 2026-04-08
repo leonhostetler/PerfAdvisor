@@ -228,15 +228,44 @@ If no API key is set and `claude` is on your PATH, the agent falls back to a sin
 
 ## Token expenditure
 
+### Prompt caching
+
+All three provider backends (Anthropic, OpenAI, Gemini) are stateless: every API call replays the full conversation history from turn 1. For a 20-turn analysis, the system prompt and pre-seeded profile summary are re-sent on every single turn — without caching, these account for the majority of total token cost.
+
+**Anthropic — sliding cache (implemented):** nsight-agent uses Anthropic's prompt caching API with a sliding cache cursor. Turn 1 writes the system prompt and pre-seeded profile summary to cache (billed at 1.25× normal). Each subsequent turn reads the previous turn's cache hit (billed at 0.10×) and writes the new tool-result exchange to cache. The cached prefix grows by one exchange per turn, so later turns read an increasingly large prefix at 0.10× while paying full price only for the new incremental content. On a typical 18-turn run this produces a ~75–80% reduction in billable input tokens.
+
+The pre-flight estimate for Anthropic runs shows the expected cache_write, cache_read, and cost-equivalent token counts instead of a raw input total.
+
+**OpenAI — automatic caching:** OpenAI automatically caches repeated input prefixes longer than 1,024 tokens at a ~50% discount. No developer action is required; nsight-agent does not do anything special for OpenAI and the savings happen transparently.
+
+**Google Gemini — not implemented:** Gemini supports explicit context caching via an "upload once, reference by ID" API that is architecturally different from the per-request marker approach. It is not currently implemented in nsight-agent.
+
+---
+
 ### Pre-flight estimate
 
-Before every `analyze` and `compare` run, nsight-agent prints an input/output token estimate and prompts for confirmation:
+Before every `analyze` and `compare` run, nsight-agent prints an input/output token estimate and prompts for confirmation.
+
+For Anthropic runs (with sliding prompt cache):
 
 ```
-Token estimate:
-  Input:  ~12,400 (heuristic)
-  Output: ~3,800 – 12,800 (5 – 20 turns estimated)
-  Model:  claude-opus-4-6 (anthropic)
+Token estimate (Anthropic, sliding prompt cache):
+  Cache write: ~46,500 tokens  (billed at 1.25×)
+  Cache read:  ~351,000 tokens (billed at 0.10×)
+  Non-cached:  ~0 tokens
+  Output:      ~3,800 – 12,800 (5 – 20 turns)
+  Cost-equiv:  ~81,600 tokens  (heuristic)
+  Model:       claude-opus-4-6 (anthropic)
+Proceed? [Y/n]
+```
+
+For OpenAI and Gemini runs (full session total):
+
+```
+Token estimate (total across up to 20 turns):
+  Input:  ~370,000 (heuristic)
+  Output: ~3,800 – 12,800
+  Model:  gpt-4o (openai)
 Proceed? [Y/n]
 ```
 
@@ -280,6 +309,10 @@ nsight-agent analyze profile.sqlite --max-turns 5    # cheapest, summarizes afte
 ```
 
 Smaller models like Haiku tend to use more turns for the same analysis. A lower `--max-turns` bounds the cost while the built-in wrap-up warning and forced final turn ensure you still get output rather than an error.
+
+**Prompt caching** (already active for Anthropic — no action required):
+
+Anthropic runs benefit from sliding prompt caching automatically. The pre-flight estimate will show the expected cache breakdown. For long runs (many turns, large profiles) the cache savings dominate: a 20-turn run on a large profile that would cost ~500k billed tokens without caching costs ~100k with it.
 
 **Use a smaller model:**
 

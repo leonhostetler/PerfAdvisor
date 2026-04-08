@@ -86,6 +86,7 @@ def get_provider_availability() -> dict[str, str | None]:
     """Return {provider: None} if available or {provider: install_hint} if missing."""
     return {p: check_provider_available(p) for p in _KNOWN_PROVIDERS}
 
+
 _HYPOTHESIS_SCHEMA = """\
 Each hypothesis object must have these fields:
   - bottleneck_type: one of [compute_bound, memory_bound, mpi_latency, mpi_imbalance,
@@ -227,7 +228,7 @@ def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
     if model:
         for p in _KNOWN_PROVIDERS:
             if model.startswith(f"{p}:"):
-                return p, model[len(p) + 1:], "provider prefix in --model"
+                return p, model[len(p) + 1 :], "provider prefix in --model"
         if model in _KNOWN_PROVIDERS:
             return model, _DEFAULT_MODELS[model], "provider name in --model"
 
@@ -241,12 +242,17 @@ def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
     if os.environ.get("GOOGLE_API_KEY"):
         return "gemini", _default("gemini"), "presence of GOOGLE_API_KEY"
 
-    return "claude_code", _default("claude_code"), "no API keys found — falling back to claude subprocess"
+    return (
+        "claude_code",
+        _default("claude_code"),
+        "no API keys found — falling back to claude subprocess",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Schema translation helpers
 # ---------------------------------------------------------------------------
+
 
 def _schemas_to_openai(schemas: list[dict]) -> list[dict]:
     """Wrap Anthropic tool schemas in OpenAI's {"type":"function","function":{...}} envelope."""
@@ -267,22 +273,23 @@ def _schemas_to_openai(schemas: list[dict]) -> list[dict]:
 # Anthropic backend
 # ---------------------------------------------------------------------------
 
+
 def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
     """Inject profile_summary and phase_summary results as the opening exchange.
 
     Saves 2 API round-trips by reusing the already-computed ProfileSummary.
     """
-    profile_result = json.dumps({
-        "profile_span_s": summary.profile_span_s,
-        "gpu_kernel_s": summary.gpu_kernel_s,
-        "gpu_utilization_pct": summary.gpu_utilization_pct,
-        "mpi_present": summary.mpi_present,
-        "nvtx_present": bool(summary.nvtx_ranges),
-        "tables": sorted(profile.tables),
-    })
-    phase_result = json.dumps({
-        "phases": [p.model_dump() for p in summary.phases]
-    })
+    profile_result = json.dumps(
+        {
+            "profile_span_s": summary.profile_span_s,
+            "gpu_kernel_s": summary.gpu_kernel_s,
+            "gpu_utilization_pct": summary.gpu_utilization_pct,
+            "mpi_present": summary.mpi_present,
+            "nvtx_present": bool(summary.nvtx_ranges),
+            "tables": sorted(profile.tables),
+        }
+    )
+    phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
     return [
         {"role": "user", "content": "Begin analysis."},
         {
@@ -296,7 +303,12 @@ def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dic
             "role": "user",
             "content": [
                 {"type": "tool_result", "tool_use_id": "pre_1", "content": profile_result},
-                {"type": "tool_result", "tool_use_id": "pre_2", "content": phase_result},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "pre_2",
+                    "content": phase_result,
+                    "cache_control": {"type": "ephemeral"},
+                },
             ],
         },
     ]
@@ -311,25 +323,44 @@ def _run_api(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
     import anthropic
 
     client = anthropic.Anthropic()
     schemas = tool_schemas()
     messages: list[dict] = _preseed_messages(profile, summary) if summary is not None else []
+    _system = [
+        {
+            "type": "text",
+            "text": _build_system_prompt(grounded),
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
     input_tokens = 0
     output_tokens = 0
+    cache_creation_tokens = 0
+    cache_read_tokens = 0
+    # Anthropic allows at most 4 cache_control blocks per request.
+    # We use 2 permanent markers (system + preseed) and keep the 2 most-recent
+    # per-turn user messages marked, giving true sliding cache:
+    #   turn N reads everything through turn N-1 from cache (0.10×)
+    #   turn N writes only the new increment to cache (1.25×)
+    # When a third per-turn message is about to be added, the oldest is stripped.
+    _cache_prev: dict | None = None   # turn N-1 (keep marker)
+    _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)
 
     for turn in range(1, max_turns + 1):
         response = client.messages.create(
             model=model,
             max_tokens=4096,
-            system=_build_system_prompt(grounded),
+            system=_system,
             tools=schemas,
             messages=messages,
         )
         input_tokens += response.usage.input_tokens
         output_tokens += response.usage.output_tokens
+        cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        cache_read_tokens += getattr(response.usage, "cache_read_input_tokens", 0) or 0
         messages.append({"role": "assistant", "content": response.content})
 
         if verbose:
@@ -351,8 +382,14 @@ def _run_api(
                             f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                         )
                         _save_files(profile.path, prompt_record, block.text, verbose, log)
-                        return hypotheses, input_tokens, output_tokens
-            return [], input_tokens, output_tokens
+                        return (
+                            hypotheses,
+                            input_tokens,
+                            cache_creation_tokens,
+                            cache_read_tokens,
+                            output_tokens,
+                        )
+            return [], input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens
 
         tool_results = []
         for block in response.content:
@@ -361,24 +398,40 @@ def _run_api(
             result_json = dispatch(profile, block.name, block.input)
             if verbose:
                 log(f"[local] {block.name} → {_trunc(result_json)}")
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result_json,
-            })
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_json,
+                }
+            )
 
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
-            tool_results.append({
-                "type": "text",
-                "text": _WRAP_UP_WARNING.format(remaining=turns_left),
-            })
+            tool_results.append(
+                {
+                    "type": "text",
+                    "text": _WRAP_UP_WARNING.format(remaining=turns_left),
+                }
+            )
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
             tool_results.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
 
-        messages.append({"role": "user", "content": tool_results})
+        # Advance the sliding cache window: strip the oldest floating marker
+        # (_cache_pprev), keep the previous turn's marker (_cache_prev), and
+        # mark the new turn.  Total markers stay at 4 (system + preseed + 2
+        # floating), which is Anthropic's maximum.
+        if _cache_pprev is not None:
+            _pprev_content = _cache_pprev.get("content", [])
+            if isinstance(_pprev_content, list) and _pprev_content:
+                _pprev_content[-1].pop("cache_control", None)
+        if tool_results:
+            tool_results[-1]["cache_control"] = {"type": "ephemeral"}
+        _new_user_msg: dict = {"role": "user", "content": tool_results}
+        messages.append(_new_user_msg)
+        _cache_pprev, _cache_prev = _cache_prev, _new_user_msg
 
     # All turns exhausted — make one final call without tools to force text output.
     if verbose:
@@ -386,11 +439,13 @@ def _run_api(
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=_build_system_prompt(grounded),
+        system=_system,
         messages=messages,
     )
     input_tokens += response.usage.input_tokens
     output_tokens += response.usage.output_tokens
+    cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+    cache_read_tokens += getattr(response.usage, "cache_read_input_tokens", 0) or 0
     for block in reversed(response.content):
         if hasattr(block, "text"):
             hypotheses = _extract_hypotheses(block.text)
@@ -401,26 +456,35 @@ def _run_api(
                     f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                 )
                 _save_files(profile.path, prompt_record, block.text, verbose, log)
-                return hypotheses, input_tokens, output_tokens
+                return (
+                    hypotheses,
+                    input_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    output_tokens,
+                )
     if verbose:
         log("[local] Warning: no hypotheses extracted after forced output turn.")
-    return [], input_tokens, output_tokens
+    return [], input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
 # OpenAI backend
 # ---------------------------------------------------------------------------
 
+
 def _preseed_messages_openai(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
     """Inject pre-computed profile/phase summaries in OpenAI's tool-call format."""
-    profile_result = json.dumps({
-        "profile_span_s": summary.profile_span_s,
-        "gpu_kernel_s": summary.gpu_kernel_s,
-        "gpu_utilization_pct": summary.gpu_utilization_pct,
-        "mpi_present": summary.mpi_present,
-        "nvtx_present": bool(summary.nvtx_ranges),
-        "tables": sorted(profile.tables),
-    })
+    profile_result = json.dumps(
+        {
+            "profile_span_s": summary.profile_span_s,
+            "gpu_kernel_s": summary.gpu_kernel_s,
+            "gpu_utilization_pct": summary.gpu_utilization_pct,
+            "mpi_present": summary.mpi_present,
+            "nvtx_present": bool(summary.nvtx_ranges),
+            "tables": sorted(profile.tables),
+        }
+    )
     phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
     return [
         {"role": "user", "content": "Begin analysis."},
@@ -428,10 +492,16 @@ def _preseed_messages_openai(profile: NsysProfile, summary: ProfileSummary) -> l
             "role": "assistant",
             "content": None,
             "tool_calls": [
-                {"id": "pre_1", "type": "function",
-                 "function": {"name": "profile_summary", "arguments": "{}"}},
-                {"id": "pre_2", "type": "function",
-                 "function": {"name": "phase_summary", "arguments": "{}"}},
+                {
+                    "id": "pre_1",
+                    "type": "function",
+                    "function": {"name": "profile_summary", "arguments": "{}"},
+                },
+                {
+                    "id": "pre_2",
+                    "type": "function",
+                    "function": {"name": "phase_summary", "arguments": "{}"},
+                },
             ],
         },
         {"role": "tool", "tool_call_id": "pre_1", "content": profile_result},
@@ -448,19 +518,18 @@ def _run_openai(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
     try:
         from openai import OpenAI
     except ImportError:
-        raise ImportError(
-            "openai package is required for the OpenAI backend: pip install openai"
-        )
+        raise ImportError("openai package is required for the OpenAI backend: pip install openai")
 
     client = OpenAI()
     schemas = tool_schemas()
     openai_tools = _schemas_to_openai(schemas)
     messages: list[dict] = (
-        _preseed_messages_openai(profile, summary) if summary is not None
+        _preseed_messages_openai(profile, summary)
+        if summary is not None
         else [{"role": "user", "content": "Begin analysis."}]
     )
     # Prepend system prompt as a system message
@@ -474,8 +543,14 @@ def _run_openai(
     def _create(msgs: list[dict]) -> Any:
         nonlocal _token_limit_param
         from openai import BadRequestError
-        kwargs = dict(model=model, messages=msgs, tools=openai_tools, tool_choice="auto",
-                      **{_token_limit_param: 4096})
+
+        kwargs = dict(
+            model=model,
+            messages=msgs,
+            tools=openai_tools,
+            tool_choice="auto",
+            **{_token_limit_param: 4096},
+        )
         try:
             return client.chat.completions.create(**kwargs)
         except BadRequestError as e:
@@ -510,7 +585,7 @@ def _run_openai(
             _turn_header(turn, max_turns, log)
             if msg.content:
                 log(f"[← llm] {_trunc(msg.content)}")
-            for tc in (msg.tool_calls or []):
+            for tc in msg.tool_calls or []:
                 log(f"[← llm:tool] {tc.function.name}({_trunc(tc.function.arguments, 120)})")
 
         if choice.finish_reason == "stop":
@@ -521,26 +596,30 @@ def _run_openai(
                     f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
                 )
                 _save_files(profile.path, prompt_record, msg.content or "", verbose, log)
-                return hypotheses, input_tokens, output_tokens
-            return [], input_tokens, output_tokens
+                return hypotheses, input_tokens, 0, 0, output_tokens
+            return [], input_tokens, 0, 0, output_tokens
 
         # finish_reason == "tool_calls"
-        for tc in (msg.tool_calls or []):
+        for tc in msg.tool_calls or []:
             result_json = dispatch(profile, tc.function.name, json.loads(tc.function.arguments))
             if verbose:
                 log(f"[local] {tc.function.name} → {_trunc(result_json)}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_json,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_json,
+                }
+            )
 
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
-            messages.append({
-                "role": "user",
-                "content": _WRAP_UP_WARNING.format(remaining=turns_left),
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _WRAP_UP_WARNING.format(remaining=turns_left),
+                }
+            )
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
@@ -566,18 +645,19 @@ def _run_openai(
                 f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
             )
             _save_files(profile.path, prompt_record, forced_content, verbose, log)
-            return hypotheses, input_tokens, output_tokens
+            return hypotheses, input_tokens, 0, 0, output_tokens
     except Exception as exc:
         if verbose:
             log(f"[local] Forced output turn failed: {exc}")
     if verbose:
         log("[local] Warning: no hypotheses extracted after forced output turn.")
-    return [], input_tokens, output_tokens
+    return [], input_tokens, 0, 0, output_tokens
 
 
 # ---------------------------------------------------------------------------
 # Gemini backend
 # ---------------------------------------------------------------------------
+
 
 def _run_gemini(
     profile: NsysProfile,
@@ -588,7 +668,7 @@ def _run_gemini(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
     try:
         from google import genai
         from google.genai import types as genai_types
@@ -620,14 +700,16 @@ def _run_gemini(
     # Gemini doesn't support injecting pre-computed tool results into history;
     # include the pre-computed summary directly in the initial user message.
     if summary is not None:
-        profile_result = json.dumps({
-            "profile_span_s": summary.profile_span_s,
-            "gpu_kernel_s": summary.gpu_kernel_s,
-            "gpu_utilization_pct": summary.gpu_utilization_pct,
-            "mpi_present": summary.mpi_present,
-            "nvtx_present": bool(summary.nvtx_ranges),
-            "tables": sorted(profile.tables),
-        })
+        profile_result = json.dumps(
+            {
+                "profile_span_s": summary.profile_span_s,
+                "gpu_kernel_s": summary.gpu_kernel_s,
+                "gpu_utilization_pct": summary.gpu_utilization_pct,
+                "mpi_present": summary.mpi_present,
+                "nvtx_present": bool(summary.nvtx_ranges),
+                "tables": sorted(profile.tables),
+            }
+        )
         phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
         init_msg = (
             "Begin analysis. Pre-computed profile data is provided below.\n\n"
@@ -671,8 +753,8 @@ def _run_gemini(
                     f"=== INITIAL MESSAGE ===\n{init_msg}"
                 )
                 _save_files(profile.path, prompt_record, text, verbose, log)
-                return hypotheses, input_tokens, output_tokens
-            return [], input_tokens, output_tokens
+                return hypotheses, input_tokens, 0, 0, output_tokens
+            return [], input_tokens, 0, 0, output_tokens
 
         parts = []
         for fc in function_calls:
@@ -688,9 +770,7 @@ def _run_gemini(
 
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
-            parts.append(genai_types.Part.from_text(
-                _WRAP_UP_WARNING.format(remaining=turns_left)
-            ))
+            parts.append(genai_types.Part.from_text(_WRAP_UP_WARNING.format(remaining=turns_left)))
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
@@ -713,18 +793,19 @@ def _run_gemini(
                 f"=== INITIAL MESSAGE ===\n{init_msg}"
             )
             _save_files(profile.path, prompt_record, text, verbose, log)
-            return hypotheses, input_tokens, output_tokens
+            return hypotheses, input_tokens, 0, 0, output_tokens
     except Exception as exc:
         if verbose:
             log(f"[local] Forced output turn failed: {exc}")
     if verbose:
         log("[local] Warning: no hypotheses extracted after forced output turn.")
-    return [], input_tokens, output_tokens
+    return [], input_tokens, 0, 0, output_tokens
 
 
 # ---------------------------------------------------------------------------
 # Claude Code backend (subprocess, no API key needed)
 # ---------------------------------------------------------------------------
+
 
 def _run_claude_code(
     profile: NsysProfile,
@@ -782,6 +863,7 @@ def _run_claude_code(
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def run_agent(
     profile_path: str | Path,
     *,
@@ -812,28 +894,50 @@ def run_agent(
     profile = NsysProfile(profile_path)
 
     if verbose:
-        log(f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})")
+        log(
+            f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})"
+        )
 
     try:
         if resolved_provider == "anthropic":
-            hypotheses, inp, out = _run_api(
-                profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded, log=log,
+            hypotheses, inp, cache_write, cache_read, out = _run_api(
+                profile,
+                model=resolved_model,
+                max_turns=max_turns,
+                verbose=verbose,
+                summary=summary,
+                grounded=grounded,
+                log=log,
             )
         elif resolved_provider == "openai":
-            hypotheses, inp, out = _run_openai(
-                profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded, log=log,
+            hypotheses, inp, cache_write, cache_read, out = _run_openai(
+                profile,
+                model=resolved_model,
+                max_turns=max_turns,
+                verbose=verbose,
+                summary=summary,
+                grounded=grounded,
+                log=log,
             )
         elif resolved_provider == "gemini":
-            hypotheses, inp, out = _run_gemini(
-                profile, model=resolved_model, max_turns=max_turns,
-                verbose=verbose, summary=summary, grounded=grounded, log=log,
+            hypotheses, inp, cache_write, cache_read, out = _run_gemini(
+                profile,
+                model=resolved_model,
+                max_turns=max_turns,
+                verbose=verbose,
+                summary=summary,
+                grounded=grounded,
+                log=log,
             )
         else:
             hypotheses, inp, out, cost_usd = _run_claude_code(
-                profile, verbose=verbose, summary=summary, grounded=grounded, log=log,
+                profile,
+                verbose=verbose,
+                summary=summary,
+                grounded=grounded,
+                log=log,
             )
+            cache_write = cache_read = 0
             if token_usage is not None and cost_usd is not None:
                 token_usage["cost_usd"] = cost_usd
     finally:
@@ -841,6 +945,8 @@ def run_agent(
 
     if token_usage is not None:
         token_usage["input_tokens"] = inp
+        token_usage["cache_creation_tokens"] = cache_write
+        token_usage["cache_read_tokens"] = cache_read
         token_usage["output_tokens"] = out
 
     return hypotheses
