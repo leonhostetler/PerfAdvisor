@@ -3,6 +3,18 @@ changelog — perf_advisor
 
 2026-04-08
 ----------
+- Update README Development section: rename to Testing, update pytest invocation
+  to `python -m pytest`, update single-test example to test_synthetic.py, add
+  one-sentence summary about the synthetic fixture.
+
+- Add portable test fixtures (todo item 11): create tests/conftest.py with a
+  session-scoped synthetic SQLite fixture covering all core metric functions
+  (kernels, memcpy, gaps, streams, NVTX, MPI, device info, CPU sync, tool
+  dispatch); add tests/test_synthetic.py with 34 fast tests that run in CI
+  without the real Nsight profile or an API key; remove the old
+  test_ingestion.py and test_analysis.py which were tied to a hardcoded
+  local profile path and offered no coverage beyond the synthetic suite.
+
 - Rename project from nsight-agent / nsight_agent to perf-advisor / perf_advisor:
   rename package directory, update pyproject.toml name and script entry point,
   update all imports, CLI prog= string, README, todo_list.md, changelog header,

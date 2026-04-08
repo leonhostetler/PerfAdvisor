@@ -376,10 +376,12 @@ perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 
 ---
 
-## Development
+## Testing
+
+Tests use a synthetic SQLite fixture and require no real Nsight profile or API key.
 
 ```bash
-pytest                                          # run all tests
-pytest tests/test_analysis.py::test_name -v    # single test
+python -m pytest                                # run all tests
+python -m pytest tests/test_synthetic.py::test_name -v    # single test
 ruff check . && ruff format .                   # lint and format
 ```
