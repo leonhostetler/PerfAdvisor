@@ -16,9 +16,8 @@ Select a provider via --model:
   gemini:gemini-2.0-flash
   anthropic:claude-opus-4-6
 
-Both prompt and raw response are saved next to the profile:
-  {profile_stem}_{timestamp}_prompt.txt
-  {profile_stem}_{timestamp}_response.txt
+LLM interaction logging (opt-in via --log / --log-file):
+  {profile_stem}_{timestamp}_log.txt
 """
 
 from __future__ import annotations
@@ -28,12 +27,12 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from nsight_agent.analysis.metrics import compute_profile_summary
 from nsight_agent.analysis.models import ProfileSummary
+from nsight_agent.agent.logger import LLMLogger
 from nsight_agent.agent.tools import dispatch, tool_schemas
 from nsight_agent.ingestion.profile import NsysProfile
 
@@ -186,29 +185,25 @@ def _turn_header(turn: int, max_turns: int, log: Callable[[str], None] = print) 
 
 
 
-def _save_files(
-    profile_path: Path,
-    prompt: str,
-    response: str,
-    verbose: bool,
-    log: Callable[[str], None] = print,
-) -> tuple[Path, Path]:
-    """Save prompt and response to files next to the profile."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = profile_path.stem
-    out_dir = profile_path.parent
-
-    prompt_path = out_dir / f"{stem}_{ts}_prompt.txt"
-    response_path = out_dir / f"{stem}_{ts}_response.txt"
-
-    prompt_path.write_text(prompt, encoding="utf-8")
-    response_path.write_text(response, encoding="utf-8")
-
-    if verbose:
-        log(f"[local] Prompt saved to:   {prompt_path}")
-        log(f"[local] Response saved to: {response_path}")
-
-    return prompt_path, response_path
+def _serialize_anthropic_content(content: list) -> list[dict]:
+    """Convert Anthropic SDK content blocks to plain dicts for logging."""
+    result = []
+    for block in content:
+        block_type = getattr(block, "type", "unknown")
+        if block_type == "text":
+            result.append({"type": "text", "text": block.text})
+        elif block_type == "tool_use":
+            result.append(
+                {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+            )
+        else:
+            result.append({"type": str(block_type)})
+    return result
 
 
 def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
@@ -324,6 +319,7 @@ def _run_api(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     import anthropic
 
@@ -372,6 +368,11 @@ def _run_api(
             else:
                 log(f"[local] Context size ≈ {_next_ctx_estimate:,} tokens")
 
+        if logger:
+            logger.write_request(
+                turn,
+                {"system": _system, "tools": schemas, "messages": messages},
+            )
         response = client.messages.create(
             model=model,
             max_tokens=4096,
@@ -379,6 +380,24 @@ def _run_api(
             tools=schemas,
             messages=messages,
         )
+        if logger:
+            logger.write_response(
+                turn,
+                {
+                    "stop_reason": response.stop_reason,
+                    "usage": {
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "cache_creation_input_tokens": getattr(
+                            response.usage, "cache_creation_input_tokens", None
+                        ),
+                        "cache_read_input_tokens": getattr(
+                            response.usage, "cache_read_input_tokens", None
+                        ),
+                    },
+                    "content": _serialize_anthropic_content(response.content),
+                },
+            )
         input_tokens += response.usage.input_tokens
         output_tokens += response.usage.output_tokens
         cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
@@ -404,12 +423,6 @@ def _run_api(
                 if hasattr(block, "text"):
                     hypotheses = _extract_hypotheses(block.text)
                     if hypotheses:
-                        prompt_record = (
-                            f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                            f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
-                            f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
-                        )
-                        _save_files(profile.path, prompt_record, block.text, verbose, log)
                         return (
                             hypotheses,
                             input_tokens,
@@ -471,12 +484,36 @@ def _run_api(
     # All turns exhausted — make one final call without tools to force text output.
     if verbose:
         log("[local] Turn limit reached — forcing final output (no tool calls).")
+    _forced_turn = max_turns + 1
+    if logger:
+        logger.write_request(
+            _forced_turn,
+            {"system": _system, "messages": messages, "(forced_output_no_tools)": True},
+        )
     response = client.messages.create(
         model=model,
         max_tokens=4096,
         system=_system,
         messages=messages,
     )
+    if logger:
+        logger.write_response(
+            _forced_turn,
+            {
+                "stop_reason": response.stop_reason,
+                "usage": {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "cache_creation_input_tokens": getattr(
+                        response.usage, "cache_creation_input_tokens", None
+                    ),
+                    "cache_read_input_tokens": getattr(
+                        response.usage, "cache_read_input_tokens", None
+                    ),
+                },
+                "content": _serialize_anthropic_content(response.content),
+            },
+        )
     input_tokens += response.usage.input_tokens
     output_tokens += response.usage.output_tokens
     cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
@@ -485,12 +522,6 @@ def _run_api(
         if hasattr(block, "text"):
             hypotheses = _extract_hypotheses(block.text)
             if hypotheses:
-                prompt_record = (
-                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                    f"=== TOOL SCHEMAS ===\n{json.dumps(schemas, indent=2)}\n\n"
-                    f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
-                )
-                _save_files(profile.path, prompt_record, block.text, verbose, log)
                 return (
                     hypotheses,
                     input_tokens,
@@ -553,6 +584,7 @@ def _run_openai(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     try:
         from openai import OpenAI
@@ -596,7 +628,42 @@ def _run_openai(
             raise
 
     for turn in range(1, max_turns + 1):
+        if logger:
+            logger.write_request(
+                turn,
+                {"messages": messages, "tools": openai_tools},
+            )
         response = _create(messages)
+        if logger:
+            _msg_dict_log: dict[str, Any] = {
+                "role": "assistant",
+                "content": response.choices[0].message.content,
+            }
+            if response.choices[0].message.tool_calls:
+                _msg_dict_log["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in response.choices[0].message.tool_calls
+                ]
+            logger.write_response(
+                turn,
+                {
+                    "finish_reason": response.choices[0].finish_reason,
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
+                        "completion_tokens": response.usage.completion_tokens
+                        if response.usage
+                        else None,
+                    },
+                    "message": _msg_dict_log,
+                },
+            )
         if response.usage:
             input_tokens += response.usage.prompt_tokens
             output_tokens += response.usage.completion_tokens
@@ -639,11 +706,6 @@ def _run_openai(
 
         if choice.finish_reason == "stop":
             hypotheses = _extract_hypotheses(msg.content or "")
-            prompt_record = (
-                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
-            )
-            _save_files(profile.path, prompt_record, msg.content or "", verbose, log)
             if hypotheses:
                 return hypotheses, input_tokens, 0, 0, output_tokens
             # Model stopped without a valid JSON array — inject a recovery prompt and continue.
@@ -689,23 +751,40 @@ def _run_openai(
     # All turns exhausted — make one final call without tools to force text output.
     if verbose:
         log("[local] Turn limit reached — forcing final output (no tool calls).")
+    _forced_turn = max_turns + 1
     try:
+        if logger:
+            logger.write_request(
+                _forced_turn,
+                {"messages": messages, "(forced_output_no_tools)": True},
+            )
         response_forced = client.chat.completions.create(
             model=model,
             messages=messages,
             **{_token_limit_param: 4096},
         )
+        if logger:
+            logger.write_response(
+                _forced_turn,
+                {
+                    "finish_reason": response_forced.choices[0].finish_reason,
+                    "usage": {
+                        "prompt_tokens": response_forced.usage.prompt_tokens
+                        if response_forced.usage
+                        else None,
+                        "completion_tokens": response_forced.usage.completion_tokens
+                        if response_forced.usage
+                        else None,
+                    },
+                    "content": response_forced.choices[0].message.content,
+                },
+            )
         if response_forced.usage:
             input_tokens += response_forced.usage.prompt_tokens
             output_tokens += response_forced.usage.completion_tokens
         forced_content = response_forced.choices[0].message.content or ""
         hypotheses = _extract_hypotheses(forced_content)
         if hypotheses:
-            prompt_record = (
-                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
-            )
-            _save_files(profile.path, prompt_record, forced_content, verbose, log)
             return hypotheses, input_tokens, 0, 0, output_tokens
     except Exception as exc:
         if verbose:
@@ -729,6 +808,7 @@ def _run_gemini(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     try:
         from google import genai
@@ -783,6 +863,7 @@ def _run_gemini(
     chat = client.chats.create(model=model, config=config)
     input_tokens = 0
     output_tokens = 0
+    _log_turn = 0
 
     def _add_gemini_usage(r: Any) -> None:
         nonlocal input_tokens, output_tokens
@@ -791,8 +872,36 @@ def _run_gemini(
             input_tokens += getattr(um, "prompt_token_count", 0) or 0
             output_tokens += getattr(um, "candidates_token_count", 0) or 0
 
+    def _gemini_response_payload(r: Any) -> dict:
+        um = getattr(r, "usage_metadata", None)
+        return {
+            "text": r.text,
+            "function_calls": [
+                {"name": fc.name, "args": dict(fc.args)}
+                for fc in (r.function_calls or [])
+            ],
+            "usage_metadata": {
+                "prompt_token_count": getattr(um, "prompt_token_count", None),
+                "candidates_token_count": getattr(um, "candidates_token_count", None),
+            }
+            if um
+            else None,
+        }
+
+    _log_turn += 1
+    if logger:
+        logger.write_request(
+            _log_turn,
+            {
+                "system_instruction": _build_system_prompt(grounded),
+                "tool_declarations": [s["name"] for s in schemas],
+                "message": init_msg,
+            },
+        )
     response = chat.send_message(init_msg)
     _add_gemini_usage(response)
+    if logger:
+        logger.write_response(_log_turn, _gemini_response_payload(response))
 
     for turn in range(1, max_turns + 1):
         function_calls = response.function_calls or []
@@ -821,19 +930,18 @@ def _run_gemini(
             text = response.text or ""
             hypotheses = _extract_hypotheses(text)
             if hypotheses:
-                prompt_record = (
-                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                    f"=== INITIAL MESSAGE ===\n{init_msg}"
-                )
-                _save_files(profile.path, prompt_record, text, verbose, log)
                 return hypotheses, input_tokens, 0, 0, output_tokens
             return [], input_tokens, 0, 0, output_tokens
 
         parts = []
+        parts_data: list[dict] = []
         for fc in function_calls:
             result_json = dispatch(profile, fc.name, dict(fc.args))
             if verbose:
                 log(f"[local] {fc.name} → {_trunc(result_json)}")
+            parts_data.append(
+                {"type": "function_response", "name": fc.name, "result": json.loads(result_json)}
+            )
             parts.append(
                 genai_types.Part.from_function_response(
                     name=fc.name,
@@ -844,28 +952,38 @@ def _run_gemini(
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
             parts.append(genai_types.Part.from_text(_WRAP_UP_WARNING.format(remaining=turns_left)))
+            parts_data.append({"type": "text", "text": _WRAP_UP_WARNING.format(remaining=turns_left)})
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
             parts.append(genai_types.Part.from_text(_FINAL_FORCED_PROMPT))
+            parts_data.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
 
+        _log_turn += 1
+        if logger:
+            logger.write_request(_log_turn, {"parts": parts_data})
         response = chat.send_message(parts)
         _add_gemini_usage(response)
+        if logger:
+            logger.write_response(_log_turn, _gemini_response_payload(response))
 
     # All turns exhausted — send one final text-only message to force output.
     if verbose:
         log("[local] Turn limit reached — forcing final output (no tool calls).")
+    _log_turn += 1
     try:
+        if logger:
+            logger.write_request(
+                _log_turn,
+                {"parts": [{"type": "text", "text": _FINAL_FORCED_PROMPT}], "(forced_output_no_tools)": True},
+            )
         response_forced = chat.send_message(_FINAL_FORCED_PROMPT)
         _add_gemini_usage(response_forced)
+        if logger:
+            logger.write_response(_log_turn, _gemini_response_payload(response_forced))
         text = response_forced.text or ""
         hypotheses = _extract_hypotheses(text)
         if hypotheses:
-            prompt_record = (
-                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                f"=== INITIAL MESSAGE ===\n{init_msg}"
-            )
-            _save_files(profile.path, prompt_record, text, verbose, log)
             return hypotheses, input_tokens, 0, 0, output_tokens
     except Exception as exc:
         if verbose:
@@ -887,6 +1005,7 @@ def _run_claude_code(
     summary: ProfileSummary | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, float | None]:
     if verbose:
         log("[local] No API key found — falling back to Claude Code (claude -p)")
@@ -901,6 +1020,9 @@ def _run_claude_code(
 
     if verbose:
         log("[→ llm] Sending profile summary to Claude Code...")
+
+    if logger:
+        logger.write_request(1, {"prompt": prompt})
 
     result = subprocess.run(
         ["claude", "-p", prompt, "--output-format", "json"],
@@ -924,7 +1046,20 @@ def _run_claude_code(
     out = usage.get("output_tokens") or 0
     cost_usd: float | None = data.get("total_cost_usd")
 
-    _save_files(profile.path, prompt, response_text, verbose, log)
+    if logger:
+        logger.write_response(
+            1,
+            {
+                "result": response_text,
+                "usage": {
+                    "input_tokens": usage.get("input_tokens"),
+                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+                    "output_tokens": out,
+                },
+                "total_cost_usd": cost_usd,
+            },
+        )
 
     if verbose:
         log(f"[← llm] {_trunc(response_text, 300)}")
@@ -947,6 +1082,7 @@ def run_agent(
     token_usage: dict[str, int | None] | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> list[dict[str, Any]]:
     """Analyze a profile and return a list of hypothesis dicts.
 
@@ -981,6 +1117,7 @@ def run_agent(
                 summary=summary,
                 grounded=grounded,
                 log=log,
+                logger=logger,
             )
         elif resolved_provider == "openai":
             hypotheses, inp, cache_write, cache_read, out = _run_openai(
@@ -991,6 +1128,7 @@ def run_agent(
                 summary=summary,
                 grounded=grounded,
                 log=log,
+                logger=logger,
             )
         elif resolved_provider == "gemini":
             hypotheses, inp, cache_write, cache_read, out = _run_gemini(
@@ -1001,6 +1139,7 @@ def run_agent(
                 summary=summary,
                 grounded=grounded,
                 log=log,
+                logger=logger,
             )
         else:
             hypotheses, inp, out, cost_usd = _run_claude_code(
@@ -1009,6 +1148,7 @@ def run_agent(
                 summary=summary,
                 grounded=grounded,
                 log=log,
+                logger=logger,
             )
             cache_write = cache_read = 0
             if token_usage is not None and cost_usd is not None:

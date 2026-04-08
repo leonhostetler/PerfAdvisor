@@ -60,12 +60,7 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 
 The `profile_summary` and `phase_summary` results are pre-seeded from Stage 1 — the agent does not need to call those tools and will not spend tokens on them.
 
-After the run, the agent saves its full prompt and response as text files next to the profile:
-
-```
-{profile_stem}_{timestamp}_prompt.txt
-{profile_stem}_{timestamp}_response.txt
-```
+Saving files to disk is opt-in. Pass `--log` to record every API request and response, and `--transcript` to save a transcript of terminal output (see Usage for details).
 
 ---
 
@@ -153,6 +148,21 @@ nsight-agent analyze profile.sqlite --yes
 # Use Anthropic's count_tokens API for an exact input token count instead of the
 # char/4 heuristic (adds one small API call; falls back to heuristic for other providers)
 nsight-agent analyze profile.sqlite --exact-token-count
+
+# Save a complete log of everything sent to and received from the LLM.
+# Written in real time; a partial log is available even if the run fails.
+# The file is placed next to the profile as {stem}_{timestamp}_log.txt.
+nsight-agent analyze profile.sqlite --log
+
+# Save the log to a specific path instead
+nsight-agent analyze profile.sqlite --log-file /tmp/my_run.log
+
+# Save a transcript of everything printed to the terminal.
+# Placed next to the profile as {stem}_{timestamp}_transcript.txt.
+nsight-agent analyze profile.sqlite --transcript
+
+# Save the transcript to a specific path
+nsight-agent analyze profile.sqlite --transcript-file /tmp/my_run_transcript.txt
 ```
 
 ### Compare two profiles
@@ -181,6 +191,9 @@ nsight-agent compare profile_a.sqlite profile_b.sqlite --yes
 
 # Exact token count via Anthropic API
 nsight-agent compare profile_a.sqlite profile_b.sqlite --exact-token-count
+
+# Save LLM interaction log and terminal transcript
+nsight-agent compare profile_a.sqlite profile_b.sqlite --log --transcript
 ```
 
 ---
@@ -355,11 +368,11 @@ nsight-agent analyze profile.sqlite --quiet --json > hypotheses.json
 
 **SQL injection via `sql_query` tool.** The agent has access to a `sql_query` tool that executes arbitrary SQL. Because this runs against a local read-only connection, the blast radius is limited to the profile database. However, if you are using a profile that was provided by an untrusted third party, a specially crafted profile could attempt to influence the agent's SQL tool calls through embedded data (e.g., misleading kernel names or NVTX strings). Treat externally-sourced profiles with the same caution as any untrusted file.
 
-**LLM hallucination.** The model may produce hypotheses that sound plausible but are not grounded in the profile data. Always cross-check the `evidence` field against the actual numbers — the `summary` subcommand and the saved `_prompt.txt` / `_response.txt` files provide the ground truth the model was given.
+**LLM hallucination.** The model may produce hypotheses that sound plausible but are not grounded in the profile data. Always cross-check the `evidence` field against the actual numbers — the `summary` subcommand and the `--log` file provide the ground truth the model was given.
 
 **Cost runaway.** If a profile is extremely large (many phases, dense MPI tables), the pre-seeded context can be very large, and if the agent makes many `sql_query` calls, costs can accumulate. Use `--max-phases 1` or a cheaper model for initial exploration.
 
-**Saved files.** The agent writes `{stem}_{timestamp}_prompt.txt` and `_response.txt` next to the profile after each run. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
+**Saved files.** When `--log` or `--transcript` is used, the corresponding files are written next to the profile. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
 
 ---
 

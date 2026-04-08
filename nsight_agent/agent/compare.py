@@ -17,11 +17,11 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from nsight_agent.analysis.models import ProfileDiff, ProfileSummary
+from nsight_agent.agent.logger import LLMLogger
 
 _COMPARE_SYSTEM_PROMPT = """\
 You are a GPU performance engineer comparing two Nsight Systems profiles.
@@ -228,6 +228,7 @@ def run_compare(
     verbose: bool = True,
     token_usage: dict[str, Any] | None = None,
     log: Callable[[str], None] = print,
+    logger: LLMLogger | None = None,
 ) -> dict[str, Any]:
     """Compare two profiles using a single-shot LLM call.
 
@@ -249,6 +250,12 @@ def run_compare(
             f"(provider={resolved_provider}, model={resolved_model})"
         )
 
+    if logger:
+        logger.write_request(
+            1,
+            {"system": _COMPARE_SYSTEM_PROMPT, "message": prompt},
+        )
+
     cost_usd: float | None = None
     if resolved_provider == "anthropic":
         text, inp, out = _call_anthropic(prompt, resolved_model)
@@ -259,29 +266,20 @@ def run_compare(
     else:
         text, inp, out, cost_usd = _call_claude_code(f"{_COMPARE_SYSTEM_PROMPT}\n\n{prompt}")
 
+    if logger:
+        logger.write_response(
+            1,
+            {
+                "text": text,
+                "usage": {"input_tokens": inp, "output_tokens": out},
+                **({"total_cost_usd": cost_usd} if cost_usd is not None else {}),
+            },
+        )
+
     if verbose:
         from nsight_agent.agent.loop import _trunc
 
         log(f"[← llm] {_trunc(text, 200)}")
-
-    # Save prompt and response files next to profile A
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem_a = Path(profile_path_a).stem
-    stem_b = Path(profile_path_b).stem
-    out_dir = Path(profile_path_a).parent
-    file_stem = f"{stem_a}_vs_{stem_b}_{ts}"
-
-    prompt_path = out_dir / f"{file_stem}_prompt.txt"
-    response_path = out_dir / f"{file_stem}_response.txt"
-    prompt_path.write_text(
-        f"=== SYSTEM PROMPT ===\n{_COMPARE_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{prompt}",
-        encoding="utf-8",
-    )
-    response_path.write_text(text, encoding="utf-8")
-
-    if verbose:
-        log(f"[local] Prompt saved to:   {prompt_path}")
-        log(f"[local] Response saved to: {response_path}")
 
     if token_usage is not None:
         token_usage["input_tokens"] = inp

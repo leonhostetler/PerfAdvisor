@@ -1,6 +1,26 @@
 changelog — nsight_agent
 ========================
 
+2026-04-08
+----------
+- Replace unconditional *_prompt.txt / *_response.txt / *_output.txt file saving
+  with opt-in --log / --log-file and --transcript / --transcript-file flags on
+  analyze and compare subcommands; no files are written to disk unless requested
+- Add nsight_agent/agent/logger.py: LLMLogger context manager that writes a
+  structured log of every API request and response in real time (with flush after
+  each write so partial logs are valid on failure); header includes command, argv,
+  provider, model, profile path, and start timestamp
+- Thread LLMLogger through run_agent() and all _run_* backends (Anthropic, OpenAI,
+  Gemini, Claude Code); each backend logs full request payload and full response
+  before/after every API call including the forced-output final turn
+- For Gemini, log the system instruction, tool declaration names, and message
+  content explicitly (since the chat object manages history internally)
+- Remove _save_files() helper from loop.py; remove post-hoc prompt reconstruction
+- Rename auto-saved files: *_transcript.txt (was *_output.txt), *_log.txt
+  (replaces *_prompt.txt + *_response.txt)
+- Update README: document new --log, --log-file, --transcript, --transcript-file
+  flags for both analyze and compare; update Risks section
+
 2026-04-07
 ----------
 - Fix preflight token overestimate for OpenAI/Gemini: `estimate_json_tokens` now accepts

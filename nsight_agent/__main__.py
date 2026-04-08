@@ -6,14 +6,26 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
 from nsight_agent.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
+from nsight_agent.agent.logger import LLMLogger
 
 console = Console(record=True)
+
+
+class _null_context:
+    """Minimal no-op context manager used when logging is not requested."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_) -> None:
+        pass
 
 
 def _print_timings(timings: dict[str, float]) -> None:
@@ -211,18 +223,47 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     log = lambda msg: console.print(msg, markup=False, highlight=False)
 
+    # Compute timestamp now (start of run) for consistent log/transcript filenames.
+    _start_time = datetime.now()
+    _ts = _start_time.strftime("%Y%m%d_%H%M%S")
+    _profile_stem = Path(args.profile).stem
+    _out_dir = Path(args.profile).parent
+
+    # Resolve log file path if requested.
+    _log_requested = args.log or bool(args.log_file)
+    _log_path = (
+        Path(args.log_file)
+        if args.log_file
+        else (_out_dir / f"{_profile_stem}_{_ts}_log.txt" if _log_requested else None)
+    )
+
     token_usage: dict[str, int | None] = {}
     t_agent = time.perf_counter()
-    hypotheses = run_agent(
-        args.profile,
-        summary=summary,
-        verbose=not args.quiet,
-        model=args.model,
-        max_turns=args.max_turns,
-        token_usage=token_usage,
-        grounded=not args.allow_app_knowledge,
-        log=log,
-    )
+    with (
+        LLMLogger(_log_path) if _log_path else _null_context()
+    ) as _logger:
+        if _log_path and _logger is not None:
+            _logger.write_header(
+                command="analyze",
+                argv=sys.argv,
+                provider=resolved_provider,
+                model=resolved_model,
+                profile_path=args.profile,
+                start_time=_start_time,
+            )
+            if not args.quiet:
+                console.print(f"  LLM log:    {_log_path}")
+        hypotheses = run_agent(
+            args.profile,
+            summary=summary,
+            verbose=not args.quiet,
+            model=args.model,
+            max_turns=args.max_turns,
+            token_usage=token_usage,
+            grounded=not args.allow_app_knowledge,
+            log=log,
+            logger=_logger,
+        )
     timings["agent_s"] = time.perf_counter() - t_agent
 
     if args.json:
@@ -289,11 +330,16 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         else:
             console.print("  Tokens: [dim]N/A[/dim]")
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    output_path = Path(args.profile).parent / f"{Path(args.profile).stem}_{ts}_output.txt"
-    output_path.write_text(console.export_text(clear=False), encoding="utf-8")
-    if not args.quiet:
-        console.print(f"  Output saved to: {output_path}")
+    _transcript_requested = args.transcript or bool(args.transcript_file)
+    if _transcript_requested:
+        _transcript_path = (
+            Path(args.transcript_file)
+            if args.transcript_file
+            else _out_dir / f"{_profile_stem}_{_ts}_transcript.txt"
+        )
+        _transcript_path.write_text(console.export_text(clear=False), encoding="utf-8")
+        if not args.quiet:
+            console.print(f"  Transcript: {_transcript_path}")
 
 
 def _print_phase_table(summary, title: str) -> None:
@@ -446,17 +492,45 @@ def cmd_compare(args: argparse.Namespace) -> None:
     log = lambda msg: console.print(msg, markup=False, highlight=False)
     token_usage: dict[str, int | None] = {}
 
-    report = run_compare(
-        args.profile_a,
-        args.profile_b,
-        summary_a=summary_a,
-        summary_b=summary_b,
-        diff=diff,
-        model=args.model,
-        verbose=not args.quiet,
-        token_usage=token_usage,
-        log=log,
+    _start_time = datetime.now()
+    _ts = _start_time.strftime("%Y%m%d_%H%M%S")
+    _stem_a = Path(args.profile_a).stem
+    _stem_b = Path(args.profile_b).stem
+    _out_dir = Path(args.profile_a).parent
+    _file_stem = f"{_stem_a}_vs_{_stem_b}_{_ts}"
+
+    _log_requested = args.log or bool(args.log_file)
+    _log_path = (
+        Path(args.log_file)
+        if args.log_file
+        else (_out_dir / f"{_file_stem}_log.txt" if _log_requested else None)
     )
+
+    with (
+        LLMLogger(_log_path) if _log_path else _null_context()
+    ) as _logger:
+        if _log_path and _logger is not None:
+            _logger.write_header(
+                command="compare",
+                argv=sys.argv,
+                provider=resolved_provider,
+                model=resolved_model,
+                start_time=_start_time,
+            )
+            if not args.quiet:
+                console.print(f"  LLM log:    {_log_path}")
+        report = run_compare(
+            args.profile_a,
+            args.profile_b,
+            summary_a=summary_a,
+            summary_b=summary_b,
+            diff=diff,
+            model=args.model,
+            verbose=not args.quiet,
+            token_usage=token_usage,
+            log=log,
+            logger=_logger,
+        )
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -509,13 +583,16 @@ def cmd_compare(args: argparse.Namespace) -> None:
         else:
             console.print("  Tokens: [dim]N/A[/dim]")
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    stem_a = Path(args.profile_a).stem
-    stem_b = Path(args.profile_b).stem
-    output_path = Path(args.profile_a).parent / f"{stem_a}_vs_{stem_b}_{ts}_output.txt"
-    output_path.write_text(console.export_text(clear=False), encoding="utf-8")
-    if not args.quiet:
-        console.print(f"  Output saved to: {output_path}")
+    _transcript_requested = args.transcript or bool(args.transcript_file)
+    if _transcript_requested:
+        _transcript_path = (
+            Path(args.transcript_file)
+            if args.transcript_file
+            else _out_dir / f"{_file_stem}_transcript.txt"
+        )
+        _transcript_path.write_text(console.export_text(clear=False), encoding="utf-8")
+        if not args.quiet:
+            console.print(f"  Transcript: {_transcript_path}")
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -638,6 +715,29 @@ def main() -> None:
             "main run). Falls back to heuristic for other providers."
         ),
     )
+    p_analyze.add_argument(
+        "--log",
+        action="store_true",
+        help=(
+            "Save a full LLM interaction log (every request and response) next to the profile. "
+            "The file is written in real time so a partial log is available if the run fails."
+        ),
+    )
+    p_analyze.add_argument(
+        "--log-file",
+        metavar="PATH",
+        help="Save the LLM interaction log to PATH (implies --log).",
+    )
+    p_analyze.add_argument(
+        "--transcript",
+        action="store_true",
+        help="Save a transcript of everything printed to the terminal next to the profile.",
+    )
+    p_analyze.add_argument(
+        "--transcript-file",
+        metavar="PATH",
+        help="Save the terminal transcript to PATH (implies --transcript).",
+    )
     p_compare = sub.add_parser("compare", help="Compare two profiles and summarize differences")
     p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
     p_compare.add_argument("profile_b", help="Path to second .sqlite profile")
@@ -670,6 +770,26 @@ def main() -> None:
             "(Anthropic only; adds one small API call). "
             "Falls back to heuristic for other providers."
         ),
+    )
+    p_compare.add_argument(
+        "--log",
+        action="store_true",
+        help="Save a full LLM interaction log (request and response) next to profile A.",
+    )
+    p_compare.add_argument(
+        "--log-file",
+        metavar="PATH",
+        help="Save the LLM interaction log to PATH (implies --log).",
+    )
+    p_compare.add_argument(
+        "--transcript",
+        action="store_true",
+        help="Save a transcript of everything printed to the terminal next to profile A.",
+    )
+    p_compare.add_argument(
+        "--transcript-file",
+        metavar="PATH",
+        help="Save the terminal transcript to PATH (implies --transcript).",
     )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
