@@ -102,8 +102,10 @@ class NsysProfile:
         needed even if LIMIT was not injected into the SQL.
         """
         if stop_event is not None:
+
             def _progress() -> int:
                 return 1 if stop_event.is_set() else 0
+
             self._conn.set_progress_handler(_progress, 1000)
         try:
             cursor = self._conn.execute(sql)

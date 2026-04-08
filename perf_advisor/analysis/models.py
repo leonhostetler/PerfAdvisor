@@ -13,7 +13,10 @@ class KernelSummary(BaseModel):
     name: str
     short_name: str | None = Field(
         default=None,
-        description="Short display name from StringIds (e.g. 'Kernel3D'); name holds the full normalized demangled name",
+        description=(
+            "Short display name from StringIds (e.g. 'Kernel3D');"
+            " name holds the full normalized demangled name"
+        ),
     )
     calls: int
     total_s: float
@@ -24,17 +27,25 @@ class KernelSummary(BaseModel):
     std_dev_ms: float = 0.0
     cv: float = Field(
         default=0.0,
-        description="Coefficient of variation (std_dev / avg); high value signals load imbalance or wavefront irregularity",
+        description=(
+            "Coefficient of variation (std_dev / avg);"
+            " high value signals load imbalance or wavefront irregularity"
+        ),
     )
     avg_registers_per_thread: int = 0
     avg_shared_mem_bytes: int = 0
     estimated_occupancy: float | None = Field(
         default=None,
-        description="Estimated wave occupancy (0–1): avg launch threads / (SM count × max threads per SM)",
+        description=(
+            "Estimated wave occupancy (0–1): avg launch threads / (SM count × max threads per SM)"
+        ),
     )
     avg_launch_overhead_us: float | None = Field(
         default=None,
-        description="Avg CPU-to-GPU enqueue latency in µs: time from cudaLaunchKernel on CPU to kernel start on GPU",
+        description=(
+            "Avg CPU-to-GPU enqueue latency in µs:"
+            " time from cudaLaunchKernel on CPU to kernel start on GPU"
+        ),
     )
     max_launch_overhead_us: float | None = Field(
         default=None,
@@ -145,7 +156,10 @@ class ProfileSummary(BaseModel):
     )
     cpu_sync_blocked_pct: float | None = Field(
         default=None,
-        description="cpu_sync_blocked_s as a fraction of total GPU kernel time (0–100); high value means GPU is being serialized by CPU sync barriers",
+        description=(
+            "cpu_sync_blocked_s as a fraction of total GPU kernel time (0–100);"
+            " high value means GPU is being serialized by CPU sync barriers"
+        ),
     )
 
     # MPI (absent if profile has no MPI tables)

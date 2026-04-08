@@ -5,7 +5,8 @@ two profiles, computes per-field deltas, and determines the appropriate
 comparison mode:
 
   phase_aware       — phases match (same count + same names); full per-phase analysis
-  summary           — phases differ but kernel overlap >= 20%; overall comparison with per-kernel diff
+  summary           — phases differ but kernel overlap >= 20%;
+                      overall comparison with per-kernel diff
   summary_no_kernel — phases differ and kernel overlap < 20%; top-level metrics only
 """
 

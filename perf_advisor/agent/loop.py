@@ -30,10 +30,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from perf_advisor.analysis.metrics import compute_profile_summary
-from perf_advisor.analysis.models import ProfileSummary
 from perf_advisor.agent.logger import LLMLogger
 from perf_advisor.agent.tools import dispatch, tool_schemas
+from perf_advisor.analysis.metrics import compute_profile_summary
+from perf_advisor.analysis.models import ProfileSummary
 from perf_advisor.ingestion.profile import NsysProfile
 
 MODEL = "claude-opus-4-6"
@@ -151,7 +151,9 @@ Not all tables are present in every profile. The profile_summary tool lists avai
 Use the get_table_schema tool (or PRAGMA table_info(<table>)) to inspect an unfamiliar table.\
 """
 
-_SYSTEM_PROMPT_API_BASE = f"""You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile.
+_SYSTEM_PROMPT_API_BASE = (
+    "You are an expert GPU performance engineer analyzing an NVIDIA Nsight Systems profile."
+    f"""
 
 Your goal is to identify the most significant performance bottlenecks and produce a ranked list of
 actionable hypotheses.
@@ -173,6 +175,7 @@ objects (not wrapped in markdown fences) and nothing else after it.
 
 {_SQL_SCHEMA_REFERENCE}
 """
+)
 
 
 def _build_system_prompt(grounded: bool = True) -> str:
@@ -226,7 +229,6 @@ def _turn_header(turn: int, max_turns: int, log: Callable[[str], None] = print) 
     left = dashes // 2
     right = dashes - left
     log(f"\n{'─' * left}{label}{'─' * right}")
-
 
 
 def _serialize_anthropic_content(content: list) -> list[dict]:
@@ -389,7 +391,7 @@ def _run_api(
     #   turn N reads everything through turn N-1 from cache (0.10×)
     #   turn N writes only the new increment to cache (1.25×)
     # When a third per-turn message is about to be added, the oldest is stripped.
-    _cache_prev: dict | None = None   # turn N-1 (keep marker)
+    _cache_prev: dict | None = None  # turn N-1 (keep marker)
     _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)
 
     # Estimated total and cached context sizes for the upcoming turn.
@@ -731,16 +733,16 @@ def _run_openai(
             _turn_header(turn, max_turns, log)
             if response.usage:
                 ctx_tokens = response.usage.prompt_tokens
-                cached_tokens = getattr(
-                    getattr(response.usage, "prompt_tokens_details", None),
-                    "cached_tokens",
-                    0,
-                ) or 0
-                if cached_tokens:
-                    log(
-                        f"[local] Context size ≈ {ctx_tokens:,} tokens"
-                        f" ({cached_tokens:,} cached)"
+                cached_tokens = (
+                    getattr(
+                        getattr(response.usage, "prompt_tokens_details", None),
+                        "cached_tokens",
+                        0,
                     )
+                    or 0
+                )
+                if cached_tokens:
+                    log(f"[local] Context size ≈ {ctx_tokens:,} tokens ({cached_tokens:,} cached)")
                 else:
                     log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
             if msg.content:
@@ -759,8 +761,9 @@ def _run_openai(
                 {
                     "role": "user",
                     "content": (
-                        "Your response did not contain the required JSON array of hypothesis objects. "
-                        "Output ONLY a JSON array now — no prose, no markdown fences."
+                        "Your response did not contain the required JSON array of"
+                        " hypothesis objects. Output ONLY a JSON array now —"
+                        " no prose, no markdown fences."
                     ),
                 }
             )
@@ -921,8 +924,7 @@ def _run_gemini(
         return {
             "text": r.text,
             "function_calls": [
-                {"name": fc.name, "args": dict(fc.args)}
-                for fc in (r.function_calls or [])
+                {"name": fc.name, "args": dict(fc.args)} for fc in (r.function_calls or [])
             ],
             "usage_metadata": {
                 "prompt_token_count": getattr(um, "prompt_token_count", None),
@@ -996,7 +998,9 @@ def _run_gemini(
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
             parts.append(genai_types.Part.from_text(_WRAP_UP_WARNING.format(remaining=turns_left)))
-            parts_data.append({"type": "text", "text": _WRAP_UP_WARNING.format(remaining=turns_left)})
+            parts_data.append(
+                {"type": "text", "text": _WRAP_UP_WARNING.format(remaining=turns_left)}
+            )
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
@@ -1019,7 +1023,10 @@ def _run_gemini(
         if logger:
             logger.write_request(
                 _log_turn,
-                {"parts": [{"type": "text", "text": _FINAL_FORCED_PROMPT}], "(forced_output_no_tools)": True},
+                {
+                    "parts": [{"type": "text", "text": _FINAL_FORCED_PROMPT}],
+                    "(forced_output_no_tools)": True,
+                },
             )
         response_forced = chat.send_message(_FINAL_FORCED_PROMPT)
         _add_gemini_usage(response_forced)
@@ -1148,7 +1155,8 @@ def run_agent(
 
     if verbose:
         log(
-            f"[local] Analyzing {profile.path.name} (provider={resolved_provider}, model={resolved_model})"
+            f"[local] Analyzing {profile.path.name}"
+            f" (provider={resolved_provider}, model={resolved_model})"
         )
 
     try:

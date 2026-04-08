@@ -13,6 +13,13 @@ import threading
 from typing import Any
 
 from perf_advisor.analysis.metrics import (
+    _window_idle_time,
+    _window_kernel_time,
+    _window_memcpy_by_kind,
+    _window_mpi_ops,
+    _window_nvtx_ranges,
+    _window_streams,
+    _window_top_kernels,
     compute_gap_histogram,
     compute_gpu_kernel_time,
     compute_memcpy_by_kind,
@@ -21,16 +28,8 @@ from perf_advisor.analysis.metrics import (
     compute_profile_span,
     compute_streams,
     compute_top_kernels,
-    _window_idle_time,
-    _window_kernel_time,
-    _window_memcpy_by_kind,
-    _window_mpi_ops,
-    _window_nvtx_ranges,
-    _window_streams,
-    _window_top_kernels,
 )
 from perf_advisor.ingestion.profile import NsysProfile
-
 
 # ---------------------------------------------------------------------------
 # Tool implementations
@@ -164,8 +163,7 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     if not (sql_norm.startswith("SELECT") or sql_norm.startswith("WITH")):
         return {
             "error": (
-                "Only SELECT queries are permitted. "
-                "Use get_table_schema for schema inspection."
+                "Only SELECT queries are permitted. Use get_table_schema for schema inspection."
             )
         }
 

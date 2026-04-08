@@ -20,10 +20,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from perf_advisor.analysis.models import ProfileDiff, ProfileSummary
 from perf_advisor.agent.logger import LLMLogger
+from perf_advisor.analysis.models import ProfileDiff, ProfileSummary
 
-_COMPARE_SYSTEM_PROMPT = """\
+_COMPARE_SYSTEM_PROMPT = (
+    """\
 You are a GPU performance engineer comparing two Nsight Systems profiles.
 Your goal is to identify and describe the most significant differences in GPU behavior — \
 utilization, kernel mix, memory bandwidth usage, MPI overhead, idle time — \
@@ -41,7 +42,8 @@ Output ONLY a JSON object (not an array, not wrapped in markdown fences) with th
       "metric": "brief metric name",
       "profile_a": "formatted value for profile A",
       "profile_b": "formatted value for profile B",
-      "magnitude_pct": <relative change as a float (positive = B larger), or null if not meaningful>,
+      "magnitude_pct": <relative change as a float (positive = B larger),"""
+    """ or null if not meaningful>,
       "note": "one sentence factual interpretation of this difference"
     }
   ]
@@ -50,6 +52,7 @@ Output ONLY a JSON object (not an array, not wrapped in markdown fences) with th
 Order key_differences by absolute magnitude (largest change first).
 Include at least the top 5 differences and no more than 15.
 """
+)
 
 _MODE_DESCRIPTION: dict[str, str] = {
     "phase_aware": (

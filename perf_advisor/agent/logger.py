@@ -74,9 +74,7 @@ class LLMLogger:
         self._write(
             f"\n{sep}\n"
             f"TURN {turn} — REQUEST TO LLM  ({ts})\n"
-            f"{sep}\n"
-            + json.dumps(payload, indent=2, default=_json_default)
-            + "\n"
+            f"{sep}\n" + json.dumps(payload, indent=2, default=_json_default) + "\n"
         )
 
     def write_response(self, turn: int, payload: dict[str, Any]) -> None:
@@ -86,9 +84,7 @@ class LLMLogger:
         self._write(
             f"\n{sep}\n"
             f"TURN {turn} — RESPONSE FROM LLM  ({ts})\n"
-            f"{sep}\n"
-            + json.dumps(payload, indent=2, default=_json_default)
-            + "\n"
+            f"{sep}\n" + json.dumps(payload, indent=2, default=_json_default) + "\n"
         )
 
     def _write(self, text: str) -> None:
@@ -98,7 +94,7 @@ class LLMLogger:
     def close(self) -> None:
         self._f.close()
 
-    def __enter__(self) -> "LLMLogger":
+    def __enter__(self) -> LLMLogger:
         return self
 
     def __exit__(self, *_: Any) -> None:

@@ -12,8 +12,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
 from perf_advisor.agent.logger import LLMLogger
+from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
 
 console = Console(record=True)
 
@@ -73,7 +73,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         console.print(
-            f"Using AI provider = [cyan]{resolved_provider}[/cyan], model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
+            f"Using AI provider = [cyan]{resolved_provider}[/cyan],"
+            f" model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
         )
 
     missing = check_provider_available(resolved_provider)
@@ -112,7 +113,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             ph.add_column("Top MPI Op")
         for p in summary.phases:
             top_kernel = (
-                f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
+                f"{p.top_kernels[0].short_name or p.top_kernels[0].name}"
+                f" ({p.top_kernels[0].pct_of_gpu_time}%)"
                 if p.top_kernels
                 else "—"
             )
@@ -221,7 +223,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 console.print("[yellow]Aborted.[/yellow]")
                 sys.exit(0)
 
-    log = lambda msg: console.print(msg, markup=False, highlight=False)
+    def log(msg):
+        return console.print(msg, markup=False, highlight=False)
 
     # Compute timestamp now (start of run) for consistent log/transcript filenames.
     _start_time = datetime.now()
@@ -239,9 +242,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     token_usage: dict[str, int | None] = {}
     t_agent = time.perf_counter()
-    with (
-        LLMLogger(_log_path) if _log_path else _null_context()
-    ) as _logger:
+    with LLMLogger(_log_path) if _log_path else _null_context() as _logger:
         if _log_path and _logger is not None:
             _logger.write_header(
                 command="analyze",
@@ -360,7 +361,8 @@ def _print_phase_table(summary, title: str) -> None:
     ph.add_column("Top Kernel")
     for p in summary.phases:
         top_kernel = (
-            f"{p.top_kernels[0].short_name or p.top_kernels[0].name} ({p.top_kernels[0].pct_of_gpu_time}%)"
+            f"{p.top_kernels[0].short_name or p.top_kernels[0].name}"
+            f" ({p.top_kernels[0].pct_of_gpu_time}%)"
             if p.top_kernels
             else "—"
         )
@@ -493,7 +495,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 console.print("[yellow]Aborted.[/yellow]")
                 sys.exit(0)
 
-    log = lambda msg: console.print(msg, markup=False, highlight=False)
+    def log(msg):
+        return console.print(msg, markup=False, highlight=False)
+
     token_usage: dict[str, int | None] = {}
 
     _start_time = datetime.now()
@@ -510,9 +514,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
         else (_out_dir / f"{_file_stem}_log.txt" if _log_requested else None)
     )
 
-    with (
-        LLMLogger(_log_path) if _log_path else _null_context()
-    ) as _logger:
+    with LLMLogger(_log_path) if _log_path else _null_context() as _logger:
         if _log_path and _logger is not None:
             _logger.write_header(
                 command="compare",
@@ -613,7 +615,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
     console.print(f"\n[bold]Profile:[/bold] {summary.profile_path}")
     console.print(f"  Span:            {summary.profile_span_s:.1f}s")
     console.print(
-        f"  GPU kernel time: {summary.gpu_kernel_s:.1f}s  ({summary.gpu_utilization_pct:.1f}% utilization)"
+        f"  GPU kernel time: {summary.gpu_kernel_s:.1f}s"
+        f"  ({summary.gpu_utilization_pct:.1f}% utilization)"
     )
     console.print(f"  GPU memcpy time: {summary.gpu_memcpy_s:.1f}s")
     console.print(f"  GPU sync time:   {summary.gpu_sync_s:.1f}s")
@@ -701,7 +704,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Allow the model to draw on application-specific knowledge from training data "
-            "(e.g. suggest named environment variables or library options inferred from kernel names). "
+            "(e.g. suggest named environment variables or library options"
+            " inferred from kernel names). "
             "By default suggestions are grounded strictly in the profile data."
         ),
     )
@@ -751,7 +755,10 @@ def main() -> None:
         "--max-phases",
         type=int,
         default=6,
-        help="Maximum number of execution phases to detect per profile (default: 6; use 1 to disable)",
+        help=(
+            "Maximum number of execution phases to detect per profile"
+            " (default: 6; use 1 to disable)"
+        ),
     )
     p_compare.add_argument(
         "--model",
