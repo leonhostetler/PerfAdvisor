@@ -1,4 +1,4 @@
-"""CLI entry point: python -m nsight_agent analyze <profile.sqlite>"""
+"""CLI entry point: python -m perf_advisor analyze <profile.sqlite>"""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from nsight_agent.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
-from nsight_agent.agent.logger import LLMLogger
+from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
+from perf_advisor.agent.logger import LLMLogger
 
 console = Console(record=True)
 
@@ -50,23 +50,23 @@ def _print_timings(timings: dict[str, float]) -> None:
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
-    from nsight_agent.agent.loop import (
+    from perf_advisor.agent.loop import (
         _build_system_prompt,
         _parse_provider_and_model,
         check_provider_available,
         get_provider_availability,
         run_agent,
     )
-    from nsight_agent.agent.preflight import (
+    from perf_advisor.agent.preflight import (
         count_tokens_exact,
         estimate_cache_breakdown,
         estimate_json_tokens,
         estimate_prose_tokens,
         estimate_total_session_tokens,
     )
-    from nsight_agent.agent.tools import tool_schemas
-    from nsight_agent.analysis.metrics import compute_profile_summary
-    from nsight_agent.ingestion.profile import NsysProfile
+    from perf_advisor.agent.tools import tool_schemas
+    from perf_advisor.analysis.metrics import compute_profile_summary
+    from perf_advisor.ingestion.profile import NsysProfile
 
     # Resolve provider early so we can fail fast before any expensive work.
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
@@ -376,20 +376,20 @@ def _print_phase_table(summary, title: str) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
-    from nsight_agent.agent.compare import _COMPARE_SYSTEM_PROMPT, _build_prompt, run_compare
-    from nsight_agent.agent.loop import (
+    from perf_advisor.agent.compare import _COMPARE_SYSTEM_PROMPT, _build_prompt, run_compare
+    from perf_advisor.agent.loop import (
         _parse_provider_and_model,
         check_provider_available,
         get_provider_availability,
     )
-    from nsight_agent.agent.preflight import (
+    from perf_advisor.agent.preflight import (
         count_tokens_exact,
         estimate_json_tokens,
         estimate_prose_tokens,
     )
-    from nsight_agent.analysis.diff import compute_profile_diff
-    from nsight_agent.analysis.metrics import compute_profile_summary
-    from nsight_agent.ingestion.profile import NsysProfile
+    from perf_advisor.analysis.diff import compute_profile_diff
+    from perf_advisor.analysis.metrics import compute_profile_summary
+    from perf_advisor.ingestion.profile import NsysProfile
 
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
 
@@ -600,8 +600,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
-    from nsight_agent.analysis.metrics import compute_profile_summary
-    from nsight_agent.ingestion.profile import NsysProfile
+    from perf_advisor.analysis.metrics import compute_profile_summary
+    from perf_advisor.ingestion.profile import NsysProfile
 
     with NsysProfile(args.profile) as profile:
         summary = compute_profile_summary(profile, max_phases=args.max_phases)
@@ -659,7 +659,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="nsight-agent")
+    parser = argparse.ArgumentParser(prog="perf-advisor")
     sub = parser.add_subparsers(dest="command")
 
     p_analyze = sub.add_parser("analyze", help="Run agent hypothesis generation on a profile")

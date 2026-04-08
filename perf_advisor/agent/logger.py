@@ -2,7 +2,7 @@
 
 Usage::
 
-    from nsight_agent.agent.logger import LLMLogger
+    from perf_advisor.agent.logger import LLMLogger
 
     with LLMLogger(path) as logger:
         logger.write_header(command="analyze", argv=sys.argv, ...)
@@ -51,7 +51,7 @@ class LLMLogger:
         sep = "=" * 72
         lines = [
             sep,
-            "nsight-agent LLM Interaction Log",
+            "perf-advisor LLM Interaction Log",
             sep,
             f"Command:    {' '.join(str(a) for a in argv)}",
             f"Subcommand: {command}",

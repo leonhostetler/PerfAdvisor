@@ -2,7 +2,7 @@
 
 import pytest
 
-from nsight_agent.analysis.metrics import (
+from perf_advisor.analysis.metrics import (
     compute_gap_histogram,
     compute_gpu_kernel_time,
     compute_gpu_memcpy_time,
@@ -15,7 +15,7 @@ from nsight_agent.analysis.metrics import (
     compute_streams,
     compute_top_kernels,
 )
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.profile import NsysProfile
 
 TEST_PROFILE = "/home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite"
 

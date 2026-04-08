@@ -2,7 +2,7 @@
 
 import pytest
 
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.profile import NsysProfile
 
 TEST_PROFILE = "/home/ads.leonhost/Downloads/nsight/nsys_4864_cgdef_2node_1rhs/cg_4864_1rhs.sqlite"
 

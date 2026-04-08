@@ -1,6 +1,6 @@
-# nsight-agent
+# PerfAdvisor
 
-An agentic performance analyzer for NVIDIA Nsight Systems profiles. It extracts structured metrics from a `.sqlite` profile, then uses an LLM to reason over the data and produce a ranked list of actionable performance hypotheses.
+An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Currently supports NVIDIA Nsight Systems (`.sqlite`); AMD ROCProfiler support is planned. Extracts structured metrics from a profile, then uses an LLM to reason over the data and produce a ranked list of actionable performance hypotheses.
 
 ---
 
@@ -94,9 +94,9 @@ nsys export --type sqlite --output profile.sqlite profile.nsys-rep
 ### Print metrics without running the LLM
 
 ```bash
-nsight-agent summary profile.sqlite
-nsight-agent summary profile.sqlite --json        # machine-readable JSON
-nsight-agent summary profile.sqlite --max-phases 3
+perf-advisor summary profile.sqlite
+perf-advisor summary profile.sqlite --json        # machine-readable JSON
+perf-advisor summary profile.sqlite --max-phases 3
 ```
 
 This runs Stage 1 only — fast, free, no API key required.
@@ -104,7 +104,7 @@ This runs Stage 1 only — fast, free, no API key required.
 ### Run the full agent
 
 ```bash
-nsight-agent analyze profile.sqlite
+perf-advisor analyze profile.sqlite
 ```
 
 The provider is auto-detected from your environment (see Provider Selection below).
@@ -113,13 +113,13 @@ The provider is auto-detected from your environment (see Provider Selection belo
 
 ```bash
 # Print the full ProfileSummary JSON sent to the model (for debugging)
-nsight-agent analyze profile.sqlite --verbose
+perf-advisor analyze profile.sqlite --verbose
 
 # Suppress per-turn agent logging and timing table
-nsight-agent analyze profile.sqlite --quiet
+perf-advisor analyze profile.sqlite --quiet
 
 # Output raw hypothesis JSON (suitable for piping or scripting)
-nsight-agent analyze profile.sqlite --json
+perf-advisor analyze profile.sqlite --json
 
 # Allow the model to draw on application-specific knowledge from training data.
 # By default, suggestions are grounded strictly in the profile data, which reduces
@@ -128,47 +128,47 @@ nsight-agent analyze profile.sqlite --json
 # by drawing on its training knowledge of the application — but it may also
 # confidently suggest configuration options, environment variables, or tuning
 # parameters that are incorrect or do not exist.
-nsight-agent analyze profile.sqlite --allow-app-knowledge
+perf-advisor analyze profile.sqlite --allow-app-knowledge
 
 # Limit phase detection (fewer phases = less context = fewer tokens)
-nsight-agent analyze profile.sqlite --max-phases 3
-nsight-agent analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely
+perf-advisor analyze profile.sqlite --max-phases 3
+perf-advisor analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely
 
 # Override the agent turn limit (default: 20).
 # Lower values reduce cost and risk of runaway tool calls; higher values give
 # the model more room on complex profiles. A wrap-up warning is injected 3 turns
 # before the limit; if the limit is still hit, one extra no-tool turn is made to
 # extract whatever the model has gathered rather than discarding it.
-nsight-agent analyze profile.sqlite --max-turns 10   # tighter limit for cheaper models
-nsight-agent analyze profile.sqlite --max-turns 30   # more room for complex profiles
+perf-advisor analyze profile.sqlite --max-turns 10   # tighter limit for cheaper models
+perf-advisor analyze profile.sqlite --max-turns 30   # more room for complex profiles
 
 # Skip the pre-flight confirmation prompt (useful in scripts or batch jobs)
-nsight-agent analyze profile.sqlite --yes
+perf-advisor analyze profile.sqlite --yes
 
 # Use Anthropic's count_tokens API for an exact input token count instead of the
 # char/4 heuristic (adds one small API call; falls back to heuristic for other providers)
-nsight-agent analyze profile.sqlite --exact-token-count
+perf-advisor analyze profile.sqlite --exact-token-count
 
 # Save a complete log of everything sent to and received from the LLM.
 # Written in real time; a partial log is available even if the run fails.
 # The file is placed next to the profile as {stem}_{timestamp}_log.txt.
-nsight-agent analyze profile.sqlite --log
+perf-advisor analyze profile.sqlite --log
 
 # Save the log to a specific path instead
-nsight-agent analyze profile.sqlite --log-file /tmp/my_run.log
+perf-advisor analyze profile.sqlite --log-file /tmp/my_run.log
 
 # Save a transcript of everything printed to the terminal.
 # Placed next to the profile as {stem}_{timestamp}_transcript.txt.
-nsight-agent analyze profile.sqlite --transcript
+perf-advisor analyze profile.sqlite --transcript
 
 # Save the transcript to a specific path
-nsight-agent analyze profile.sqlite --transcript-file /tmp/my_run_transcript.txt
+perf-advisor analyze profile.sqlite --transcript-file /tmp/my_run_transcript.txt
 ```
 
 ### Compare two profiles
 
 ```bash
-nsight-agent compare profile_a.sqlite profile_b.sqlite
+perf-advisor compare profile_a.sqlite profile_b.sqlite
 ```
 
 Produces a structured narrative and a key-differences table ordered by magnitude of change.
@@ -181,19 +181,19 @@ into a single LLM prompt (no tool-use loop). Three comparison modes are selected
 
 ```bash
 # Suppress verbose output
-nsight-agent compare profile_a.sqlite profile_b.sqlite --quiet
+perf-advisor compare profile_a.sqlite profile_b.sqlite --quiet
 
 # Output raw JSON
-nsight-agent compare profile_a.sqlite profile_b.sqlite --json
+perf-advisor compare profile_a.sqlite profile_b.sqlite --json
 
 # Skip the pre-flight confirmation prompt
-nsight-agent compare profile_a.sqlite profile_b.sqlite --yes
+perf-advisor compare profile_a.sqlite profile_b.sqlite --yes
 
 # Exact token count via Anthropic API
-nsight-agent compare profile_a.sqlite profile_b.sqlite --exact-token-count
+perf-advisor compare profile_a.sqlite profile_b.sqlite --exact-token-count
 
 # Save LLM interaction log and terminal transcript
-nsight-agent compare profile_a.sqlite profile_b.sqlite --log --transcript
+perf-advisor compare profile_a.sqlite profile_b.sqlite --log --transcript
 ```
 
 ---
@@ -211,26 +211,26 @@ Provider resolution order (first match wins):
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-nsight-agent analyze profile.sqlite
-nsight-agent analyze profile.sqlite --model claude-haiku-4-5-20251001   # faster, cheaper
+perf-advisor analyze profile.sqlite
+perf-advisor analyze profile.sqlite --model claude-haiku-4-5-20251001   # faster, cheaper
 ```
 
 ### OpenAI
 
 ```bash
 export OPENAI_API_KEY=sk-...
-nsight-agent analyze profile.sqlite --model openai:gpt-4o
-nsight-agent analyze profile.sqlite --model openai:gpt-4o-mini
-nsight-agent analyze profile.sqlite --model openai   # uses gpt-4o (default)
+perf-advisor analyze profile.sqlite --model openai:gpt-4o
+perf-advisor analyze profile.sqlite --model openai:gpt-4o-mini
+perf-advisor analyze profile.sqlite --model openai   # uses gpt-4o (default)
 ```
 
 ### Google Gemini
 
 ```bash
 export GOOGLE_API_KEY=...
-nsight-agent analyze profile.sqlite --model gemini:gemini-2.0-flash
-nsight-agent analyze profile.sqlite --model gemini:gemini-1.5-pro
-nsight-agent analyze profile.sqlite --model gemini   # uses gemini-2.0-flash (default)
+perf-advisor analyze profile.sqlite --model gemini:gemini-2.0-flash
+perf-advisor analyze profile.sqlite --model gemini:gemini-1.5-pro
+perf-advisor analyze profile.sqlite --model gemini   # uses gemini-2.0-flash (default)
 ```
 
 ### Claude Code fallback (no API key)
@@ -245,19 +245,19 @@ If no API key is set and `claude` is on your PATH, the agent falls back to a sin
 
 All three provider backends (Anthropic, OpenAI, Gemini) are stateless: every API call replays the full conversation history from turn 1. For a 20-turn analysis, the system prompt and pre-seeded profile summary are re-sent on every single turn — without caching, these account for the majority of total token cost.
 
-**Anthropic — sliding cache (implemented):** nsight-agent uses Anthropic's prompt caching API with a sliding cache cursor. Turn 1 writes the system prompt and pre-seeded profile summary to cache (billed at 1.25× normal). Each subsequent turn reads the previous turn's cache hit (billed at 0.10×) and writes the new tool-result exchange to cache. The cached prefix grows by one exchange per turn, so later turns read an increasingly large prefix at 0.10× while paying full price only for the new incremental content. On a typical 18-turn run this produces a ~75–80% reduction in billable input tokens.
+**Anthropic — sliding cache (implemented):** perf-advisor uses Anthropic's prompt caching API with a sliding cache cursor. Turn 1 writes the system prompt and pre-seeded profile summary to cache (billed at 1.25× normal). Each subsequent turn reads the previous turn's cache hit (billed at 0.10×) and writes the new tool-result exchange to cache. The cached prefix grows by one exchange per turn, so later turns read an increasingly large prefix at 0.10× while paying full price only for the new incremental content. On a typical 18-turn run this produces a ~75–80% reduction in billable input tokens.
 
 The pre-flight estimate for Anthropic runs shows the expected cache_write, cache_read, and cost-equivalent token counts instead of a raw input total.
 
-**OpenAI — automatic caching:** OpenAI automatically caches repeated input prefixes longer than 1,024 tokens at a ~50% discount. No developer action is required; nsight-agent does not do anything special for OpenAI and the savings happen transparently.
+**OpenAI — automatic caching:** OpenAI automatically caches repeated input prefixes longer than 1,024 tokens at a ~50% discount. No developer action is required; perf-advisor does not do anything special for OpenAI and the savings happen transparently.
 
-**Google Gemini — not implemented:** Gemini supports explicit context caching via an "upload once, reference by ID" API that is architecturally different from the per-request marker approach. It is not currently implemented in nsight-agent.
+**Google Gemini — not implemented:** Gemini supports explicit context caching via an "upload once, reference by ID" API that is architecturally different from the per-request marker approach. It is not currently implemented in perf-advisor.
 
 ---
 
 ### Pre-flight estimate
 
-Before every `analyze` and `compare` run, nsight-agent prints an input/output token estimate and prompts for confirmation.
+Before every `analyze` and `compare` run, perf-advisor prints an input/output token estimate and prompts for confirmation.
 
 For Anthropic runs (with sliding prompt cache):
 
@@ -308,8 +308,8 @@ Profiles with many MPI operations, many phases, or dense kernel tables will be a
 **Reduce phase context** (largest single lever):
 
 ```bash
-nsight-agent analyze profile.sqlite --max-phases 2
-nsight-agent analyze profile.sqlite --max-phases 1   # global metrics only, no phases
+perf-advisor analyze profile.sqlite --max-phases 2
+perf-advisor analyze profile.sqlite --max-phases 1   # global metrics only, no phases
 ```
 
 Each phase adds its own per-phase kernel table, MPI breakdown, and gap histogram to the pre-seeded context. Reducing from 6 to 1 can cut pre-seed size by 60–80%.
@@ -317,8 +317,8 @@ Each phase adds its own per-phase kernel table, MPI breakdown, and gap histogram
 **Cap the turn count** (reduces worst-case cost and avoids runaway tool loops):
 
 ```bash
-nsight-agent analyze profile.sqlite --max-turns 10   # good default for Haiku
-nsight-agent analyze profile.sqlite --max-turns 5    # cheapest, summarizes after 5 tool calls
+perf-advisor analyze profile.sqlite --max-turns 10   # good default for Haiku
+perf-advisor analyze profile.sqlite --max-turns 5    # cheapest, summarizes after 5 tool calls
 ```
 
 Smaller models like Haiku tend to use more turns for the same analysis. A lower `--max-turns` bounds the cost while the built-in wrap-up warning and forced final turn ensure you still get output rather than an error.
@@ -331,13 +331,13 @@ Anthropic runs benefit from sliding prompt caching automatically. The pre-flight
 
 ```bash
 # Anthropic — ~20× cheaper than Opus, good for straightforward profiles
-nsight-agent analyze profile.sqlite --model claude-haiku-4-5-20251001
+perf-advisor analyze profile.sqlite --model claude-haiku-4-5-20251001
 
 # OpenAI
-nsight-agent analyze profile.sqlite --model openai:gpt-4o-mini
+perf-advisor analyze profile.sqlite --model openai:gpt-4o-mini
 
 # Gemini — generous free tier
-nsight-agent analyze profile.sqlite --model gemini:gemini-2.0-flash
+perf-advisor analyze profile.sqlite --model gemini:gemini-2.0-flash
 ```
 
 **Inspect before analyzing:**
@@ -345,7 +345,7 @@ nsight-agent analyze profile.sqlite --model gemini:gemini-2.0-flash
 Run `summary` first to understand whether the full agent analysis is warranted:
 
 ```bash
-nsight-agent summary profile.sqlite
+perf-advisor summary profile.sqlite
 ```
 
 If the bottleneck is already obvious from the summary table (e.g., one kernel dominates at 95% GPU time), you may not need the LLM at all.
@@ -353,7 +353,7 @@ If the bottleneck is already obvious from the summary table (e.g., one kernel do
 **Use the JSON output for batch workflows:**
 
 ```bash
-nsight-agent analyze profile.sqlite --quiet --json > hypotheses.json
+perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 ```
 
 `--quiet` suppresses verbose turn-by-turn output but doesn't affect token usage. `--json` skips the Rich table rendering.

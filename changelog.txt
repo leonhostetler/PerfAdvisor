@@ -1,8 +1,15 @@
-changelog — nsight_agent
+changelog — perf_advisor
 ========================
 
 2026-04-08
 ----------
+- Rename project from nsight-agent / nsight_agent to perf-advisor / perf_advisor:
+  rename package directory, update pyproject.toml name and script entry point,
+  update all imports, CLI prog= string, README, todo_list.md, changelog header,
+  and .gitignore comment; update README title to PerfAdvisor and broaden
+  description to frame the tool as a general GPU/accelerator profiler with
+  Nsight Systems as the current backend and ROCProfiler planned; broaden
+  perf_advisor/__init__.py docstring to match
 - Add `phase` and `evidence` columns to the hypotheses rich table in __main__.py;
   phase appears after Type, evidence appears after Description
 - Add `phase` field to hypothesis schema (_HYPOTHESIS_SCHEMA): LLM must now cite
@@ -49,7 +56,7 @@ changelog — nsight_agent
 - Replace unconditional *_prompt.txt / *_response.txt / *_output.txt file saving
   with opt-in --log / --log-file and --transcript / --transcript-file flags on
   analyze and compare subcommands; no files are written to disk unless requested
-- Add nsight_agent/agent/logger.py: LLMLogger context manager that writes a
+- Add perf_advisor/agent/logger.py: LLMLogger context manager that writes a
   structured log of every API request and response in real time (with flush after
   each write so partial logs are valid on failure); header includes command, argv,
   provider, model, profile path, and start timestamp
@@ -159,7 +166,7 @@ changelog — nsight_agent
 - Add `--exact-token-count` flag to `analyze` and `compare`: use Anthropic's
   `client.messages.count_tokens()` API for an exact input count instead of the char/4
   heuristic; no-ops with a note for non-Anthropic providers
-- Add `nsight_agent/agent/preflight.py`: `estimate_tokens_heuristic(*texts)` and
+- Add `perf_advisor/agent/preflight.py`: `estimate_tokens_heuristic(*texts)` and
   `count_tokens_exact(provider, model, system_prompt, *user_texts, tools=None)`
 - Consolidate `--provider` flag into `--model`: `_parse_provider_and_model` now
   accepts only the model string; a bare provider name (e.g. `--model=openai`)
@@ -174,14 +181,14 @@ changelog — nsight_agent
   producing a structured `ComparisonReport` (narrative + key differences table
   ordered by magnitude); no tool-use loop — both summaries and a pre-computed
   structural diff are injected into one prompt
-- Add `nsight_agent/analysis/diff.py`: `compute_profile_diff()` aligns two
+- Add `perf_advisor/analysis/diff.py`: `compute_profile_diff()` aligns two
   `ProfileSummary` objects and determines comparison mode:
     - `phase_aware` — same phase count + names; full per-phase analysis
     - `summary` — phases differ but Jaccard kernel overlap >= 20%; per-kernel diff included
     - `summary_no_kernel` — phases differ and overlap < 20%; top-level metrics only
   Jaccard similarity used for kernel overlap; status message shown before LLM call
   (e.g. "Phases do not match (A has 4, B has 6) and kernel overlap is 8%...")
-- Add `nsight_agent/agent/compare.py`: `run_compare()` single-shot backends for
+- Add `perf_advisor/agent/compare.py`: `run_compare()` single-shot backends for
   Anthropic, OpenAI, Gemini, and claude_code; saves `{stem_a}_vs_{stem_b}_{ts}_prompt.txt`
   and `_response.txt` alongside the profile
 - Add `ScalarDiff`, `KernelDiff`, `MemcpyDiff`, `MpiDiff`, `ProfileDiff`,
@@ -238,13 +245,13 @@ changelog — nsight_agent
 - Add "Action" column (magenta, abbreviated) to hypotheses table in `cmd_analyze`
 - Update `README.md`: document `action_category` field in hypothesis output
 - Add `eval/score.py` — standalone independent hypothesis evaluator; scores
-  nsight-agent hypothesis JSON using gpt-5.4 on six criteria (bottleneck
+  perf-advisor hypothesis JSON using gpt-5.4 on six criteria (bottleneck
   alignment, addressability, mechanistic plausibility, specificity/actionability,
   testability, generality) plus implementation-cost and correctness-risk flags
   and a list-level redundancy score; writes `.eval.json` alongside input
 - Add `eval/context_example.yaml` — template for injecting application/phase
   context into the evaluator prompt (critical for addressability scoring)
-- Add `eval/` to `.gitignore` — evaluator is intentionally separate from nsight-agent
+- Add `eval/` to `.gitignore` — evaluator is intentionally separate from perf-advisor
 - Add rich terminal table to `eval/score.py` — displays per-hypothesis scores (color-coded
   1–5), implementation-cost and correctness-risk flags, and per-hypothesis average; footer
   shows redundancy score and overall aggregate
@@ -279,7 +286,7 @@ changelog — nsight_agent
   - `_run_openai()` — function-calling loop via openai>=1.0
   - `_run_gemini()` — Gemini start_chat() loop via google-genai
   - `--provider {anthropic,openai,gemini}` flag added to CLI
-  - New optional extras: `pip install 'nsight-agent[openai]'` / `[gemini]`
+  - New optional extras: `pip install 'perf-advisor[openai]'` / `[gemini]`
 - CPU-GPU overlap metrics (4d6c67f)
   - `KernelSummary`: avg/max launch overhead (µs) per kernel name
   - `ProfileSummary`: `cpu_sync_blocked_s` / `cpu_sync_blocked_pct`

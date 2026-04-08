@@ -30,11 +30,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from nsight_agent.analysis.metrics import compute_profile_summary
-from nsight_agent.analysis.models import ProfileSummary
-from nsight_agent.agent.logger import LLMLogger
-from nsight_agent.agent.tools import dispatch, tool_schemas
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.analysis.metrics import compute_profile_summary
+from perf_advisor.analysis.models import ProfileSummary
+from perf_advisor.agent.logger import LLMLogger
+from perf_advisor.agent.tools import dispatch, tool_schemas
+from perf_advisor.ingestion.profile import NsysProfile
 
 MODEL = "claude-opus-4-6"
 
@@ -367,7 +367,7 @@ def _run_api(
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     import anthropic
 
-    from nsight_agent.agent.preflight import estimate_json_tokens, estimate_prose_tokens
+    from perf_advisor.agent.preflight import estimate_json_tokens, estimate_prose_tokens
 
     client = anthropic.Anthropic()
     schemas = tool_schemas()

@@ -12,7 +12,7 @@ import signal
 import threading
 from typing import Any
 
-from nsight_agent.analysis.metrics import (
+from perf_advisor.analysis.metrics import (
     compute_gap_histogram,
     compute_gpu_kernel_time,
     compute_memcpy_by_kind,
@@ -29,7 +29,7 @@ from nsight_agent.analysis.metrics import (
     _window_streams,
     _window_top_kernels,
 )
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.profile import NsysProfile
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +126,8 @@ def tool_stream_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
 
 def tool_phase_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Return the profile segmented into sequential execution phases."""
-    from nsight_agent.analysis.metrics import compute_phase_summary
-    from nsight_agent.analysis.phases import detect_phases
+    from perf_advisor.analysis.metrics import compute_phase_summary
+    from perf_advisor.analysis.phases import detect_phases
 
     max_phases = int(args.get("max_phases", 6))
     phases = detect_phases(profile, max_phases=max_phases)

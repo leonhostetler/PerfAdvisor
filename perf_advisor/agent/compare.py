@@ -20,8 +20,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from nsight_agent.analysis.models import ProfileDiff, ProfileSummary
-from nsight_agent.agent.logger import LLMLogger
+from perf_advisor.analysis.models import ProfileDiff, ProfileSummary
+from perf_advisor.agent.logger import LLMLogger
 
 _COMPARE_SYSTEM_PROMPT = """\
 You are a GPU performance engineer comparing two Nsight Systems profiles.
@@ -238,7 +238,7 @@ def run_compare(
 
     Returns the parsed ComparisonReport dict.
     """
-    from nsight_agent.agent.loop import _parse_provider_and_model
+    from perf_advisor.agent.loop import _parse_provider_and_model
 
     resolved_provider, resolved_model, _ = _parse_provider_and_model(model)
 
@@ -277,7 +277,7 @@ def run_compare(
         )
 
     if verbose:
-        from nsight_agent.agent.loop import _trunc
+        from perf_advisor.agent.loop import _trunc
 
         log(f"[← llm] {_trunc(text, 200)}")
 

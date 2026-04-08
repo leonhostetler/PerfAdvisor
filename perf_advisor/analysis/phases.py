@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.profile import NsysProfile
 
 
 @dataclass

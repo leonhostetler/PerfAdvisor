@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nsight-agent"
+name = "perf-advisor"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,7 +27,7 @@ gemini = [
 ]
 
 [project.scripts]
-nsight-agent = "nsight_agent.__main__:main"
+perf-advisor = "perf_advisor.__main__:main"
 
 [tool.ruff]
 line-length = 100

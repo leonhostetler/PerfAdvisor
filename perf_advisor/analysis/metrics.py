@@ -11,7 +11,7 @@ import math
 import re
 import time
 
-from nsight_agent.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.profile import NsysProfile
 
 from .models import (
     GapBucket,
