@@ -27,9 +27,9 @@ import importlib
 import json
 import os
 import subprocess
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 from nsight_agent.analysis.metrics import compute_profile_summary
@@ -185,6 +185,7 @@ def _turn_header(turn: int, max_turns: int, log: Callable[[str], None] = print) 
     log(f"\n{'─' * left}{label}{'─' * right}")
 
 
+
 def _save_files(
     profile_path: Path,
     prompt: str,
@@ -326,6 +327,8 @@ def _run_api(
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     import anthropic
 
+    from nsight_agent.agent.preflight import estimate_json_tokens, estimate_prose_tokens
+
     client = anthropic.Anthropic()
     schemas = tool_schemas()
     messages: list[dict] = _preseed_messages(profile, summary) if summary is not None else []
@@ -349,7 +352,26 @@ def _run_api(
     _cache_prev: dict | None = None   # turn N-1 (keep marker)
     _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)
 
+    # Estimated total and cached context sizes for the upcoming turn.
+    # Turn 1: full heuristic (no prior usage data); subsequent turns: exact from usage.
+    _next_ctx_estimate = (
+        estimate_prose_tokens(_build_system_prompt(grounded))
+        + estimate_json_tokens(json.dumps(messages, default=str))
+        + estimate_json_tokens(json.dumps(schemas))
+    )
+    _next_cached_estimate = 0  # nothing cached before the first call
+
     for turn in range(1, max_turns + 1):
+        if verbose:
+            _turn_header(turn, max_turns, log)
+            if _next_cached_estimate:
+                log(
+                    f"[local] Context size ≈ {_next_ctx_estimate:,} tokens"
+                    f" ({_next_cached_estimate:,} cached)"
+                )
+            else:
+                log(f"[local] Context size ≈ {_next_ctx_estimate:,} tokens")
+
         response = client.messages.create(
             model=model,
             max_tokens=4096,
@@ -361,10 +383,16 @@ def _run_api(
         output_tokens += response.usage.output_tokens
         cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
         cache_read_tokens += getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+        _ctx_total = (
+            response.usage.input_tokens
+            + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
+            + (getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+        )
+
         messages.append({"role": "assistant", "content": response.content})
 
         if verbose:
-            _turn_header(turn, max_turns, log)
             for block in response.content:
                 if hasattr(block, "text"):
                     log(f"[← llm] {_trunc(block.text)}")
@@ -418,6 +446,13 @@ def _run_api(
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
             tool_results.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
+
+        # Estimate context and cached size for the next turn.
+        # All of _ctx_total will be cache_read next turn; the new increment
+        # (assistant response + tool results) will be cache_creation.
+        _tool_results_tokens = estimate_json_tokens(json.dumps(tool_results, default=str))
+        _next_ctx_estimate = _ctx_total + response.usage.output_tokens + _tool_results_tokens
+        _next_cached_estimate = _ctx_total
 
         # Advance the sliding cache window: strip the oldest floating marker
         # (_cache_pprev), keep the previous turn's marker (_cache_prev), and

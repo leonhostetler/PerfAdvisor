@@ -39,8 +39,6 @@ def _print_timings(timings: dict[str, float]) -> None:
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     from nsight_agent.agent.loop import (
-        MAX_TURNS,
-        WARN_TURNS_BEFORE_LIMIT,
         _build_system_prompt,
         _parse_provider_and_model,
         check_provider_available,
@@ -631,7 +629,6 @@ def main() -> None:
             "main run). Falls back to heuristic for other providers."
         ),
     )
-
     p_compare = sub.add_parser("compare", help="Compare two profiles and summarize differences")
     p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
     p_compare.add_argument("profile_b", help="Path to second .sqlite profile")

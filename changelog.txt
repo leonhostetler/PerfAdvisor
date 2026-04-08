@@ -3,6 +3,25 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Remove rate-limiting feature (`--rate-limit-tpm`, `_rate_limit_sleep`, `_token_window`,
+  `rate_limit_tpm` param from `_run_api` and `run_agent`): Anthropic's rate limit does
+  not apply to cache reads; with sliding cache the non-cached increment per turn is only
+  ~1–3k tokens, making the rate limit effectively unreachable in normal use
+- Update per-turn context display in `_run_api`: shows `Context size ≈ X,XXX tokens
+  (Y,YYY cached)` from turn 2 onwards, where cached ≈ previous turn's total context;
+  turn 1 shows no cached count since nothing is in cache yet
+- Add `--rate-limit-tpm` flag to `analyze`: when set, `_run_api` tracks a 60-second
+  rolling token window (deque of monotonic timestamp + exact context size from
+  `response.usage`) and calls `_rate_limit_sleep` before each turn; `_rate_limit_sleep`
+  loops until the window has room, sleeping the exact number of seconds until the oldest
+  entry expires and printing a notification to the user each time it sleeps; single
+  requests that alone exceed the limit are passed through without sleeping; no-ops for
+  non-Anthropic providers; `run_agent` gains `rate_limit_tpm` parameter
+- Add per-turn context size display to `_run_api`: prints `Context size ≈ X,XXX tokens`
+  before each API call (turn 1 uses heuristic estimate from messages + schemas + system
+  prompt; subsequent turns use exact prior context + output + tool result estimate)
+- Move turn header display to before the API call in `_run_api` so it appears with the
+  context size line rather than after the (potentially long) API wait
 - Fix `cache_control` 4-block limit error and restore true sliding cache in `_run_api`:
   keep the 2 most-recent per-turn user messages marked (`_cache_prev` + `_cache_pprev`),
   stripping only the oldest on each advance; total markers stay at 4 (system + preseed +
