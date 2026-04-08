@@ -147,8 +147,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 )
             _input_tokens = (
                 estimate_prose_tokens(_system_prompt)
-                + estimate_json_tokens(_summary_json)
-                + estimate_json_tokens(_schemas_json)
+                + estimate_json_tokens(_summary_json, resolved_provider)
+                + estimate_json_tokens(_schemas_json, resolved_provider)
             )
             _input_label = "heuristic"
         else:
@@ -156,8 +156,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     else:
         _input_tokens = (
             estimate_prose_tokens(_system_prompt)
-            + estimate_json_tokens(_summary_json)
-            + estimate_json_tokens(_schemas_json)
+            + estimate_json_tokens(_summary_json, resolved_provider)
+            + estimate_json_tokens(_schemas_json, resolved_provider)
         )
         _input_label = "heuristic"
 
@@ -179,15 +179,24 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 f"  Model:       {resolved_model} ({resolved_provider})"
             )
         else:
-            _total_tokens = estimate_total_session_tokens(_input_tokens, _max_turns)
+            _lo_turns = min(5, _max_turns)
+            _total_lo = estimate_total_session_tokens(_input_tokens, _lo_turns)
+            _total_hi = estimate_total_session_tokens(_input_tokens, _max_turns)
             _cache_note = (
                 "\n  [dim](OpenAI applies automatic ~50% caching to repeated prefixes)[/dim]"
                 if resolved_provider == "openai"
                 else ""
             )
+            if _lo_turns < _max_turns:
+                _input_range = (
+                    f"~{_total_lo:,} – ~{_total_hi:,}"
+                    f" ({_lo_turns} – {_max_turns} turns, {_input_label})"
+                )
+            else:
+                _input_range = f"~{_total_hi:,} ({_input_label})"
             console.print(
                 f"\n[bold]Token estimate (total across up to {_max_turns} turns):[/bold]\n"
-                f"  Input:  ~{_total_tokens:,} ({_input_label}){_cache_note}\n"
+                f"  Input:  {_input_range}{_cache_note}\n"
                 f"  Output: ~{_output_lo:,} – {_output_hi:,}\n"
                 f"  Model:  {resolved_model} ({resolved_provider})"
             )
@@ -407,14 +416,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     " — using heuristic)[/dim]"
                 )
             _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
-                _compare_prompt
+                _compare_prompt, resolved_provider
             )
             _input_label = "heuristic"
         else:
             _input_label = "exact"
     else:
         _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
-            _compare_prompt
+            _compare_prompt, resolved_provider
         )
         _input_label = "heuristic"
 

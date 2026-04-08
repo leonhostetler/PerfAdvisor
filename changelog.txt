@@ -3,6 +3,19 @@ changelog — nsight_agent
 
 2026-04-07
 ----------
+- Fix preflight token overestimate for OpenAI/Gemini: `estimate_json_tokens` now accepts
+  a `provider` parameter with calibrated chars/token ratios (anthropic: 2.5, openai/gemini: 3.5);
+  `cmd_analyze` and `cmd_compare` pass `resolved_provider` through
+- Show input token estimate as a range (5 turns → max_turns) for OpenAI/Gemini rather than
+  a single worst-case figure; range collapses to a single number when max_turns ≤ 5
+- Add per-turn context size display to OpenAI and Gemini backends (matching Anthropic):
+  OpenAI uses `response.usage.prompt_tokens` and `prompt_tokens_details.cached_tokens`;
+  Gemini uses `usage_metadata.prompt_token_count` and `cached_content_token_count`
+- Fix OpenAI backend multi-turn bug: when `finish_reason == "stop"` but the model outputs
+  prose instead of a JSON array, the loop now injects a recovery prompt and continues rather
+  than returning `[]` immediately after a single turn
+- Fix OpenAI backend file saving: prompt and response are now saved unconditionally on stop,
+  not only when hypotheses are successfully extracted
 - Remove rate-limiting feature (`--rate-limit-tpm`, `_rate_limit_sleep`, `_token_window`,
   `rate_limit_tpm` param from `_run_api` and `run_agent`): Anthropic's rate limit does
   not apply to cache reads; with sliding cache the non-cached increment per turn is only

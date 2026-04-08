@@ -618,6 +618,20 @@ def _run_openai(
 
         if verbose:
             _turn_header(turn, max_turns, log)
+            if response.usage:
+                ctx_tokens = response.usage.prompt_tokens
+                cached_tokens = getattr(
+                    getattr(response.usage, "prompt_tokens_details", None),
+                    "cached_tokens",
+                    0,
+                ) or 0
+                if cached_tokens:
+                    log(
+                        f"[local] Context size ≈ {ctx_tokens:,} tokens"
+                        f" ({cached_tokens:,} cached)"
+                    )
+                else:
+                    log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
             if msg.content:
                 log(f"[← llm] {_trunc(msg.content)}")
             for tc in msg.tool_calls or []:
@@ -625,14 +639,26 @@ def _run_openai(
 
         if choice.finish_reason == "stop":
             hypotheses = _extract_hypotheses(msg.content or "")
+            prompt_record = (
+                f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
+                f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
+            )
+            _save_files(profile.path, prompt_record, msg.content or "", verbose, log)
             if hypotheses:
-                prompt_record = (
-                    f"=== SYSTEM PROMPT ===\n{_build_system_prompt(grounded)}\n\n"
-                    f"=== MESSAGE HISTORY ===\n{json.dumps(messages, indent=2, default=str)}"
-                )
-                _save_files(profile.path, prompt_record, msg.content or "", verbose, log)
                 return hypotheses, input_tokens, 0, 0, output_tokens
-            return [], input_tokens, 0, 0, output_tokens
+            # Model stopped without a valid JSON array — inject a recovery prompt and continue.
+            if verbose:
+                log("[local] stop with no JSON array — injecting recovery prompt")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your response did not contain the required JSON array of hypothesis objects. "
+                        "Output ONLY a JSON array now — no prose, no markdown fences."
+                    ),
+                }
+            )
+            continue
 
         # finish_reason == "tool_calls"
         for tc in msg.tool_calls or []:
@@ -773,6 +799,18 @@ def _run_gemini(
 
         if verbose:
             _turn_header(turn, max_turns, log)
+            um = getattr(response, "usage_metadata", None)
+            if um:
+                ctx_tokens = getattr(um, "prompt_token_count", 0) or 0
+                cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
+                if ctx_tokens:
+                    if cached_tokens:
+                        log(
+                            f"[local] Context size ≈ {ctx_tokens:,} tokens"
+                            f" ({cached_tokens:,} cached)"
+                        )
+                    else:
+                        log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
             text = response.text or ""
             if text:
                 log(f"[← llm] {_trunc(text)}")

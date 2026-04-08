@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 # Empirically calibrated chars-per-token ratios.
-# English prose (system prompts, descriptions): ~4 chars/token.
-# JSON (profile summaries, diffs, tool schemas): ~2.5 chars/token.
-# JSON tokenizes less efficiently than prose because of dense numeric values,
-# repeated structural characters, and underscore-heavy field names.
+# English prose (system prompts, descriptions): ~4 chars/token across all providers.
+# JSON tokenization efficiency varies by provider tokenizer:
+#   Anthropic (Claude tokenizer): ~2.5 chars/token — dense numerics and structural
+#     punctuation tokenize less efficiently.
+#   OpenAI cl100k_base, Gemini SentencePiece: larger vocabularies and better BPE
+#     for technical content yield ~3.5 chars/token on profile JSON.
 _PROSE_CHARS_PER_TOKEN = 4.0
-_JSON_CHARS_PER_TOKEN = 2.5
+_JSON_CHARS_PER_TOKEN: dict[str, float] = {
+    "anthropic": 2.5,
+    "openai": 3.5,
+    "gemini": 3.5,
+}
+_JSON_CHARS_PER_TOKEN_DEFAULT = 2.5
 
 
 def estimate_prose_tokens(text: str) -> int:
@@ -16,14 +23,16 @@ def estimate_prose_tokens(text: str) -> int:
     return int(len(text) / _PROSE_CHARS_PER_TOKEN)
 
 
-def estimate_json_tokens(text: str) -> int:
-    """Estimate token count for JSON using the 2.5-chars/token heuristic.
+def estimate_json_tokens(text: str, provider: str = "anthropic") -> int:
+    """Estimate token count for JSON using a provider-specific chars/token ratio.
 
-    JSON tokenizes significantly less efficiently than prose (~2.5 chars/token
-    vs ~4) due to dense numeric values, structural punctuation, and
-    underscore-separated field names.
+    Ratio varies by tokenizer: Anthropic ~2.5, OpenAI/Gemini ~3.5.
+    JSON tokenizes less efficiently than prose for Anthropic due to dense numeric
+    values and structural punctuation, but OpenAI and Gemini tokenizers handle
+    JSON more efficiently owing to larger vocabularies.
     """
-    return int(len(text) / _JSON_CHARS_PER_TOKEN)
+    ratio = _JSON_CHARS_PER_TOKEN.get(provider, _JSON_CHARS_PER_TOKEN_DEFAULT)
+    return int(len(text) / ratio)
 
 
 def count_tokens_exact(
