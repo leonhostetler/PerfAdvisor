@@ -90,6 +90,11 @@ _HYPOTHESIS_SCHEMA = """\
 Each hypothesis object must have these fields:
   - bottleneck_type: one of [compute_bound, memory_bound, mpi_latency, mpi_imbalance,
                               cpu_launch_overhead, synchronization, io, other]
+  - phase: name of the execution phase this bottleneck belongs to. Use the name exactly as it
+           appears in the phase_summary results (e.g. "ev0", "ev1024", "profile"). If the
+           profile has no phase structure or only one phase, use "whole_profile".
+           The phase names are already present in the pre-seeded phase_summary data — use
+           those names directly; do not issue SQL queries to determine phase membership.
   - description: concise plain-English description of the bottleneck
   - evidence: specific numbers from the profile that support this hypothesis
   - suggestion: concrete, actionable recommendation

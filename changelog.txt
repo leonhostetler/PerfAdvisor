@@ -3,6 +3,32 @@ changelog — nsight_agent
 
 2026-04-08
 ----------
+- Add `phase` and `evidence` columns to the hypotheses rich table in __main__.py;
+  phase appears after Type, evidence appears after Description
+- Add `phase` field to hypothesis schema (_HYPOTHESIS_SCHEMA): LLM must now cite
+  the exact phase name from phase_summary results (or "whole_profile") for each
+  hypothesis; makes phase attribution unambiguous without requiring readers to infer
+  it from evidence text; added note that phase names are already in the pre-seeded
+  data so the LLM should not issue SQL queries to determine phase membership
+- Fix sql_query SELECT-only check to strip -- and /* */ comments before the
+  keyword check; LLM-generated queries often include a leading -- comment line
+  which caused legitimate SELECT queries to be incorrectly rejected
+- Add 30s automatic timeout to sql_query: a threading.Timer sets the same stop
+  event used by Ctrl-C; a separate timed_out flag distinguishes the two sources
+  so the LLM receives an actionable message ("Query timed out after 30s — avoid
+  self-joins / correlated subqueries, scope with timestamps, or use a structured
+  tool") rather than a bare "interrupted"
+- Add sql_query guardrails to prevent runaway queries hanging the process:
+  (1) SELECT/WITH-only filter — blocks PRAGMA, ATTACH, and write statements;
+  (2) LIMIT injection — appends LIMIT 200 to queries that omit it;
+  (3) SQLite progress handler in NsysProfile.query_safe() fires every 1000 VM
+      instructions and raises OperationalError if a threading.Event is set,
+      making every query interruptible; SIGINT is wired to that event so Ctrl-C
+      works even while SQLite is running in its C extension;
+  (4) 100 KB byte cap — result dicts over 100 KB are blocked with an actionable
+      error message telling the LLM to narrow its query or use a structured tool;
+  all four guardrails apply to all three backends (Anthropic, OpenAI, Gemini)
+  via the shared dispatch() / tool_sql_query() path
 - Add SQL schema reference block (_SQL_SCHEMA_REFERENCE) to the multi-turn system
   prompt: lists exact column names for CUPTI_ACTIVITY_KIND_KERNEL (start/end/shortName/
   demangledName/grid/block/registers/sharedMem/streamId/correlationId),

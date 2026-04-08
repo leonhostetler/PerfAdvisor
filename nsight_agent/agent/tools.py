@@ -7,6 +7,9 @@ a JSON-serializable dict. The tool schemas follow the Anthropic tool-use format.
 from __future__ import annotations
 
 import json
+import re
+import signal
+import threading
 from typing import Any
 
 from nsight_agent.analysis.metrics import (
@@ -136,6 +139,10 @@ def tool_phase_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     return {"phases": [s.model_dump() for s in summaries]}
 
 
+_SQL_RESULT_BYTE_LIMIT = 100_000  # 100 KB
+_SQL_TIMEOUT_S = 30  # seconds before a query is automatically interrupted
+
+
 def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     """Execute an arbitrary read-only SQL query against the profile SQLite database.
 
@@ -147,11 +154,81 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     sql = args.get("sql", "").strip()
     if not sql:
         return {"error": "No SQL provided"}
+
+    # Only SELECT / WITH (CTE) statements are permitted. Writes are already
+    # blocked by the read-only connection, but ATTACH, PRAGMA with side-effects,
+    # etc. are also disallowed here.
+    # Strip -- and /* */ comments before checking so leading comments don't
+    # cause legitimate SELECT queries to be rejected.
+    sql_norm = re.sub(r"--[^\n]*|/\*.*?\*/", "", sql, flags=re.DOTALL).lstrip().upper()
+    if not (sql_norm.startswith("SELECT") or sql_norm.startswith("WITH")):
+        return {
+            "error": (
+                "Only SELECT queries are permitted. "
+                "Use get_table_schema for schema inspection."
+            )
+        }
+
+    # Inject LIMIT 200 if none is present so the query cannot return a
+    # pathologically large result set.
+    if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+        sql = sql.rstrip(";") + " LIMIT 200"
+
+    # stop event shared by the timeout timer and the SIGINT handler.
+    # timed_out flag distinguishes which source fired so we can give the LLM
+    # a more actionable error message.
+    stop = threading.Event()
+    timed_out = threading.Event()
+
+    def _on_timeout() -> None:
+        timed_out.set()
+        stop.set()
+
+    timer = threading.Timer(_SQL_TIMEOUT_S, _on_timeout)
+
+    # Wire SIGINT to the same stop event so Ctrl-C also interrupts SQLite.
+    # Only installed on the main thread; worker threads are left alone.
+    orig_handler = signal.getsignal(signal.SIGINT)
+    on_main_thread = threading.current_thread() is threading.main_thread()
+
+    def _on_sigint(sig: int, frame: object) -> None:
+        stop.set()
+        signal.signal(signal.SIGINT, orig_handler)  # restore so next Ctrl-C terminates
+
+    if on_main_thread:
+        signal.signal(signal.SIGINT, _on_sigint)
+    timer.start()
     try:
-        rows = profile.query(sql)[:200]
-        return {"rows": [dict(r) for r in rows], "count": len(rows)}
+        rows = profile.query_safe(sql, stop_event=stop, row_limit=200)
     except Exception as e:
+        if timed_out.is_set():
+            return {
+                "error": (
+                    f"Query timed out after {_SQL_TIMEOUT_S}s. "
+                    "The query was too expensive to complete. "
+                    "Simplify it: avoid self-joins and correlated subqueries on large tables, "
+                    "scope with a WHERE clause on start/end timestamps, "
+                    "or use a structured tool (top_kernels, mpi_summary, etc.) instead."
+                )
+            }
         return {"error": str(e)}
+    finally:
+        timer.cancel()
+        if on_main_thread:
+            signal.signal(signal.SIGINT, orig_handler)
+
+    result = {"rows": [dict(r) for r in rows], "count": len(rows)}
+    result_bytes = len(json.dumps(result, default=str))
+    if result_bytes > _SQL_RESULT_BYTE_LIMIT:
+        return {
+            "error": (
+                f"Result too large ({len(rows)} rows, {result_bytes:,} bytes after serialization). "
+                "Narrow your query: add a WHERE clause scoped to a time window, "
+                "select specific columns instead of *, or use the structured tools "
+                "(top_kernels, memcpy_summary, mpi_summary, etc.) for pre-aggregated data."
+            )
+        }
+    return result
 
 
 def tool_get_table_schema(profile: NsysProfile, args: dict[str, Any]) -> dict:
@@ -342,7 +419,9 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                 "Tables include: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_MEMCPY, "
                 "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION, NVTX_EVENTS, MPI_COLLECTIVES_EVENTS, "
                 "MPI_P2P_EVENTS, MPI_START_WAIT_EVENTS, StringIds (resolves integer name IDs), "
-                "ENUM_* (resolve integer kind/type codes). Returns up to 200 rows. "
+                "ENUM_* (resolve integer kind/type codes). "
+                "Constraints: only SELECT/WITH queries are accepted; LIMIT 200 is injected "
+                "automatically if absent; results over 100 KB are blocked with an error. "
                 "SQLite only — PERCENTILE_CONT, MEDIAN, and STDDEV are not supported."
             ),
             "input_schema": {

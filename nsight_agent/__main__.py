@@ -273,9 +273,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     table = Table(title=f"Hypotheses — {Path(args.profile).name}", show_lines=True)
     table.add_column("#", style="dim", width=3)
     table.add_column("Type", style="cyan")
+    table.add_column("Phase", style="dim")
     table.add_column("Impact", style="bold")
     table.add_column("Action", style="magenta")
     table.add_column("Description")
+    table.add_column("Evidence", style="dim")
     table.add_column("Suggestion")
 
     _ACTION_ABBREV = {
@@ -294,9 +296,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         table.add_row(
             str(i),
             h.get("bottleneck_type", "—"),
+            h.get("phase", "—"),
             f"[{impact_color}]{h.get('expected_impact', '—')}[/{impact_color}]",
             action_str,
             h.get("description", ""),
+            h.get("evidence", ""),
             h.get("suggestion", ""),
         )
 

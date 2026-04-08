@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,31 @@ class NsysProfile:
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         """Execute a SQL query and return all rows."""
         return self._conn.execute(sql, params).fetchall()
+
+    def query_safe(
+        self,
+        sql: str,
+        stop_event: threading.Event | None = None,
+        row_limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Execute a SQL query with interrupt support and a row limit.
+
+        Installs a SQLite progress handler that fires every 1000 VM instructions
+        and checks stop_event; if the event is set, SQLite raises
+        OperationalError('interrupted'), which propagates to the caller.
+        Uses fetchmany(row_limit) so Python never materialises more rows than
+        needed even if LIMIT was not injected into the SQL.
+        """
+        if stop_event is not None:
+            def _progress() -> int:
+                return 1 if stop_event.is_set() else 0
+            self._conn.set_progress_handler(_progress, 1000)
+        try:
+            cursor = self._conn.execute(sql)
+            return cursor.fetchmany(row_limit)
+        finally:
+            if stop_event is not None:
+                self._conn.set_progress_handler(None, 0)
 
     def query_df(self, sql: str, params: tuple[Any, ...] = ()):
         """Execute a SQL query and return a pandas DataFrame."""
