@@ -5,6 +5,20 @@ build-backend = "hatchling.build"
 [project]
 name = "perf-advisor"
 version = "0.1.0"
+description = "AI agent for analyzing GPU/accelerator performance profiles in HPC applications."
+license = { file = "LICENSE" }
+authors = [{ name = "Leon Hostetler", email = "leonhost@iu.edu" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Hardware",
+]
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
@@ -25,6 +39,11 @@ openai = [
 gemini = [
     "google-generativeai>=0.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/leonhostetler/PerfAdvisor"
+Source = "https://github.com/leonhostetler/PerfAdvisor"
+Issues = "https://github.com/leonhostetler/PerfAdvisor/issues"
 
 [project.scripts]
 perf-advisor = "perf_advisor.__main__:main"

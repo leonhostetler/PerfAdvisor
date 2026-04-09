@@ -6,9 +6,7 @@ eval/
 
 # Personal / session notes
 CLAUDE.md
-LEON.md
 done.md
-other_ideas.md
 
 # Python
 __pycache__/
@@ -28,6 +26,13 @@ build/
 .vscode/
 .idea/
 *.swp
+
+# Profile exports and agent output logs
+*.sqlite
+*_log.txt
+
+# Environment / secrets
+.env
 
 # OS
 .DS_Store

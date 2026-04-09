@@ -20,7 +20,11 @@ class NsysProfile:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"Profile not found: {self.path}")
-        self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        try:
+            self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            self._conn.execute("SELECT * FROM sqlite_master LIMIT 1")
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"Not a valid SQLite file: {self.path}") from exc
         self._conn.row_factory = sqlite3.Row
         try:
             file_size = self.path.stat().st_size

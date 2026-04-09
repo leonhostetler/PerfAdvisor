@@ -441,18 +441,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             )
             if not args.quiet:
                 console.print(f"  LLM log:    {_log_path}")
-        hypotheses = run_agent(
-            primary_profile,
-            summary=summary,
-            cross_rank_summary=cross_rank_summary,
-            verbose=not args.quiet,
-            model=args.model,
-            max_turns=args.max_turns,
-            token_usage=token_usage,
-            grounded=not args.allow_app_knowledge,
-            log=log,
-            logger=_logger,
-        )
+        try:
+            hypotheses = run_agent(
+                primary_profile,
+                summary=summary,
+                cross_rank_summary=cross_rank_summary,
+                verbose=not args.quiet,
+                model=args.model,
+                max_turns=args.max_turns,
+                token_usage=token_usage,
+                grounded=not args.allow_app_knowledge,
+                log=log,
+                logger=_logger,
+            )
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
     timings["agent_s"] = time.perf_counter() - t_agent
 
     if args.json:
@@ -713,18 +717,22 @@ def cmd_compare(args: argparse.Namespace) -> None:
             )
             if not args.quiet:
                 console.print(f"  LLM log:    {_log_path}")
-        report = run_compare(
-            args.profile_a,
-            args.profile_b,
-            summary_a=summary_a,
-            summary_b=summary_b,
-            diff=diff,
-            model=args.model,
-            verbose=not args.quiet,
-            token_usage=token_usage,
-            log=log,
-            logger=_logger,
-        )
+        try:
+            report = run_compare(
+                args.profile_a,
+                args.profile_b,
+                summary_a=summary_a,
+                summary_b=summary_b,
+                diff=diff,
+                model=args.model,
+                verbose=not args.quiet,
+                token_usage=token_usage,
+                log=log,
+                logger=_logger,
+            )
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -853,7 +861,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="perf-advisor")
     sub = parser.add_subparsers(dest="command")
 
-    p_analyze = sub.add_parser("analyze", help="Run agent hypothesis generation on a profile")
+    p_analyze = sub.add_parser(
+        "analyze",
+        help="Run agent hypothesis generation on a profile",
+        description=(
+            "Run agent hypothesis generation on a profile. "
+            "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
+            "configured LLM API provider. See README for details."
+        ),
+    )
     p_analyze.add_argument(
         "profile",
         nargs="+",
@@ -952,7 +968,15 @@ def main() -> None:
         metavar="PATH",
         help="Save the terminal transcript to PATH (implies --transcript).",
     )
-    p_compare = sub.add_parser("compare", help="Compare two profiles and summarize differences")
+    p_compare = sub.add_parser(
+        "compare",
+        help="Compare two profiles and summarize differences",
+        description=(
+            "Compare two profiles and summarize differences. "
+            "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
+            "configured LLM API provider. See README for details."
+        ),
+    )
     p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
     p_compare.add_argument("profile_b", help="Path to second .sqlite profile")
     p_compare.add_argument("--json", action="store_true", help="Output raw JSON")
@@ -1020,14 +1044,18 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.command == "analyze":
-        cmd_analyze(args)
-    elif args.command == "compare":
-        cmd_compare(args)
-    elif args.command == "summary":
-        cmd_summary(args)
-    else:
-        parser.print_help()
+    try:
+        if args.command == "analyze":
+            cmd_analyze(args)
+        elif args.command == "compare":
+            cmd_compare(args)
+        elif args.command == "summary":
+            cmd_summary(args)
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
 

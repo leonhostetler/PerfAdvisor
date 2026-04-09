@@ -5,6 +5,20 @@ changelog — perf_advisor
 ----------
 - Fix missing phase detection and metrics timing in multi-rank mode: accumulate
   per-rank timings into the shared dict so the timing breakdown table is complete.
+- Add MIT LICENSE file (pre-release legal requirement).
+- Add project metadata to pyproject.toml: description, license, authors, classifiers,
+  and [project.urls] pointing to https://github.com/leonhostetler/PerfAdvisor.
+- Update .gitignore: remove LEON.md and other_ideas.md (no longer in this directory);
+  add *.sqlite, *_log.txt, and .env.
+- Add Data Privacy section to README near the top, and data privacy notice to the
+  `analyze` and `compare` subcommand descriptions (visible in --help output).
+- Add user-facing error handling: clean error message for missing/invalid SQLite profile
+  (validated in NsysProfile.__init__); clean RuntimeError with env var instructions for
+  missing ANTHROPIC_API_KEY or OPENAI_API_KEY; top-level FileNotFoundError/ValueError
+  handler in main() for all profile-related errors.
+- Update README: expand intro blurb to list multi-rank, comparison, and multi-provider
+  capabilities; add --max-phases, --log-file, --transcript-file to compare usage examples;
+  add tested platform note (Ubuntu 24.04.4 LTS, Nsight Systems 2025.3.1.90, schema 3.20.2).
 
 2026-04-08
 ----------

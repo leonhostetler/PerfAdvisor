@@ -1,6 +1,6 @@
 # Todo List — perf_advisor Improvements
 
-## 3. Iterative hypothesis refinement
+## 1. Iterative hypothesis refinement
 
 Extend the multi-turn API backend to perform a second reasoning pass:
 
@@ -8,7 +8,7 @@ Extend the multi-turn API backend to perform a second reasoning pass:
 - Increase `MAX_TURNS` accordingly and add a "confirmation" phase to the agent loop in `perf_advisor/agent/loop.py`.
 - This turns the current single-pass analysis into a two-stage reasoning loop: hypothesis generation → evidence gathering → final ranked output.
 
-## 6. Hypothesis evaluation agent
+## 2. Hypothesis evaluation agent
 
 A second agent pass that runs after the primary agent and scores/filters hypotheses for grounding, applicability, and whether the optimization is already implemented. Opt-in: only runs when at least one of `--build-log`, `--run-log`, or `--source-dir` is provided (unless lightweight mode is added — see open questions).
 
@@ -80,46 +80,9 @@ Add evaluation fields to the hypothesis TypedDict so `--json` output is self-des
 
 2. **Should the evaluator ever add hypotheses?** Scope-limited answer is no. But it could in principle notice something while reading the build log that the primary agent missed (e.g., fast math is disabled, a relevant compiler flag is absent). If yes, needs a `submit_hypotheses` tool and increases scope significantly. Recommendation: keep it purely evaluative for now.
 
-3. **Dependency on todo item 2**: demangled kernel names are the natural codebase navigation keys. Without them, the evaluator can only search by short names ("Kernel3D"), which is far less precise. Strongly recommend implementing item 2 before item 6.
+3. **Dependency on todo item 2**: demangled kernel names are the natural codebase navigation keys. Without them, the evaluator can only search by short names ("Kernel3D"), which is far less precise. Strongly recommend implementing item 2 before item 6. 
 
-## 7. Multi-model ensemble hypothesis generation
-
-Run `run_agent()` against N models in parallel and merge all hypothesis lists before display.
-
-### Motivation
-
-Different models have different training cutoffs and reasoning patterns for GPU performance tuning. Ensemble coverage reduces blind spots any single model has. The marginal implementation cost is low if the evaluator (item 6) is already running: the merged list is passed to the evaluator just as a single-model list would be, and the evaluator handles deduplication/filtering.
-
-### Design
-
-**New CLI flag on `p_analyze`:**
-
-- `--multi-model model1,model2,...` — run the primary agent with each specified model (or provider-prefixed model, e.g. `anthropic:claude-opus-4-6,openai:gpt-4o`). Models run concurrently via `ThreadPoolExecutor`. Results are merged before the evaluator step.
-
-**Deduplication / merge step** (`perf_advisor/agent/merge.py` or inline in `__main__.py`):
-
-Two options, in order of implementation complexity:
-
-1. **Structural deduplication** — group hypotheses that share the same `bottleneck_type` and the same top-mentioned kernel name; keep the best-worded version (longest `description` or highest `confidence`). Simple, no extra LLM call.
-2. **Synthesis pass** — a short Haiku call that receives all N lists and outputs one deduplicated, best-of-N list with a `source_models` field per hypothesis. Cleaner output but adds latency and cost.
-
-Recommendation: start with structural deduplication (option 1). Add `source_models: list[str]` field to each hypothesis so the output table can show which model(s) agreed.
-
-**`token_usage` aggregation:** sum input/output tokens across all model runs and display the total cost.
-
-### Ordering and dependencies
-
-- Implement after item 6 (evaluator) is working — the evaluator naturally absorbs the merged list without changes.
-- Item 5 (`action_category`) should be implemented first so categories are consistent across models before merging.
-- No dependency on item 2, but demangled names improve deduplication accuracy (structural grouping by kernel name is more precise with full demangled names).
-
-### Open design questions
-
-1. **Default behavior**: should `--multi-model` be the only entry point, or should there be a `--ensemble` flag that auto-selects all available providers? Auto-selection is convenient but makes cost unpredictable.
-2. **Disagreement signal**: when two models disagree (one flags a kernel as memory-bound, another as compute-bound), should that disagreement be surfaced to the user rather than silently deduplicating? Could add a `consensus: "agree" | "disagree" | "unique"` field per hypothesis.
-3. **Synthesis model choice**: if using option 2 (synthesis pass), Haiku is the right default (classification task, not open-ended reasoning). But the synthesis prompt needs to be careful not to hallucinate evidence that wasn't in any model's output.
-
-## 9. Nsight Systems version compatibility
+## 3. Nsight Systems version compatibility
 
 Ensure perf-advisor works with profiles generated by older and newer Nsight Systems versions. The SQLite schema has changed across releases — tables, columns, and enum values have been added, renamed, or restructured.
 
@@ -143,67 +106,7 @@ Ensure perf-advisor works with profiles generated by older and newer Nsight Syst
 1. **How to detect Nsight version**: some profiles have a metadata table (e.g., `COLLECTOR_INFO` or `TARGET_INFO_SESSION`) with a version string; others do not. Fall back to schema introspection (`PRAGMA table_info(...)`) to detect which columns are present.
 2. **Minimum supported version**: pick a floor (e.g., Nsight Systems 2022.1) below which we explicitly warn but do not guarantee results. This bounds the compatibility matrix.
 
-## 10. Update README.md
-
-Update `README.md` after all other todo items are complete to reflect the final feature set, CLI flags, and architecture.
-
-Sections to update or add:
-
-- **Feature list** — add action categories, evaluator pass, multi-model ensemble, pre-flight cost estimate, version compatibility note
-- **CLI reference** — document all new flags added by items 5–9 (`--build-log`, `--run-log`, `--source-dir`, `--no-evaluate`, `--evaluate-model`, `--show-filtered`, `--multi-model`, `--yes`, `--exact-token-count`)
-- **Architecture diagram / description** — reflect the two-stage pipeline (primary agent → evaluator) and optional ensemble path
-- **Supported Nsight Systems versions** — document the tested version range (from item 9)
-- **Cost and token usage** — brief note on the pre-flight estimate feature and how to suppress it
-
-This item has no implementation work; it is purely documentation. Do it last.
-
-## 11. Pre-release / public readiness
-
-Checklist of work required before perf-advisor can be made public. None of these items depend on items 1–10 being complete; they can be done in parallel.
-
-### Legal and licensing
-
-- **Add `LICENSE` file** — required before any public release. Pick a license (MIT is the simplest for a tool like this).
-- **Add `[project.urls]`, `description`, `authors`, and `classifiers` to `pyproject.toml`** — needed for a proper PyPI listing and expected even for a GitHub-only release.
-
-### Repository hygiene
-
-- **`.gitignore`** — verify it covers: `.venv/`, `__pycache__/`, `*.sqlite` (exported profile files), `*_prompt.txt` / `*_response.txt` (agent output files saved next to profiles), `.env`.
-- **`LEON.md`** — currently modified and tracked by git. Decide whether this is personal notes that should be removed before the repo goes public.
-- **`CHANGELOG`** — add a changelog file, even if it just has a single `0.1.0` entry.
-
-### CI
-
-- Add a GitHub Actions workflow (`.github/workflows/ci.yml`) that runs `ruff check . && ruff format --check .` and `pytest` on push and pull request.
-- This requires the portable test fixtures below — CI cannot use the real test profile at `/home/ads.leonhost/Downloads/...`.
-
-### Portable test fixtures
-
-- Current tests are integration tests tied to a hardcoded absolute path. They cannot run in CI or on any other machine.
-- Create a small synthetic SQLite fixture (a few hundred rows of fake `CUPTI_ACTIVITY_KIND_KERNEL`, `TARGET_INFO_GPU`, etc.) that covers the core metric functions. Store it in `tests/fixtures/`.
-- Keep the real-profile tests as an optional slow suite (e.g., `pytest -m slow`) that skips automatically if the file is absent.
-- Add mock-based tests for the agent loop: tool dispatch, multi-turn logic, provider routing. These should not require a real API key.
-
-### User-facing error handling
-
-- **Missing API key**: currently raises a raw SDK exception. Catch and emit a clean error message pointing to the relevant env var.
-- **Profile not found or not a valid SQLite**: emit a clear error before attempting any queries.
-- **`--version` flag**: add to the CLI (`perf-advisor --version`). Wire to the version string in `pyproject.toml` via `importlib.metadata.version("perf-advisor")`.
-
-### Privacy and data disclosure
-
-The README Risks section covers hallucination and SQL injection but does not explicitly state that profile data (kernel names, NVTX annotations, timing data) is sent to a third-party LLM API. For HPC users at institutions with data governance policies, this must be stated clearly and prominently — not buried in a risks subsection. Add a dedicated **Data Privacy** notice near the top of the README and in the `analyze` command's help text.
-
-### Distribution
-
-- Add `build` and `twine` to the `[dev]` extras in `pyproject.toml`.
-- Document the release process (tag → `python -m build` → `twine upload`) somewhere, even if just in a `CONTRIBUTING.md` or a comment in `pyproject.toml`.
-
-### Priority order
-
-License → `.gitignore` / `LEON.md` → portable test fixtures → CI → clean error handling → `--version` → privacy disclosure → PyPI metadata → distribution docs.
-
-## 12. Multi-profiler support (long-term)
+## 4. Multi-profiler support (long-term)
 
 Extend perf-advisor to ingest profiles from HPC profilers other than Nsight Systems. The analysis and agent layers already work through `ProfileSummary` and would be largely unaffected; the work is in ingestion adapters and making the agent prompt architecture-aware.
 
@@ -230,3 +133,39 @@ Extend perf-advisor to ingest profiles from HPC profilers other than Nsight Syst
 Introduce a `ProfileAdapter` abstraction: each profiler has an adapter that reads its native format and populates a normalized `ProfileSummary`. The analysis and agent layers are unchanged. The `sql_query` tool becomes optional or adapter-specific — adapters that can provide a queryable backend expose it; others do not.
 
 A `--profiler {nsight,rocprof,scorep}` flag on the CLI selects the adapter. Auto-detection from file extension is a nice-to-have.
+
+## 5. CI
+
+Add a GitHub Actions workflow (`.github/workflows/ci.yml`) that runs linting and tests on every push and pull request.
+
+### What to add
+
+- **`.github/workflows/ci.yml`** — runs on `push` and `pull_request` to `master`:
+  1. `ruff check . && ruff format --check .`
+  2. `pytest`
+- Python version matrix: at minimum 3.11 and 3.12.
+- No real profile or API key required — all tests use the synthetic fixture in `conftest.py`.
+
+### Notes
+
+- The `[dev]` extras in `pyproject.toml` (`pytest`, `pytest-cov`, `ruff`) are already the right install target for CI: `pip install -e ".[dev]"`.
+- Optional providers (`openai`, `gemini`) do not need to be installed in CI unless provider-specific tests are added.
+
+## 6. Distribution / PyPI release
+
+Work required to publish perf-advisor to PyPI.
+
+### What to add
+
+- **`pyproject.toml`** — add `build` and `twine` to a new `[project.optional-dependencies]` group (e.g., `publish`) or to `dev`.
+- **Release process documentation** — document the steps somewhere (a `CONTRIBUTING.md`, a comment block in `pyproject.toml`, or a `## Release` section in the README):
+  1. Bump `version` in `pyproject.toml`
+  2. Tag the commit: `git tag v0.x.y && git push --tags`
+  3. Build: `python -m build`
+  4. Upload: `twine upload dist/*`
+
+### Notes
+
+- `pyproject.toml` already has `description`, `authors`, `classifiers`, and `[project.urls]` — the package is PyPI-ready metadata-wise.
+- Depends on the repo being public on GitHub first.
+- Add `--version` flag to the CLI at this point: `perf-advisor --version` via `argparse action="version"` wired to `importlib.metadata.version("perf-advisor")`. Deferred from todo 11 because versioning hadn't been decided yet.

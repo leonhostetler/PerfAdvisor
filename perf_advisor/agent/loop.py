@@ -389,6 +389,11 @@ def _run_api(
 
     from perf_advisor.agent.preflight import estimate_json_tokens, estimate_prose_tokens
 
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Export it before running: export ANTHROPIC_API_KEY=sk-ant-..."
+        )
     client = anthropic.Anthropic()
     schemas = tool_schemas()
     messages: list[dict] = (
@@ -679,6 +684,11 @@ def _run_openai(
     except ImportError:
         raise ImportError("openai package is required for the OpenAI backend: pip install openai")
 
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Export it before running: export OPENAI_API_KEY=sk-..."
+        )
     client = OpenAI()
     schemas = tool_schemas()
     openai_tools = _schemas_to_openai(schemas)

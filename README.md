@@ -1,8 +1,29 @@
 # PerfAdvisor
 
-An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Currently supports NVIDIA Nsight Systems (`.sqlite`); AMD ROCProfiler support is planned. Extracts structured metrics from a profile, then uses an LLM to reason over the data and produce a ranked list of actionable performance hypotheses.
+An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Currently supports NVIDIA Nsight Systems (`.sqlite`); AMD ROCProfiler support is planned.
+
+- Extracts structured metrics from a profile and uses an LLM to produce a ranked list of actionable performance hypotheses, each with a bottleneck type, evidence, suggested fix, expected impact, and effort category.
+- **Multi-rank MPI analysis** — pass profiles from all ranks to detect load imbalance, identify the straggler rank, and get cross-rank per-phase imbalance scores alongside the standard hypothesis output.
+- **Profile comparison** — compare two profiles (e.g. before/after an optimization) and get a structured narrative and key-differences table.
+- **Multi-provider** — works with Anthropic (default), OpenAI, and Google Gemini; provider is auto-detected from available API keys.
 
 This tool was built with heavy AI coding assistance ("vibe coded"). The SQL queries, metric calculations, and analysis logic have not been exhaustively validated — they look plausible but may contain subtle errors in unit conversions, aggregations, or edge-case handling. Treat the numbers as starting points for investigation rather than ground truth, and verify anything surprising directly against the SQLite database or the Nsight Systems GUI.
+
+---
+
+## Data Privacy
+
+**Profile data is sent to a third-party LLM API when you run `analyze` or `compare`.** This includes kernel names (including full demangled template names such as `quda::Kernel3D<dslash_functor<...>>`), NVTX annotation text, timing metrics, grid and block dimensions, memory transfer statistics, and MPI operation names. The raw `.sqlite` file is never transmitted — only the structured summary extracted from it and any follow-up tool call results.
+
+**Why this matters for HPC users:** Demangled kernel names can reveal algorithmic structure. NVTX annotation strings are arbitrary user-defined text and may contain project names, application identifiers, or other sensitive labels. Users at institutions with data governance, export control, or confidentiality policies should verify compliance before analyzing production profiles.
+
+**Data goes to the configured provider** (Anthropic, OpenAI, or Google). Each provider's data retention and usage policies apply independently of this tool.
+
+**To analyze a profile without sending any data externally**, use the `summary` subcommand — Stage 1 runs entirely locally:
+
+```bash
+perf-advisor summary profile.sqlite
+```
 
 ---
 
@@ -223,8 +244,14 @@ perf-advisor compare profile_a.sqlite profile_b.sqlite --yes
 # Exact token count via Anthropic API
 perf-advisor compare profile_a.sqlite profile_b.sqlite --exact-token-count
 
+# Limit phase detection (reduces context size and token cost)
+perf-advisor compare profile_a.sqlite profile_b.sqlite --max-phases 3
+
 # Save LLM interaction log and terminal transcript
 perf-advisor compare profile_a.sqlite profile_b.sqlite --log --transcript
+
+# Save to specific paths
+perf-advisor compare profile_a.sqlite profile_b.sqlite --log-file /tmp/compare.log --transcript-file /tmp/compare_transcript.txt
 ```
 
 ---
@@ -416,3 +443,5 @@ python -m pytest                                # run all tests
 python -m pytest tests/test_synthetic.py::test_name -v    # single test
 ruff check . && ruff format .                   # lint and format
 ```
+
+Tested on Ubuntu 24.04.4 LTS with Nsight Systems 2025.3.1.90 (SQLite schema version 3.20.2).
