@@ -316,10 +316,17 @@ def _schemas_to_openai(schemas: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
-    """Inject profile_summary and phase_summary results as the opening exchange.
+def _preseed_messages(
+    profile: NsysProfile,
+    summary: ProfileSummary,
+    cross_rank_summary=None,
+) -> list[dict]:
+    """Inject profile_summary, phase_summary (and optionally cross_rank_summary)
+    as the opening exchange.
 
-    Saves 2 API round-trips by reusing the already-computed ProfileSummary.
+    Saves 2–3 API round-trips by reusing already-computed summaries.
+    The cache_control marker is placed on the last pre-seeded result so the
+    full pre-seed block is cached as a single unit.
     """
     profile_result = json.dumps(
         {
@@ -332,27 +339,37 @@ def _preseed_messages(profile: NsysProfile, summary: ProfileSummary) -> list[dic
         }
     )
     phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
+
+    assistant_tool_uses = [
+        {"type": "tool_use", "id": "pre_1", "name": "profile_summary", "input": {}},
+        {"type": "tool_use", "id": "pre_2", "name": "phase_summary", "input": {}},
+    ]
+    tool_results: list[dict] = [
+        {"type": "tool_result", "tool_use_id": "pre_1", "content": profile_result},
+        {"type": "tool_result", "tool_use_id": "pre_2", "content": phase_result},
+    ]
+
+    if cross_rank_summary is not None:
+        cross_rank_result = json.dumps(cross_rank_summary.model_dump())
+        assistant_tool_uses.append(
+            {
+                "type": "tool_use",
+                "id": "pre_3",
+                "name": "cross_rank_summary",
+                "input": {},
+            }
+        )
+        tool_results.append(
+            {"type": "tool_result", "tool_use_id": "pre_3", "content": cross_rank_result}
+        )
+
+    # Cache marker goes on the last result so the whole pre-seed block is cached.
+    tool_results[-1]["cache_control"] = {"type": "ephemeral"}
+
     return [
         {"role": "user", "content": "Begin analysis."},
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "tool_use", "id": "pre_1", "name": "profile_summary", "input": {}},
-                {"type": "tool_use", "id": "pre_2", "name": "phase_summary", "input": {}},
-            ],
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": "pre_1", "content": profile_result},
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "pre_2",
-                    "content": phase_result,
-                    "cache_control": {"type": "ephemeral"},
-                },
-            ],
-        },
+        {"role": "assistant", "content": assistant_tool_uses},
+        {"role": "user", "content": tool_results},
     ]
 
 
@@ -363,6 +380,7 @@ def _run_api(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    cross_rank_summary=None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -373,7 +391,11 @@ def _run_api(
 
     client = anthropic.Anthropic()
     schemas = tool_schemas()
-    messages: list[dict] = _preseed_messages(profile, summary) if summary is not None else []
+    messages: list[dict] = (
+        _preseed_messages(profile, summary, cross_rank_summary)
+        if summary is not None
+        else []
+    )
     _system = [
         {
             "type": "text",
@@ -585,7 +607,11 @@ def _run_api(
 # ---------------------------------------------------------------------------
 
 
-def _preseed_messages_openai(profile: NsysProfile, summary: ProfileSummary) -> list[dict]:
+def _preseed_messages_openai(
+    profile: NsysProfile,
+    summary: ProfileSummary,
+    cross_rank_summary=None,
+) -> list[dict]:
     """Inject pre-computed profile/phase summaries in OpenAI's tool-call format."""
     profile_result = json.dumps(
         {
@@ -598,26 +624,41 @@ def _preseed_messages_openai(profile: NsysProfile, summary: ProfileSummary) -> l
         }
     )
     phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
-    return [
-        {"role": "user", "content": "Begin analysis."},
+
+    tool_calls = [
         {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "pre_1",
-                    "type": "function",
-                    "function": {"name": "profile_summary", "arguments": "{}"},
-                },
-                {
-                    "id": "pre_2",
-                    "type": "function",
-                    "function": {"name": "phase_summary", "arguments": "{}"},
-                },
-            ],
+            "id": "pre_1",
+            "type": "function",
+            "function": {"name": "profile_summary", "arguments": "{}"},
         },
+        {
+            "id": "pre_2",
+            "type": "function",
+            "function": {"name": "phase_summary", "arguments": "{}"},
+        },
+    ]
+    tool_results = [
         {"role": "tool", "tool_call_id": "pre_1", "content": profile_result},
         {"role": "tool", "tool_call_id": "pre_2", "content": phase_result},
+    ]
+
+    if cross_rank_summary is not None:
+        cross_rank_result = json.dumps(cross_rank_summary.model_dump())
+        tool_calls.append(
+            {
+                "id": "pre_3",
+                "type": "function",
+                "function": {"name": "cross_rank_summary", "arguments": "{}"},
+            }
+        )
+        tool_results.append(
+            {"role": "tool", "tool_call_id": "pre_3", "content": cross_rank_result}
+        )
+
+    return [
+        {"role": "user", "content": "Begin analysis."},
+        {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        *tool_results,
     ]
 
 
@@ -628,6 +669,7 @@ def _run_openai(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    cross_rank_summary=None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -641,7 +683,7 @@ def _run_openai(
     schemas = tool_schemas()
     openai_tools = _schemas_to_openai(schemas)
     messages: list[dict] = (
-        _preseed_messages_openai(profile, summary)
+        _preseed_messages_openai(profile, summary, cross_rank_summary)
         if summary is not None
         else [{"role": "user", "content": "Begin analysis."}]
     )
@@ -853,6 +895,7 @@ def _run_gemini(
     max_turns: int,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    cross_rank_summary=None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -904,6 +947,9 @@ def _run_gemini(
             f"profile_summary:\n{profile_result}\n\n"
             f"phase_summary:\n{phase_result}"
         )
+        if cross_rank_summary is not None:
+            cross_rank_result = json.dumps(cross_rank_summary.model_dump())
+            init_msg += f"\n\ncross_rank_summary:\n{cross_rank_result}"
     else:
         init_msg = "Begin analysis."
 
@@ -1054,6 +1100,7 @@ def _run_claude_code(
     *,
     verbose: bool,
     summary: ProfileSummary | None = None,
+    cross_rank_summary=None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -1068,6 +1115,11 @@ def _run_claude_code(
 
     summary_json = summary.model_dump_json(indent=2)
     prompt = _format_summary_prompt(summary_json, profile.path.name, grounded=grounded)
+    if cross_rank_summary is not None:
+        prompt += (
+            "\n\ncross_rank_summary (multi-rank MPI analysis):\n"
+            + json.dumps(cross_rank_summary.model_dump(), indent=2)
+        )
 
     if verbose:
         log("[→ llm] Sending profile summary to Claude Code...")
@@ -1130,6 +1182,7 @@ def run_agent(
     max_turns: int = MAX_TURNS,
     verbose: bool = True,
     summary: ProfileSummary | None = None,
+    cross_rank_summary=None,
     token_usage: dict[str, int | None] | None = None,
     grounded: bool = True,
     log: Callable[[str], None] = print,
@@ -1167,6 +1220,7 @@ def run_agent(
                 max_turns=max_turns,
                 verbose=verbose,
                 summary=summary,
+                cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
                 log=log,
                 logger=logger,
@@ -1178,6 +1232,7 @@ def run_agent(
                 max_turns=max_turns,
                 verbose=verbose,
                 summary=summary,
+                cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
                 log=log,
                 logger=logger,
@@ -1189,6 +1244,7 @@ def run_agent(
                 max_turns=max_turns,
                 verbose=verbose,
                 summary=summary,
+                cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
                 log=log,
                 logger=logger,
@@ -1198,6 +1254,7 @@ def run_agent(
                 profile,
                 verbose=verbose,
                 summary=summary,
+                cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
                 log=log,
                 logger=logger,

@@ -49,6 +49,84 @@ def _print_timings(timings: dict[str, float]) -> None:
     console.print(t)
 
 
+def _print_cross_rank_tables(cross_rank_summary) -> None:
+    """Print per-rank overview and per-phase imbalance tables."""
+    from rich.panel import Panel
+
+    from perf_advisor.analysis.models import CrossRankSummary
+
+    crs: CrossRankSummary = cross_rank_summary
+
+    # Table 1 — per-rank overview
+    t1 = Table(title=f"Multi-rank Overview ({crs.num_ranks} ranks)", show_header=True)
+    t1.add_column("Rank", justify="right")
+    t1.add_column("GPU Kernel (s)", justify="right")
+    t1.add_column("GPU Idle (s)", justify="right")
+    t1.add_column("MPI Wait (s)", justify="right")
+    t1.add_column("GPU Util %", justify="right")
+    t1.add_column("Primary", justify="center")
+    for ov in crs.per_rank_overview:
+        marker = "[bold green]★[/bold green]" if ov.rank_id == crs.primary_rank_id else ""
+        t1.add_row(
+            str(ov.rank_id),
+            f"{ov.gpu_kernel_s:.2f}",
+            f"{ov.gpu_idle_s:.2f}",
+            f"{ov.mpi_wait_s:.2f}",
+            f"{ov.gpu_utilization_pct:.1f}%",
+            marker,
+        )
+    console.print(t1)
+
+    if not crs.phases:
+        return
+
+    # Table 2 — per-phase imbalance
+    t2 = Table(title="Cross-rank Phase Imbalance", show_header=True)
+    t2.add_column("Phase")
+    t2.add_column("GPU Kernel Imbalance", justify="right")
+    t2.add_column("Slowest Rank", justify="right")
+    t2.add_column("MPI Wait Imbalance", justify="right")
+    t2.add_column("Slowest Rank", justify="right")
+    t2.add_column("Top Collective Imbalance")
+
+    def _imbalance_color(score: float) -> str:
+        if score >= 0.5:
+            return "red"
+        if score >= 0.2:
+            return "yellow"
+        return "green"
+
+    for ph in crs.phases:
+        gpu_color = _imbalance_color(ph.gpu_kernel_imbalance)
+        mpi_color = _imbalance_color(ph.mpi_wait_imbalance)
+        top_coll = (
+            f"{ph.collective_imbalance[0].op} "
+            f"[{_imbalance_color(ph.collective_imbalance[0].imbalance_score)}]"
+            f"{ph.collective_imbalance[0].imbalance_score:.0%}[/]"
+            if ph.collective_imbalance
+            else "—"
+        )
+        t2.add_row(
+            ph.phase_name,
+            f"[{gpu_color}]{ph.gpu_kernel_imbalance:.0%}[/{gpu_color}]",
+            str(ph.gpu_kernel_slowest_rank_id),
+            f"[{mpi_color}]{ph.mpi_wait_imbalance:.0%}[/{mpi_color}]",
+            str(ph.mpi_wait_slowest_rank_id),
+            top_coll,
+        )
+    console.print(t2)
+
+    if crs.phase_alignment == "index_order":
+        console.print(
+            Panel(
+                "[yellow]Phase names differed across ranks — phases aligned by index order "
+                "based on duration agreement. Cross-rank phase labels may not be exact.[/yellow]",
+                title="[yellow]Warning: Phase Alignment[/yellow]",
+                border_style="yellow",
+            )
+        )
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     from perf_advisor.agent.loop import (
         _build_system_prompt,
@@ -95,9 +173,113 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False
             )
 
-    timings: dict[str, float] = {}
-    with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(profile, max_phases=args.max_phases, timings=timings)
+    # -----------------------------------------------------------------------
+    # Multi-rank path: more than one profile file provided
+    # -----------------------------------------------------------------------
+    cross_rank_summary = None
+    primary_profile: str
+
+    if len(args.profile) > 1:
+        from pathlib import Path as _Path
+
+        from rich.panel import Panel
+
+        from perf_advisor.analysis.cross_rank import (
+            align_phases,
+            compute_cross_rank_summary,
+            parse_rank_ids,
+            select_primary_rank,
+        )
+
+        profile_paths = [_Path(p) for p in args.profile]
+        rank_ids, parsed_ok = parse_rank_ids(profile_paths)
+        if not parsed_ok and not args.quiet:
+            console.print(
+                "[yellow]Warning:[/yellow] Could not determine rank IDs from filenames "
+                "— using index order (0, 1, 2, …).",
+                highlight=False,
+            )
+
+        rank_id_to_path = dict(zip(rank_ids, profile_paths))
+
+        if not args.quiet:
+            console.print(
+                f"  Multi-rank mode: {len(profile_paths)} profiles, "
+                f"rank IDs {sorted(rank_ids)}"
+            )
+
+        timings: dict[str, float] = {}
+        summaries: dict = {}
+        for rid, path in sorted(rank_id_to_path.items()):
+            _rank_timings: dict[str, float] = {}
+            with NsysProfile(path) as _prof:
+                summaries[rid] = compute_profile_summary(
+                    _prof, max_phases=args.max_phases, timings=_rank_timings
+                )
+            for k, v in _rank_timings.items():
+                timings[k] = timings.get(k, 0.0) + v
+
+        # Primary rank selection
+        if args.primary_rank is not None:
+            if args.primary_rank not in rank_ids:
+                console.print(
+                    f"[red]Error:[/red] --primary-rank {args.primary_rank} is not in the "
+                    f"set of parsed rank IDs {sorted(rank_ids)}."
+                )
+                sys.exit(1)
+            primary_rank_id = args.primary_rank
+            if not args.quiet:
+                console.print(
+                    f"  Primary rank: [cyan]{primary_rank_id}[/cyan] (set via --primary-rank)"
+                )
+        else:
+            primary_rank_id, outlier_reason = select_primary_rank(summaries)
+            if not args.quiet:
+                console.print(
+                    f"  Primary rank: [cyan]{primary_rank_id}[/cyan] ({outlier_reason})"
+                )
+
+        primary_profile = str(rank_id_to_path[primary_rank_id])
+
+        # Phase alignment check
+        alignment, alignment_msg = align_phases(summaries)
+
+        if alignment == "failed":
+            console.print(
+                Panel(
+                    f"[red]{alignment_msg}[/red]\n\n"
+                    f"Falling back to single-rank analysis on rank {primary_rank_id}.",
+                    title="[red]Error: Cross-rank Phase Alignment Failed[/red]",
+                    border_style="red",
+                )
+            )
+            # Fall through with no cross_rank_summary; use primary rank only.
+            summary = summaries[primary_rank_id]
+        else:
+            if alignment == "index_order" and not args.quiet:
+                console.print(
+                    Panel(
+                        f"[yellow]{alignment_msg}[/yellow]",
+                        title="[yellow]Warning: Phase Alignment[/yellow]",
+                        border_style="yellow",
+                    )
+                )
+            cross_rank_summary = compute_cross_rank_summary(
+                summaries, primary_rank_id, alignment
+            )
+            summary = summaries[primary_rank_id]
+
+            if not args.quiet:
+                _print_cross_rank_tables(cross_rank_summary)
+
+    else:
+        # Single-rank path (original behaviour)
+        primary_profile = args.profile[0]
+        timings = {}
+        with NsysProfile(primary_profile) as profile:
+            summary = compute_profile_summary(
+                profile, max_phases=args.max_phases, timings=timings
+            )
 
     if not args.quiet and summary.phases:
         ph = Table(title="Detected Execution Phases")
@@ -144,6 +326,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     _summary_json = summary.model_dump_json(indent=2)
     _schemas = tool_schemas()
     _schemas_json = json.dumps(_schemas)
+    _cross_rank_json = (
+        json.dumps(cross_rank_summary.model_dump()) if cross_rank_summary is not None else ""
+    )
 
     if args.exact_token_count:
         _input_tokens = count_tokens_exact(
@@ -163,6 +348,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 estimate_prose_tokens(_system_prompt)
                 + estimate_json_tokens(_summary_json, resolved_provider)
                 + estimate_json_tokens(_schemas_json, resolved_provider)
+                + estimate_json_tokens(_cross_rank_json, resolved_provider)
             )
             _input_label = "heuristic"
         else:
@@ -172,6 +358,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             estimate_prose_tokens(_system_prompt)
             + estimate_json_tokens(_summary_json, resolved_provider)
             + estimate_json_tokens(_schemas_json, resolved_provider)
+            + estimate_json_tokens(_cross_rank_json, resolved_provider)
         )
         _input_label = "heuristic"
 
@@ -229,8 +416,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     # Compute timestamp now (start of run) for consistent log/transcript filenames.
     _start_time = datetime.now()
     _ts = _start_time.strftime("%Y%m%d_%H%M%S")
-    _profile_stem = Path(args.profile).stem
-    _out_dir = Path(args.profile).parent
+    _profile_stem = Path(primary_profile).stem
+    _out_dir = Path(primary_profile).parent
 
     # Resolve log file path if requested.
     _log_requested = args.log or bool(args.log_file)
@@ -249,14 +436,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 argv=sys.argv,
                 provider=resolved_provider,
                 model=resolved_model,
-                profile_path=args.profile,
+                profile_path=primary_profile,
                 start_time=_start_time,
             )
             if not args.quiet:
                 console.print(f"  LLM log:    {_log_path}")
         hypotheses = run_agent(
-            args.profile,
+            primary_profile,
             summary=summary,
+            cross_rank_summary=cross_rank_summary,
             verbose=not args.quiet,
             model=args.model,
             max_turns=args.max_turns,
@@ -271,7 +459,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print(json.dumps(hypotheses, indent=2))
         return
 
-    table = Table(title=f"Hypotheses — {Path(args.profile).name}", show_lines=True)
+    table = Table(title=f"Hypotheses — {Path(primary_profile).name}", show_lines=True)
     table.add_column("#", style="dim", width=3)
     table.add_column("Type", style="cyan")
     table.add_column("Phase", style="dim")
@@ -666,7 +854,14 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     p_analyze = sub.add_parser("analyze", help="Run agent hypothesis generation on a profile")
-    p_analyze.add_argument("profile", help="Path to .sqlite profile")
+    p_analyze.add_argument(
+        "profile",
+        nargs="+",
+        help=(
+            "Path(s) to .sqlite profile(s). Pass multiple files (or a shell glob) "
+            "to enable multi-rank analysis."
+        ),
+    )
     p_analyze.add_argument("--json", action="store_true", help="Output raw JSON")
     p_analyze.add_argument(
         "--verbose", action="store_true", help="Print the ProfileSummary sent to the AI"
@@ -677,6 +872,17 @@ def main() -> None:
         type=int,
         default=6,
         help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+    )
+    p_analyze.add_argument(
+        "--primary-rank",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Multi-rank mode: use rank N as the primary rank for detailed analysis "
+            "(N is the parsed rank ID from the filename, not the file index). "
+            "By default the outlier rank (highest GPU idle time) is selected automatically."
+        ),
     )
     p_analyze.add_argument(
         "--max-turns",

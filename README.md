@@ -2,10 +2,6 @@
 
 An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Currently supports NVIDIA Nsight Systems (`.sqlite`); AMD ROCProfiler support is planned. Extracts structured metrics from a profile, then uses an LLM to reason over the data and produce a ranked list of actionable performance hypotheses.
 
----
-
-## Provenance
-
 This tool was built with heavy AI coding assistance ("vibe coded"). The SQL queries, metric calculations, and analysis logic have not been exhaustively validated — they look plausible but may contain subtle errors in unit conversions, aggregations, or edge-case handling. Treat the numbers as starting points for investigation rather than ground truth, and verify anything surprising directly against the SQLite database or the Nsight Systems GUI.
 
 ---
@@ -58,7 +54,7 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 | `stream_summary`  | Per-stream GPU utilization                                              |
 | `sql_query`       | Arbitrary read-only SQL for targeted follow-up                          |
 
-The `profile_summary` and `phase_summary` results are pre-seeded from Stage 1 — the agent does not need to call those tools and will not spend tokens on them.
+The `profile_summary`, `phase_summary`, and (in multi-rank mode) `cross_rank_summary` results are pre-seeded from Stage 1 — the agent does not need to call those tools and will not spend tokens on them.
 
 Saving files to disk is opt-in. Pass `--log` to record every API request and response, and `--transcript` to save a transcript of terminal output (see Usage for details).
 
@@ -164,6 +160,41 @@ perf-advisor analyze profile.sqlite --transcript
 # Save the transcript to a specific path
 perf-advisor analyze profile.sqlite --transcript-file /tmp/my_run_transcript.txt
 ```
+
+### Multi-rank analysis
+
+Pass multiple `.sqlite` files (or a shell glob) to analyze an MPI job across all ranks:
+
+```bash
+perf-advisor analyze report.*.sqlite
+```
+
+In multi-rank mode, Stage 1 runs on every rank. The primary rank (used for the full agent
+analysis) is selected automatically as the outlier with the highest GPU idle time — the rank
+being held up the most by MPI waits, memcpy, or sync. If no rank exceeds the median by more
+than 20%, then the primary rank is used (primary rank defaults to 0 unless `--primary-rank` is set):
+
+```bash
+# Override automatic outlier selection
+perf-advisor analyze report.*.sqlite --primary-rank 3
+```
+
+Before the agent runs, two tables are printed:
+
+- **Per-rank overview** — GPU kernel time, GPU idle, MPI wait, and GPU utilization for every rank, with the primary rank marked
+- **Per-phase imbalance** — `(max − min) / mean` across ranks for GPU kernel time and MPI wait per phase, color-coded green/yellow/red, with the worst collective per phase highlighted
+
+The cross-rank summary is injected as a pre-seeded tool result alongside the primary rank's
+profile summary. The agent can reference specific ranks and per-phase imbalance scores when
+generating hypotheses without additional tool calls — enabling it to distinguish "this rank is
+the straggler causing everyone to wait at barriers" from "all ranks wait equally, the collective
+itself is the bottleneck."
+
+**Phase alignment:** phases are matched by name across ranks (they should be identical in a
+well-behaved MPI job, since all ranks run the same code and synchronize frequently). If phase
+names differ but durations agree within 20%, index-order alignment is used with a warning. If
+phase counts differ or durations diverge beyond tolerance, cross-rank analysis is aborted with
+a prominent warning and the run falls back to single-rank analysis on the primary rank.
 
 ### Compare two profiles
 
@@ -292,12 +323,12 @@ Proceed? [Y/n]
 
 The agent is multi-turn: each tool call costs one LLM round-trip. A typical analysis on a moderately complex profile (3–6 phases, a few dominant kernels, MPI present) uses roughly:
 
-| Component                                 | Approximate tokens (input)                    |
-| ----------------------------------------- | --------------------------------------------- |
-| System prompt                             | ~400                                          |
-| Pre-seeded profile + phase summary        | 3,000–12,000 (scales with phases and kernels) |
-| Per-tool-call result (5–12 calls typical) | 500–2,000 each                                |
-| Output hypothesis JSON                    | 1,000–2,500                                   |
+| Component                                 | Approximate tokens (input)                                                                                |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| System prompt                             | ~400                                                                                                      |
+| Pre-seeded profile + phase summary        | 3,000–12,000 (scales with phases and kernels); add ~2,000–8,000 for cross-rank summary in multi-rank mode |
+| Per-tool-call result (5–12 calls typical) | 500–2,000 each                                                                                            |
+| Output hypothesis JSON                    | 1,000–2,500                                                                                               |
 
 **Total typical range: 15,000–60,000 input tokens + 1,000–3,000 output tokens per run.**
 

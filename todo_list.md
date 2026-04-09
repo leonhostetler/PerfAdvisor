@@ -1,16 +1,5 @@
 # Todo List — perf_advisor Improvements
 
-## 1. Multi-rank MPI analysis
-
-Add a `mpianalyze` subcommand that accepts N rank files, runs `compute_profile_summary` on one "primary" rank (default: rank 0), pre-aggregates cross-rank MPI metrics into a compact structure, then sends both to the LLM together. The agent generates hypotheses as usual but now has cross-rank context to ground MPI-related ones. No new agent prompt needed — the cross-rank MPI summary is injected as an additional pre-seeded tool result.
-
-Open design questions:
-
-1. **Which rank is "primary"?** Rank 0 is the natural default, but the slow outlier rank might be more informative. Options: let pre-aggregation auto-identify the outlier, or add `--primary-rank`.
-2. **What goes in the pre-aggregated MPI structure?** At minimum: per-rank GPU kernel time, MPI wait time, top-kernel breakdown, plus cross-rank stats (mean/std/min/max with rank IDs). Key derived metric: imbalance score per collective = `(max − min) / mean` across ranks.
-3. **File selection UX:** A glob pattern (e.g., `report.0.*.sqlite`) with automatic rank-ID parsing from the filename would be more practical than listing 64+ files manually.
-4. **Does `mpianalyze` need its own system prompt?** Proposed answer: no — just inject the cross-rank summary as an additional pre-seeded tool result. The data speaks for itself.
-
 ## 3. Iterative hypothesis refinement
 
 Extend the multi-turn API backend to perform a second reasoning pass:

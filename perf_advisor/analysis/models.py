@@ -169,6 +169,83 @@ class ProfileSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Multi-rank / cross-rank models
+# ---------------------------------------------------------------------------
+
+
+class RankOverview(BaseModel):
+    """Whole-profile stats for a single MPI rank."""
+
+    rank_id: int
+    gpu_kernel_s: float
+    gpu_idle_s: float
+    mpi_wait_s: float
+    gpu_utilization_pct: float
+
+
+class RankPhaseStats(BaseModel):
+    """Per-phase stats for a single MPI rank."""
+
+    rank_id: int
+    gpu_kernel_s: float
+    gpu_idle_s: float
+    mpi_wait_s: float
+
+
+class CollectiveImbalance(BaseModel):
+    """Cross-rank imbalance metrics for a single MPI collective operation."""
+
+    op: str
+    imbalance_score: float = Field(
+        description="(max - min) / mean across ranks; 0 = perfectly balanced"
+    )
+    slowest_rank_id: int
+    mean_s: float
+    min_s: float
+    max_s: float
+
+
+class CrossRankPhaseSummary(BaseModel):
+    """Cross-rank metrics for a single execution phase."""
+
+    phase_index: int
+    phase_name: str
+    # GPU kernel time stats across ranks
+    gpu_kernel_mean_s: float
+    gpu_kernel_std_s: float
+    gpu_kernel_min_s: float
+    gpu_kernel_max_s: float
+    gpu_kernel_imbalance: float = Field(
+        description="(max - min) / mean; 0 = perfectly balanced"
+    )
+    gpu_kernel_slowest_rank_id: int
+    # MPI wait time stats across ranks
+    mpi_wait_mean_s: float
+    mpi_wait_std_s: float
+    mpi_wait_min_s: float
+    mpi_wait_max_s: float
+    mpi_wait_imbalance: float
+    mpi_wait_slowest_rank_id: int
+    # Per-collective breakdown
+    collective_imbalance: list[CollectiveImbalance] = Field(default_factory=list)
+    # Raw per-rank data (for agent reasoning about specific ranks)
+    per_rank: list[RankPhaseStats] = Field(default_factory=list)
+
+
+class CrossRankSummary(BaseModel):
+    """Cross-rank analysis summary for a multi-rank MPI job."""
+
+    num_ranks: int
+    rank_ids: list[int]
+    primary_rank_id: int
+    phase_alignment: str = Field(
+        description="'name_match' | 'index_order' — how phases were aligned across ranks"
+    )
+    per_rank_overview: list[RankOverview]
+    phases: list[CrossRankPhaseSummary]
+
+
+# ---------------------------------------------------------------------------
 # Profile comparison models
 # ---------------------------------------------------------------------------
 

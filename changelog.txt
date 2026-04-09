@@ -1,8 +1,40 @@
 changelog — perf_advisor
 ========================
 
+2026-04-09
+----------
+- Fix missing phase detection and metrics timing in multi-rank mode: accumulate
+  per-rank timings into the shared dict so the timing breakdown table is complete.
+
 2026-04-08
 ----------
+- Update README: add Multi-rank analysis subsection under Usage, update pre-seed
+  note to mention cross_rank_summary, update token usage table with multi-rank
+  overhead estimate.
+
+- Implement multi-rank MPI analysis (todo #1): `analyze` now accepts multiple
+  .sqlite files (or a shell glob) to enable cross-rank analysis alongside the
+  standard single-rank agent loop.
+  - New `perf_advisor/analysis/cross_rank.py`: `parse_rank_ids` (varying-slot
+    integer detection with index-order fallback), `select_primary_rank` (GPU
+    idle outlier detection, 20% threshold), `align_phases` (name-match /
+    index-order / failed modes with duration-tolerance check),
+    `compute_cross_rank_summary` (per-phase GPU kernel and MPI wait imbalance
+    scores, per-collective breakdown, per-rank raw stats).
+  - New Pydantic models in `models.py`: `RankOverview`, `RankPhaseStats`,
+    `CollectiveImbalance`, `CrossRankPhaseSummary`, `CrossRankSummary`.
+  - `__main__.py`: `profile` argument changed to `nargs='+'`; `--primary-rank N`
+    flag added; multi-rank path prints per-rank overview table and per-phase
+    imbalance table with color-coded imbalance scores; phase alignment failures
+    produce prominent Rich Panel warnings and fall back to single-rank analysis.
+  - `agent/loop.py`: all four backends (`_run_api`, `_run_openai`, `_run_gemini`,
+    `_run_claude_code`) and `run_agent` accept optional `cross_rank_summary`;
+    injected as a third pre-seeded tool result (`pre_3`) in the Anthropic and
+    OpenAI backends; appended to the initial message in Gemini and claude_code.
+  - New `tests/test_cross_rank.py`: 18 unit tests covering all four functions,
+    all passing with no real profile files required.
+
+
 - Update README Development section: rename to Testing, update pytest invocation
   to `python -m pytest`, update single-test example to test_synthetic.py, add
   one-sentence summary about the synthetic fixture.
