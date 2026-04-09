@@ -430,6 +430,8 @@ perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 
 **Cost runaway.** If a profile is extremely large (many phases, dense MPI tables), the pre-seeded context can be very large, and if the agent makes many `sql_query` calls, costs can accumulate. Use `--max-phases 1` or a cheaper model for initial exploration.
 
+**Prompt injection from untrusted profiles.** Profile data — including NVTX annotation text, kernel names, and MPI operation names — is inserted verbatim into the LLM prompt. A maliciously crafted profile could embed instruction-like text designed to manipulate the model's analysis output. Only analyze profiles from sources you trust.
+
 **Saved files.** When `--log` or `--transcript` is used, the corresponding files are written next to the profile. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
 
 ---

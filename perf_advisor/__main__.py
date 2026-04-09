@@ -616,6 +616,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
         summary_b = compute_profile_summary(pb, max_phases=args.max_phases)
 
     # Always print both phase tables first
+    if not args.quiet:
+        console.print(
+            f"\n  Profile A: [cyan]{Path(args.profile_a).name}[/cyan]"
+            f"\n  Profile B: [cyan]{Path(args.profile_b).name}[/cyan]"
+        )
     _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}")
     _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}")
 
@@ -867,7 +872,10 @@ def main() -> None:
         description=(
             "Run agent hypothesis generation on a profile. "
             "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
-            "configured LLM API provider. See README for details."
+            "configured LLM API provider. "
+            "Only analyze profiles from trusted sources — profile data is inserted verbatim "
+            "into the LLM prompt and could contain instruction-like text. "
+            "See README § Risks for details."
         ),
     )
     p_analyze.add_argument(
@@ -974,7 +982,10 @@ def main() -> None:
         description=(
             "Compare two profiles and summarize differences. "
             "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
-            "configured LLM API provider. See README for details."
+            "configured LLM API provider. "
+            "Only analyze profiles from trusted sources — profile data is inserted verbatim "
+            "into the LLM prompt and could contain instruction-like text. "
+            "See README § Risks for details."
         ),
     )
     p_compare.add_argument("profile_a", help="Path to first .sqlite profile")

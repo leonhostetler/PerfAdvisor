@@ -169,3 +169,19 @@ Work required to publish perf-advisor to PyPI.
 - `pyproject.toml` already has `description`, `authors`, `classifiers`, and `[project.urls]` — the package is PyPI-ready metadata-wise.
 - Depends on the repo being public on GitHub first.
 - Add `--version` flag to the CLI at this point: `perf-advisor --version` via `argparse action="version"` wired to `importlib.metadata.version("perf-advisor")`. Deferred from todo 11 because versioning hadn't been decided yet.
+
+## 7. Threading for concurrent operations
+
+Add threading where operations are naturally parallel to reduce wall-clock time.
+
+### Priority targets
+
+- **Multi-rank analysis** (`perf_advisor/agent/compare.py`) — when analyzing N rank profiles, ingestion and `compute_profile_summary()` for each rank are independent. Use `concurrent.futures.ThreadPoolExecutor` to load and summarize all ranks in parallel before the comparison agent runs.
+- **Per-profile agent runs** — if a future mode runs the primary agent independently on each rank before aggregating, those agent calls can also be parallelized (subject to API rate limits).
+
+### Implementation notes
+
+- Use `concurrent.futures.ThreadPoolExecutor` (stdlib, no extra deps). SQLite connections are not thread-safe across threads; each worker must open its own connection rather than sharing a `NsysProfile` instance.
+- Expose a `--workers N` CLI flag (default: number of rank profiles, capped at a reasonable max like 8) to let users control parallelism.
+- Ensure exceptions from worker threads are propagated and surfaced cleanly (i.e., don't silently swallow errors from a failed rank load).
+- Token/cost accounting (`token_usage` dict) will need a lock or per-thread accumulation with a final merge if agent calls are parallelized.

@@ -3,6 +3,20 @@ changelog — perf_advisor
 
 2026-04-09
 ----------
+- Docs: add todo item 7 — threading for concurrent operations (multi-rank ingestion and summary via ThreadPoolExecutor, --workers flag).
+- Cleanup: remove dead _batch_window_mpi_ops() from metrics.py; superseded by _compute_all_mpi_stats() and never called. Also cleaned up two docstring references to it.
+- Security: remove dead NsysProfile.query_df() method; it was never called, bypassed the 50,000-row cap on query(), and unnecessarily exposed an unbounded pandas read path.
+- Security: exclude profile_path from ProfileSummary.model_dump_json() when building LLM prompts (claude_code backend and all compare backends); the field is not needed by the model and discloses the user's local filesystem path to the LLM API provider.
+- Security: exclude profile_a_name/profile_b_name from ProfileDiff.model_dump_json() in the compare LLM prompt; filenames are now shown to the user in the terminal via a new "Profile A: / Profile B:" label printed before the phase tables, but kept out of the model context.
+- Security: cap NsysProfile.query() at 50,000 rows with a stderr warning if truncated; prevents unbounded memory use from unexpectedly large result sets.
+- Security: add LIMIT 50,001 guard and stderr warning to _mpi_cluster_boundaries() in phases.py; prevents OOM from profiles with abnormally high MPI_Barrier counts.
+- Fix: correct Gemini optional dependency in pyproject.toml from google-generativeai to google-genai (the package that provides the google.genai import used in the code).
+- Security: remove profile filenames from LLM prompts (analyze and compare) to eliminate a prompt-injection surface via user-controlled filenames.
+- Fix: remove incorrect PRAGMA table_info() suggestion from _SQL_SCHEMA_REFERENCE system prompt; sql_query blocks PRAGMA, so the instruction was misleading and wasted agent turns.
+- Security: remove dead `resolve_enum()` method from NsysProfile (unreachable code with latent SQL injection via unvalidated table name).
+- Security: add allowlist check in `NsysProfile.columns()` before PRAGMA table_info — validates table name against schema before interpolating into SQL.
+- Security: document prompt injection risk from untrusted profile data in README § Risks, both subcommand --help descriptions, the analyze/compare system prompts, and the claude_code fallback prompt.
+- Security: catch OSError in both claude_code subprocess paths (loop.py, compare.py) to surface a clear error message when the profile summary exceeds the OS argument-length limit (ARG_MAX).
 - Fix missing phase detection and metrics timing in multi-rank mode: accumulate
   per-rank timings into the shared dict so the timing breakdown table is complete.
 - Add MIT LICENSE file (pre-release legal requirement).

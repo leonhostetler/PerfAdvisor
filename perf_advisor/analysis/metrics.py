@@ -464,8 +464,8 @@ def _compute_all_mpi_stats(
 ) -> tuple[list[MpiOpSummary], list[list[MpiOpSummary]]]:
     """Compute global and per-phase MPI stats in a single scan per table.
 
-    Replaces separate ``compute_mpi_ops`` + ``_batch_window_mpi_ops`` calls with
-    one query per MPI table using conditional aggregation (CASE WHEN per phase).
+    Compute global and per-phase MPI stats in a single scan per table using
+    conditional aggregation (CASE WHEN per phase).
     Saves ~50% of MPI scan time when computing both global and phase-level stats.
 
     Returns ``(global_ops, per_phase_ops)`` where ``per_phase_ops[i]`` is the list
@@ -683,64 +683,6 @@ def _window_top_kernels(
     return result
 
 
-def _batch_window_mpi_ops(
-    profile: NsysProfile,
-    phases: list[PhaseWindow],
-    limit: int = 5,
-) -> list[list[MpiOpSummary]]:
-    """Fetch per-phase MPI op summaries for all phases in one query per table.
-
-    Replaces N_phases × N_tables separate queries with N_tables queries total,
-    using a CASE expression to assign each event to its phase in one pass.
-    Returns a list indexed by phase position.
-    """
-    if not profile.has_mpi() or not phases:
-        return [[] for _ in phases]
-
-    case_clauses = " ".join(
-        f"WHEN e.start >= {p.start_ns} AND e.end <= {p.end_ns} THEN {i}"
-        for i, p in enumerate(phases)
-    )
-    case_expr = f"CASE {case_clauses} ELSE -1 END"
-    overall_min = min(p.start_ns for p in phases)
-    overall_max = max(p.end_ns for p in phases)
-
-    # phase_ops[i] maps op_name -> MpiOpSummary for phase i
-    phase_ops: list[dict[str, MpiOpSummary]] = [{} for _ in phases]
-
-    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
-        if not profile.has_table(table):
-            continue
-        rows = profile.query(f"""
-            SELECT
-                {case_expr}                     AS phase_idx,
-                s.value                         AS op,
-                COUNT(*)                        AS calls,
-                SUM(e.end - e.start) / 1e9     AS total_s,
-                AVG(e.end - e.start) / 1e6     AS avg_ms,
-                MAX(e.end - e.start) / 1e6     AS max_ms
-            FROM {table} e
-            JOIN StringIds s ON e.textId = s.id
-            WHERE e.start >= {overall_min} AND e.end <= {overall_max}
-              AND e.end IS NOT NULL
-            GROUP BY phase_idx, e.textId
-            HAVING phase_idx >= 0
-            ORDER BY phase_idx, total_s DESC
-        """)
-        for r in rows:
-            pidx = int(r["phase_idx"])
-            op_name = r["op"]
-            if op_name not in phase_ops[pidx]:
-                phase_ops[pidx][op_name] = MpiOpSummary(
-                    op=op_name,
-                    calls=r["calls"],
-                    total_s=round(r["total_s"], 3),
-                    avg_ms=round(r["avg_ms"], 3),
-                    max_ms=round(r["max_ms"], 3),
-                )
-
-    return [sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:limit] for d in phase_ops]
-
 
 def _window_mpi_ops(
     profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 5
@@ -888,7 +830,7 @@ def compute_phase_summary(
     """Compute full metrics for a single PhaseWindow.
 
     Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra query when
-    all phases are processed together via _batch_window_mpi_ops).
+    all phases are processed together).
     Pass ``device_info`` (from compute_device_info) to enable occupancy metrics.
     Pass ``launch_overhead`` (from _compute_launch_overhead) to annotate kernels with
     CPU-to-GPU enqueue latency.

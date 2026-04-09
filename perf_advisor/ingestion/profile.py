@@ -13,7 +13,7 @@ class NsysProfile:
 
     Handles string ID resolution, table presence detection, and raw queries.
     All name columns in CUPTI/NVTX tables are integer foreign keys into StringIds;
-    use resolve_string() or the join helpers to get human-readable names.
+    use resolve_string() to get human-readable names.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -62,6 +62,8 @@ class NsysProfile:
         return self.has_table("NVTX_EVENTS")
 
     def columns(self, table: str) -> list[str]:
+        if table not in self.tables:
+            raise ValueError(f"Unknown table: {table!r}")
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return [r["name"] for r in rows]
 
@@ -78,18 +80,30 @@ class NsysProfile:
             self._string_cache[string_id] = row[0] if row else f"<id:{string_id}>"
         return self._string_cache[string_id]
 
-    def resolve_enum(self, table: str, id_value: int) -> str:
-        """Resolve an integer from an ENUM_* table to its human-readable label."""
-        row = self._conn.execute(f"SELECT label FROM {table} WHERE id = ?", (id_value,)).fetchone()
-        return row[0] if row else f"<{id_value}>"
-
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
 
+    _QUERY_ROW_LIMIT = 50_000
+
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        """Execute a SQL query and return all rows."""
-        return self._conn.execute(sql, params).fetchall()
+        """Execute a SQL query and return all rows, capped at _QUERY_ROW_LIMIT.
+
+        If the result is truncated a warning is printed to stderr so the caller
+        is never silently missing data.
+        """
+        import sys
+
+        cursor = self._conn.execute(sql, params)
+        rows = cursor.fetchmany(self._QUERY_ROW_LIMIT + 1)
+        if len(rows) > self._QUERY_ROW_LIMIT:
+            rows = rows[: self._QUERY_ROW_LIMIT]
+            print(
+                f"[perf_advisor] Warning: query result truncated at {self._QUERY_ROW_LIMIT:,} rows."
+                " The profile may be too large for full analysis.",
+                file=sys.stderr,
+            )
+        return rows
 
     def query_safe(
         self,
@@ -117,12 +131,6 @@ class NsysProfile:
         finally:
             if stop_event is not None:
                 self._conn.set_progress_handler(None, 0)
-
-    def query_df(self, sql: str, params: tuple[Any, ...] = ()):
-        """Execute a SQL query and return a pandas DataFrame."""
-        import pandas as pd
-
-        return pd.read_sql_query(sql, self._conn, params=params)
 
     # ------------------------------------------------------------------
     # Lifecycle

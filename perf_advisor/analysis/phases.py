@@ -134,19 +134,32 @@ def _nvtx_phase_boundaries(
     return boundaries, all_long
 
 
+_MPI_BARRIER_ROW_LIMIT = 50_000
+
+
 def _mpi_cluster_boundaries(profile: NsysProfile) -> list[int]:
     """Return end-of-cluster timestamps for MPI_Barrier bursts."""
+    import sys
+
     if not profile.has_mpi() or not profile.has_table("MPI_COLLECTIVES_EVENTS"):
         return []
-    rows = profile.query("""
+    rows = profile.query(f"""
         SELECT e.end
         FROM MPI_COLLECTIVES_EVENTS e
         JOIN StringIds s ON e.textId = s.id
         WHERE s.value = 'MPI_Barrier' AND e.end IS NOT NULL
         ORDER BY e.end
+        LIMIT {_MPI_BARRIER_ROW_LIMIT + 1}
     """)
     if not rows:
         return []
+    if len(rows) > _MPI_BARRIER_ROW_LIMIT:
+        rows = rows[:_MPI_BARRIER_ROW_LIMIT]
+        print(
+            f"[perf_advisor] Warning: MPI_Barrier event count exceeds {_MPI_BARRIER_ROW_LIMIT:,};"
+            " phase boundary detection truncated. Results may be approximate.",
+            file=sys.stderr,
+        )
     ends = [int(r["end"]) for r in rows]
     boundaries: list[int] = []
     cluster_end = ends[0]
