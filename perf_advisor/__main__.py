@@ -208,13 +208,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 f"rank IDs {sorted(rank_ids)}"
             )
 
+        if args.verbose:
+            print("[phase] Rank → file mapping:")
+            for rid, path in sorted(rank_id_to_path.items()):
+                print(f"         rank={rid}  {path}")
+
         timings: dict[str, float] = {}
         summaries: dict = {}
         for rid, path in sorted(rank_id_to_path.items()):
             _rank_timings: dict[str, float] = {}
             with NsysProfile(path) as _prof:
                 summaries[rid] = compute_profile_summary(
-                    _prof, max_phases=args.max_phases, timings=_rank_timings
+                    _prof,
+                    max_phases=args.max_phases,
+                    timings=_rank_timings,
+                    verbose=args.verbose,
+                    rank=rid,
                 )
             for k, v in _rank_timings.items():
                 timings[k] = timings.get(k, 0.0) + v
@@ -278,7 +287,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         timings = {}
         with NsysProfile(primary_profile) as profile:
             summary = compute_profile_summary(
-                profile, max_phases=args.max_phases, timings=timings
+                profile,
+                max_phases=args.max_phases,
+                timings=timings,
+                verbose=args.verbose,
             )
 
     if not args.quiet and summary.phases:
@@ -807,7 +819,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
     from perf_advisor.ingestion.profile import NsysProfile
 
     with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(profile, max_phases=args.max_phases)
+        summary = compute_profile_summary(
+            profile, max_phases=args.max_phases, verbose=args.verbose
+        )
 
     if args.json:
         print(summary.model_dump_json(indent=2))
@@ -1047,6 +1061,9 @@ def main() -> None:
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
     p_summary.add_argument("profile", help="Path to .sqlite profile")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_summary.add_argument(
+        "--verbose", action="store_true", help="Print phase detection debug output"
+    )
     p_summary.add_argument(
         "--max-phases",
         type=int,

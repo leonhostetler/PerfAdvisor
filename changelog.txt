@@ -3,6 +3,11 @@ changelog — perf_advisor
 
 2026-04-09
 ----------
+- Add rank= parameter to detect_phases/compute_profile_summary; multi-rank --verbose output now prefixes each line with [phase rank=N] so output from different ranks can be distinguished.
+- Fix _profile_bounds: include OSRT_API and MPI event tables (MPI_OTHER_EVENTS, MPI_COLLECTIVES_EVENTS, MPI_P2P_EVENTS) so t0 reflects the true profile start (first host-side event, e.g. MPI_Init_thread) rather than the first CUDA activity. Shifts t0 from 1.739s to 0.347s on the test profile, fixing phase table start/end times.
+- Fix _fingerprint: kernel_ns now sums ALL kernels overlapping the window (overlap condition, clamped) rather than the dominant kernel's time only, so gpu_util is accurate for similarity scoring. Dominant kernel now uses center-of-kernel to assign ownership rather than strict containment, so boundary-straddling kernels no longer vanish from both adjacent segments.
+- Fix phase detection bug: candidates within tolerance_ns of t0 or t1 were creating tiny phantom segments at profile edges because t0/t1 are appended after _merge_nearby and never participate in its averaging. Fix: drop candidates too close to either edge before merging.
+- Add --verbose phase detection debug output: detect_phases() now accepts verbose=False and prints step-by-step diagnostics (bounds, raw candidates, post-merge boundaries, initial segment fingerprints, each greedy merge, final labels). compute_profile_summary() threads verbose through. Both analyze and summary CLI commands activate it via --verbose.
 - Docs: add todo item 7 — threading for concurrent operations (multi-rank ingestion and summary via ThreadPoolExecutor, --workers flag).
 - Cleanup: remove dead _batch_window_mpi_ops() from metrics.py; superseded by _compute_all_mpi_stats() and never called. Also cleaned up two docstring references to it.
 - Security: remove dead NsysProfile.query_df() method; it was never called, bypassed the 50,000-row cap on query(), and unnecessarily exposed an unbounded pandas read path.

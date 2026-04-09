@@ -61,6 +61,20 @@ def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
             "SELECT start, end FROM NVTX_EVENTS "
             "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
         )
+    # Include OS runtime and MPI tables so that pre-CUDA activity (e.g.
+    # MPI_Init, thread creation) is covered.  These tables may not exist in
+    # all profiles, so each is guarded by has_table().
+    if profile.has_table("OSRT_API"):
+        sources.append(
+            "SELECT start, end FROM OSRT_API "
+            "WHERE start IS NOT NULL AND end IS NOT NULL"
+        )
+    for _mpi_tbl in ("MPI_OTHER_EVENTS", "MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS"):
+        if profile.has_table(_mpi_tbl):
+            sources.append(
+                f"SELECT start, end FROM {_mpi_tbl} "
+                "WHERE start IS NOT NULL AND end IS NOT NULL"
+            )
     union_sql = " UNION ALL ".join(sources)
     row = profile.query(f"SELECT MIN(start) AS t0, MAX(end) AS t1 FROM ({union_sql})")[0]
     return int(row["t0"] or 0), int(row["t1"] or 0)
@@ -185,18 +199,34 @@ def _merge_nearby(timestamps: list[int], tolerance_ns: int) -> list[int]:
 
 
 def _fingerprint(profile: NsysProfile, start_ns: int, end_ns: int) -> _Seg:
-    """Lightweight fingerprint: dominant kernel + total kernel time in window."""
-    rows = profile.query(f"""
-        SELECT s.value AS name, SUM(k.end - k.start) AS kernel_ns
+    """Lightweight fingerprint: dominant kernel + total kernel time in window.
+
+    Total kernel time uses an overlap condition (k.start < end_ns AND k.end > start_ns)
+    clamped to the window, so kernels that straddle a boundary contribute their partial
+    time rather than being excluded entirely.  The dominant kernel is taken from kernels
+    whose center falls inside the window, which avoids attributing a large straddling
+    kernel to both adjacent segments.
+    """
+    # Total GPU time: all kernels overlapping the window, clamped to window edges.
+    total_rows = profile.query(f"""
+        SELECT SUM(MIN(k.end, {end_ns}) - MAX(k.start, {start_ns})) AS total_kernel_ns
+        FROM CUPTI_ACTIVITY_KIND_KERNEL k
+        WHERE k.start < {end_ns} AND k.end > {start_ns}
+    """)
+    kernel_ns = int(total_rows[0]["total_kernel_ns"] or 0) if total_rows else 0
+
+    # Dominant kernel: kernel type with most time whose center lies inside the window.
+    dom_rows = profile.query(f"""
+        SELECT s.value AS name, SUM(k.end - k.start) AS kns
         FROM CUPTI_ACTIVITY_KIND_KERNEL k
         JOIN StringIds s ON k.shortName = s.id
-        WHERE k.start >= {start_ns} AND k.end <= {end_ns}
+        WHERE (k.start + k.end) / 2 >= {start_ns}
+          AND (k.start + k.end) / 2 < {end_ns}
         GROUP BY k.shortName
-        ORDER BY kernel_ns DESC
+        ORDER BY kns DESC
         LIMIT 1
     """)
-    kernel_ns = int(rows[0]["kernel_ns"]) if rows else 0
-    dominant_kernel = rows[0]["name"] if rows else None
+    dominant_kernel = dom_rows[0]["name"] if dom_rows else None
     return _Seg(
         start_ns=start_ns, end_ns=end_ns, kernel_ns=kernel_ns, dominant_kernel=dominant_kernel
     )
@@ -261,13 +291,21 @@ def _deduplicate_names(phases: list[PhaseWindow]) -> list[PhaseWindow]:
     return result
 
 
-def detect_phases(profile: NsysProfile, max_phases: int = 6) -> list[PhaseWindow]:
+def detect_phases(
+    profile: NsysProfile,
+    max_phases: int = 6,
+    verbose: bool = False,
+    rank: int | None = None,
+) -> list[PhaseWindow]:
     """Detect a flat, ordered, non-overlapping sequence of phases.
 
     Returns at most `max_phases` PhaseWindow objects covering the full profile span.
     Set max_phases=1 to skip segmentation and return a single phase.
     """
+    tag = f"[phase rank={rank}]" if rank is not None else "[phase]"
     t0, t1 = _profile_bounds(profile)
+    if verbose:
+        print(f"{tag} Step 1 — profile bounds: t0={t0}ns, t1={t1}ns, span={t1 - t0}ns")
     if t0 == 0 and t1 == 0:
         return [PhaseWindow("unknown", 0, 0)]
     if max_phases <= 1:
@@ -289,14 +327,34 @@ def detect_phases(profile: NsysProfile, max_phases: int = 6) -> list[PhaseWindow
     if gpu_row["gpu_end"]:
         candidates.append(int(gpu_row["gpu_end"]))
 
-    candidates.extend(_gap_boundaries(profile, n=min(20, max_phases * 4)))
+    gap_bounds = _gap_boundaries(profile, n=min(20, max_phases * 4))
+    candidates.extend(gap_bounds)
     nvtx_boundaries, all_nvtx = _nvtx_phase_boundaries(profile, span_ns, max_phases)
     candidates.extend(nvtx_boundaries)
-    candidates.extend(_mpi_cluster_boundaries(profile))
+    mpi_bounds = _mpi_cluster_boundaries(profile)
+    candidates.extend(mpi_bounds)
 
-    # Clamp to (t0, t1) and merge nearby
-    candidates = [c for c in candidates if t0 < c < t1]
+    if verbose:
+        print(f"{tag} Step 2 — candidate boundaries ({len(candidates)} total):")
+        gpu_se = [int(gpu_row["gpu_start"] or 0), int(gpu_row["gpu_end"] or 0)]
+        print(f"         GPU start/end:   {gpu_se}")
+        print(f"         GPU idle gaps:   {gap_bounds}")
+        print(f"         NVTX boundaries: {nvtx_boundaries}")
+        print(f"         MPI clusters:    {mpi_bounds}")
+        print(f"         All candidates:  {sorted(candidates)}")
+
+    # Clamp to (t0, t1) and drop candidates too close to the profile edges —
+    # those would create tiny phantom segments at the start/end because t0/t1
+    # are appended after _merge_nearby and never participate in its averaging.
+    candidates = [
+        c for c in candidates
+        if t0 < c < t1 and c - t0 > tolerance_ns and t1 - c > tolerance_ns
+    ]
     boundaries = sorted(set([t0] + _merge_nearby(candidates, tolerance_ns) + [t1]))
+
+    if verbose:
+        print(f"{tag} Step 3 — after merging nearby (tolerance={tolerance_ns}ns), "
+              f"{len(boundaries)} boundaries remain: {boundaries}")
 
     # --- Build and fingerprint initial segments ---
     segs = [
@@ -307,12 +365,31 @@ def detect_phases(profile: NsysProfile, max_phases: int = 6) -> list[PhaseWindow
     if not segs:
         return [PhaseWindow("profile", t0, t1)]
 
+    if verbose:
+        print(f"{tag} Step 4 — {len(segs)} initial segments after fingerprinting:")
+        for i, s in enumerate(segs):
+            print(f"         [{i}] {s.start_ns}–{s.end_ns}ns  "
+                  f"gpu_util={s.gpu_util:.1f}%  dominant={s.dominant_kernel!r}")
+
     # --- Merge until <= max_phases ---
     while len(segs) > max_phases:
         scores = [_similarity(segs[i], segs[i + 1]) for i in range(len(segs) - 1)]
         best_i = scores.index(max(scores))
+        if verbose:
+            print(f"{tag} Step 5 — merging segs[{best_i}] + segs[{best_i + 1}] "
+                  f"(similarity={scores[best_i]:.1f})  {len(segs)} → {len(segs) - 1} segments")
         segs = segs[:best_i] + [_merge_segs(segs[best_i], segs[best_i + 1])] + segs[best_i + 2 :]
+
+    if verbose:
+        print(f"{tag} Step 5 — final {len(segs)} segments (at or below max_phases={max_phases})")
 
     # --- Label and return ---
     phases = [PhaseWindow(_label(s, all_nvtx), s.start_ns, s.end_ns) for s in segs]
-    return _deduplicate_names(phases)
+    result = _deduplicate_names(phases)
+
+    if verbose:
+        print(f"{tag} Step 6 — labeled phases:")
+        for p in result:
+            print(f"         {p.name!r}  {p.start_ns}–{p.end_ns}ns")
+
+    return result
