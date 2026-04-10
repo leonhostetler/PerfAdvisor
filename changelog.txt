@@ -1,8 +1,53 @@
 changelog — perf_advisor
 ========================
 
+2026-04-10
+----------
+- bench/synthetic_cuda_benchmark.cu: redesign P2P scenarios (scen_h, scen_i) to use N symmetric MPI ranks instead of a single process with two GPUs — each rank now participates in a ring; scen_h uses CUDA IPC handles exchanged via MPI_Sendrecv for direct GPU-to-GPU copies (NVLink path); scen_i delegates to run_halo_exchange_impl(device_ptrs=false) for explicit D2H→MPI_Sendrecv→H2D; add P2pNvlink and P2pStaged to requires_mpi().
+- bench/submit_4gpu.sbatch: replace run_p2p helper (srun -n 1 --gpus=2 --gpu-bind=none) with profile_mpi for runs #10–#11; all 4 intra-node ranks now participate symmetrically; update header comment.
+- bench/synthetic_cuda_benchmark.cu: fix scen_h (p2p_nvlink) — replace CUDA IPC ring with CUDA-aware MPI (device pointers via MPI_Sendrecv, same as scen_n); cudaIpcOpenMemHandle fails with CUDA_ERROR_INVALID_VALUE when the peer memory is on a different physical GPU — IPC only works for same-device cross-process sharing; with --gpus-per-task=1 each rank owns a different physical GPU so IPC is not usable; GTL routes intra-node CUDA-aware MPI via NVLink, which is the correct mechanism.
+- bench/submit_4gpu.sbatch: add MPICH_GPU_SUPPORT_ENABLED=1 and MPICH_RDMA_ENABLED_CUDA=1 (required for GTL linking and CUDA-aware MPI); add --cuda-aware-mpi 1 to run_10.
+- bench/submit_8gpu.sbatch: add --distribution=cyclic — interleaves ranks across nodes (rank 0 → node 0, rank 1 → node 1, …) so every adjacent pair in the halo ring crosses the Slingshot network; without this, 6 of 8 ring pairs were intra-node and GTL attempted CUDA IPC for those pairs, which fails with CUDA_ERROR_INVALID_VALUE because --gpus-per-task=1 gives each rank a distinct physical GPU, causing MPI_Sendrecv to hang.
+- bench/submit_4gpu.sbatch: drop run_10 (scen_h, intra-node GPU-Direct NVLink) — true NVLink between MPI processes requires CUDA IPC, which cannot work when each rank owns a different physical GPU; GTL has no usable fallback for this case on Perlmutter.
+- bench/README.md: add benchmark documentation — intro, build/submit instructions, and per-run reference with bottleneck description and resolution advice for all 15 runs.
+- bench/synthetic_cuda_benchmark.cu: remove all NVTX annotations (NvtxRange struct, USE_NVTX include, every range push/pop) — NVTX strings appear verbatim in profile data and would give PerfAdvisor direct hints about the bottleneck being tested.
+- bench/synthetic_cuda_benchmark.cu: rename all kernels to neutral identifiers (kernel_a…kernel_e) with descriptive comments in the source; kernel names are visible in profiles and descriptive names (e.g. compute_heavy_kernel) would bias PerfAdvisor's LLM.
+- bench/synthetic_cuda_benchmark.cu: replace descriptive --scenario names (e.g. compute_bound) with opaque IDs (scen_a…scen_n); nsys captures the full process argv so the scenario name would appear in profile metadata; to_string() still returns descriptive names for ground-truth JSON and stdout only.
+- bench/build.sh: remove -DUSE_NVTX from NVCCFLAGS (NVTX removed from source).
+- bench/Makefile: remove nvtx and mpi_nvtx targets (now identical to all/mpi).
+- bench/submit_1gpu.sbatch, submit_4gpu.sbatch, submit_8gpu.sbatch: replace --scenario <name> with opaque scen_X IDs; update run comments to describe the bottleneck in plain English (visible to user in script, not in profile); drop nvtx from nsys -t flags (binary emits no NVTX events).
+- bench/synthetic_cuda_benchmark.cu: fix run_low_occupancy for --smem-kb > 48 — validate against sharedMemPerBlockOptin (164 KB on A100) instead of sharedMemPerBlock (default 48 KB limit), and call cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize) to opt kernel_e into the larger carveout before launch.
+- bench/submit_1gpu.sbatch, submit_4gpu.sbatch, submit_8gpu.sbatch: neutralize run IDs (run_01…run_16) — the ID is passed to nsys -o and --ground-truth, so it appears in profile metadata (TARGET_INFO_SESSION) and process argv where the agent's sql_query tool could read it; descriptive names like comp, mem_coal, rdma_gpu would reveal the bottleneck type.
+
+
+- bench/build.sh, bench/Makefile: remove -lnvToolsExt — NVTX3 (nvtx3/nvToolsExt.h) is header-only and libnvToolsExt was removed in CUDA 12.x; the source already included the NVTX3 header so no source changes were needed.
+- bench/build.sh: link GTL (GPU Transfer Library) — Cray MPICH aborts MPI_Init with "GTL library is not linked" when MPICH_GPU_SUPPORT_ENABLED=1 is set in the environment (Perlmutter default) and the binary lacks -lmpi_gtl_cuda; detect via Cray PE per-accelerator variables PE_MPICH_GTL_DIR_${CRAY_ACCEL_TARGET} and PE_MPICH_GTL_LIBS_${CRAY_ACCEL_TARGET} (e.g. nvidia80 on Perlmutter A100) using bash indirect expansion; mpicxx -show does not include these flags automatically.
+- bench/submit_1gpu.sbatch, bench/submit_4gpu.sbatch: move P2P runs (#10–#11) from submit_1gpu to submit_4gpu — P2P requires ≥2 GPUs so it doesn't belong in the single-GPU script; submit_4gpu adds a run_p2p helper using srun -n 1 --gpus=2 --gpu-bind=none to expose two GPUs to the single process; submit_1gpu now covers only runs #1–#9 with --gpu-bind=map_gpu:0.
+- bench/submit_4gpu.sbatch, bench/submit_8gpu.sbatch: created Slurm sbatch scripts for intra-node multi-GPU (runs #10–#13) and inter-node MPI (8 ranks, runs #14–#16); no email directives.
+- bench/submit_1gpu.sbatch: removed email directives (#SBATCH --mail-user, --mail-type).
+
 2026-04-09
 ----------
+- bench/build.sh: add Perlmutter build script — loads cudatoolkit module, checks for nvcc/mpicxx, compiles MPI+NVTX binary (sm_80/A100); supports --arch and --debug flags; prints usage reminder on success.
+- bench/synthetic_cuda_benchmark.cu: remove atomic_contention scenario — Nsight Systems captures no per-SM atomic-throughput counters; detecting atomic serialization requires Nsight Compute, so the scenario cannot be evaluated by PerfAdvisor and would produce misleading ground-truth labels. Removed Scenario::AtomicContention, atomic_hist_kernel, fill_atomic_keys, --atomic-bins/--hot-bin-span knobs, DeviceArrays::keys/bins, and all related CSV/JSON fields.
+- bench/synthetic_cuda_benchmark.cu: fix atomic_contention timing — cudaMemset moved before cudaEventRecord(start) so bin-reset is not charged to the measured kernel time.
+- bench/synthetic_cuda_benchmark.cu: fix event recording asymmetry in memory_bandwidth and compute_bound — cudaEventRecord(start) is now unconditional (matching stop); elapsed_ms is still guarded by the timed flag.
+- bench/synthetic_cuda_benchmark.cu: remove dead cfg.blocks field (--blocks arg); all scenarios compute their own block count and never used it.
+- bench/synthetic_cuda_benchmark.cu: add sync_stall scenario — launches tiny_kernel then immediately calls cudaStreamSynchronize(0) per iteration, producing a CPU-stalled sawtooth pattern that PerfAdvisor should detect as cpu_sync_stall.
+- bench/synthetic_cuda_benchmark.cu: add low_occupancy scenario — uses dynamic shared memory (--smem-kb, default 48 KB) to limit blocks-per-SM and reduce warp occupancy; validates smem_bytes >= threads*sizeof(float) and against device limit.
+- bench/synthetic_cuda_benchmark.cu: add --ground-truth PATH option; writes a JSON file with scenario name, expected_bottleneck label, all params, and timing result for automated PerfAdvisor eval.
+- bench/synthetic_cuda_benchmark.cu: add clarifying comments on compute_bound (SFU saturation, not FP32/tensor) and memory_bandwidth (stride=1 = HBM bandwidth, stride>1 = uncoalesced access).
+- bench/Makefile: add Makefile with 'all' (no NVTX) and 'nvtx' (DUSE_NVTX + lnvToolsExt) targets.
+- bench/synthetic_cuda_benchmark.cu: add MPI infrastructure — MpiCtx struct, init_mpi (MPI_Comm_split_type for local rank), finalize_mpi, barrier_sync, reduce_time_max; all scenario runners now accept MpiCtx and insert barrier before start and MPI_MAX reduce on timing. Device auto-assigned from MPI local_rank when size>1.
+- bench/synthetic_cuda_benchmark.cu: add mpi_barrier_stall scenario — each rank does work_iters*(rank+1) SFU iterations + rank*stagger_us CPU sleep then MPI_Barrier; tests load-imbalance detection.
+- bench/synthetic_cuda_benchmark.cu: add mpi_allreduce scenario — compute → D2H → MPI_Allreduce → H2D; tests host-staged collective detection.
+- bench/synthetic_cuda_benchmark.cu: add mpi_halo_exchange / host_staged_mpi scenarios — ring MPI_Sendrecv with host staging; transfer size controlled by --transfer-size-mb.
+- bench/synthetic_cuda_benchmark.cu: add gpu_direct_rdma scenario — ring MPI_Sendrecv with device pointers (CUDA-aware MPI; requires --cuda-aware-mpi 1); paired with host_staged_mpi for inter-node staging comparison.
+- bench/synthetic_cuda_benchmark.cu: add p2p_nvlink scenario — cudaDeviceEnablePeerAccess + cudaMemcpyPeer between --device and --peer-device; checks cudaDeviceCanAccessPeer and fails with a clear message if NVLink/PCIe P2P is unavailable.
+- bench/synthetic_cuda_benchmark.cu: add p2p_staged scenario — forced D2H → H2D through pinned host buffer between two GPUs; paired with p2p_nvlink for intra-node staging comparison.
+- bench/synthetic_cuda_benchmark.cu: add --transfer-size-mb, --peer-device, --cuda-aware-mpi, --stagger-us knobs; update ground-truth JSON with mpi_ranks field and new scenario bottleneck labels.
+- bench/synthetic_cuda_benchmark.cu: refactor event handling into EventPair RAII struct; all scenarios now record both start and stop unconditionally with elapsed_ms guarded by timed flag.
+- bench/Makefile: add mpi and mpi_nvtx targets using -DUSE_MPI -ccbin mpicxx.
 - Add rank= parameter to detect_phases/compute_profile_summary; multi-rank --verbose output now prefixes each line with [phase rank=N] so output from different ranks can be distinguished.
 - Fix _profile_bounds: include OSRT_API and MPI event tables (MPI_OTHER_EVENTS, MPI_COLLECTIVES_EVENTS, MPI_P2P_EVENTS) so t0 reflects the true profile start (first host-side event, e.g. MPI_Init_thread) rather than the first CUDA activity. Shifts t0 from 1.739s to 0.347s on the test profile, fixing phase table start/end times.
 - Fix _fingerprint: kernel_ns now sums ALL kernels overlapping the window (overlap condition, clamped) rather than the dominant kernel's time only, so gpu_util is accurate for similarity scoring. Dominant kernel now uses center-of-kernel to assign ownership rather than strict containment, so boundary-straddling kernels no longer vanish from both adjacent segments.
