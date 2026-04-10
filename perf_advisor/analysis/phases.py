@@ -2,14 +2,19 @@
 
 Algorithm (hybrid):
 1. Collect candidate phase boundaries from:
-   - Top-N largest GPU idle gaps (gap midpoints)
+   - GPU activity start/end (first/last kernel timestamp)
+   - GPU idle gap midpoints — only gaps > max(10 * median_gap, 1000 ns)
    - Start/end of NVTX top-level ranges that appear <= max_phases times
-     (repeated ranges are iterations within a phase, not distinct phases)
+     (frequently-repeated ranges are iterations, not distinct phases)
    - End-of-cluster timestamps from MPI_Barrier bursts
-2. Merge nearby boundary candidates (within 50ms or 0.5% of profile span)
+2. Merge nearby boundary candidates (within 50ms or 0.5% of profile span):
+   each candidate is tagged with a source priority; when two candidates
+   are within tolerance the lower-priority one is discarded (no averaging).
 3. Segment the profile at each surviving boundary
 4. Fingerprint each segment: dominant kernel + GPU utilization
-5. Merge the most similar adjacent pair, repeating until <= max_phases remain
+5a. Pre-pass: merge any adjacent pair with the same dominant kernel and
+    GPU utilization difference < 15%, repeating until stable
+5b. Merge the most similar adjacent pair, repeating until <= max_phases remain
 6. Label each final segment using NVTX coverage, then GPU activity patterns
 """
 
@@ -66,39 +71,60 @@ def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
     # all profiles, so each is guarded by has_table().
     if profile.has_table("OSRT_API"):
         sources.append(
-            "SELECT start, end FROM OSRT_API "
-            "WHERE start IS NOT NULL AND end IS NOT NULL"
+            "SELECT start, end FROM OSRT_API WHERE start IS NOT NULL AND end IS NOT NULL"
         )
     for _mpi_tbl in ("MPI_OTHER_EVENTS", "MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS"):
         if profile.has_table(_mpi_tbl):
             sources.append(
-                f"SELECT start, end FROM {_mpi_tbl} "
-                "WHERE start IS NOT NULL AND end IS NOT NULL"
+                f"SELECT start, end FROM {_mpi_tbl} WHERE start IS NOT NULL AND end IS NOT NULL"
             )
     union_sql = " UNION ALL ".join(sources)
     row = profile.query(f"SELECT MIN(start) AS t0, MAX(end) AS t1 FROM ({union_sql})")[0]
     return int(row["t0"] or 0), int(row["t1"] or 0)
 
 
-def _gap_boundaries(profile: NsysProfile, n: int) -> list[int]:
-    """Return midpoints of the N largest GPU idle gaps."""
+# A gap must exceed this multiple of the median inter-kernel gap to be treated
+# as a phase boundary candidate.  Higher values = fewer, more dramatic gaps.
+_GAP_OUTLIER_MULTIPLIER = 50
+
+
+def _gap_boundaries(profile: NsysProfile) -> list[int]:
+    """Return midpoints of GPU idle gaps that are statistical outliers.
+
+    Only gaps larger than max(_GAP_OUTLIER_MULTIPLIER * median_gap, 1000 ns)
+    are returned.  If no gap clears this threshold, returns an empty list.
+
+    The median and outlier filter are computed entirely in SQL so that the
+    query returns only the surviving rows regardless of kernel count.
+    """
     rows = profile.query(f"""
         WITH ordered AS (
             SELECT start, end, ROW_NUMBER() OVER (ORDER BY start) AS rn
             FROM CUPTI_ACTIVITY_KIND_KERNEL
         ),
         gaps AS (
-            SELECT o1.end AS gs, o2.start AS ge
+            SELECT o1.end AS gs, o2.start AS ge, o2.start - o1.end AS gap_ns
             FROM ordered o1
             JOIN ordered o2 ON o2.rn = o1.rn + 1
             WHERE o2.start > o1.end
+        ),
+        gap_count AS (
+            SELECT COUNT(*) AS n FROM gaps
+        ),
+        median_gap AS (
+            SELECT AVG(gap_ns) AS val
+            FROM (
+                SELECT gap_ns FROM gaps ORDER BY gap_ns
+                LIMIT   2 - (SELECT n % 2 FROM gap_count)
+                OFFSET  (SELECT (n - 1) / 2 FROM gap_count)
+            )
         )
-        SELECT gs, ge, ge - gs AS gap_ns
-        FROM gaps
-        ORDER BY gap_ns DESC
-        LIMIT {n}
+        SELECT gs, ge
+        FROM gaps, median_gap
+        WHERE gap_ns > MAX({_GAP_OUTLIER_MULTIPLIER} * val, 1000)
+        ORDER BY gs
     """)
-    return [(r["gs"] + r["ge"]) // 2 for r in rows]
+    return [(int(r["gs"]) + int(r["ge"])) // 2 for r in rows]
 
 
 def _nvtx_phase_boundaries(
@@ -185,17 +211,34 @@ def _mpi_cluster_boundaries(profile: NsysProfile) -> list[int]:
     return boundaries
 
 
-def _merge_nearby(timestamps: list[int], tolerance_ns: int) -> list[int]:
-    """Collapse timestamps that are within tolerance_ns of each other."""
-    if not timestamps:
+# Source priorities for candidate boundaries (higher = more authoritative).
+# When two candidates are within the merge tolerance, the lower-priority one
+# is discarded so the surviving boundary stays at an actual event timestamp.
+_PRI_GAP = 1  # synthetic midpoint of an idle gap
+_PRI_MPI = 2  # end of an MPI_Barrier cluster
+_PRI_NVTX = 3  # NVTX range start/end
+_PRI_GPU_EDGE = 4  # first/last kernel timestamp
+
+
+def _merge_nearby(tagged: list[tuple[int, int]], tolerance_ns: int) -> list[int]:
+    """Collapse tagged candidates within tolerance_ns of each other.
+
+    Each element is (timestamp_ns, priority).  When two candidates are within
+    tolerance, the lower-priority one is discarded; ties keep the existing
+    entry.  No new synthetic timestamps are introduced.
+    """
+    if not tagged:
         return []
-    merged = [sorted(timestamps)[0]]
-    for t in sorted(timestamps)[1:]:
-        if t - merged[-1] <= tolerance_ns:
-            merged[-1] = (merged[-1] + t) // 2
+    result: list[tuple[int, int]] = [min(tagged, key=lambda x: x[0])]
+    for ts, pri in sorted(tagged, key=lambda x: x[0])[1:]:
+        last_ts, last_pri = result[-1]
+        if ts - last_ts <= tolerance_ns:
+            if pri > last_pri:
+                result[-1] = (ts, pri)
+            # else: keep existing (higher or equal priority)
         else:
-            merged.append(t)
-    return merged
+            result.append((ts, pri))
+    return [ts for ts, _ in result]
 
 
 def _fingerprint(profile: NsysProfile, start_ns: int, end_ns: int) -> _Seg:
@@ -312,10 +355,10 @@ def detect_phases(
         return [PhaseWindow("profile", t0, t1)]
 
     span_ns = t1 - t0
-    tolerance_ns = max(50_000_000, int(span_ns * 0.005))  # 50ms or 0.5%, whichever larger
+    tolerance_ns = max(5_000_000, int(span_ns * 0.005))  # 5ms or 0.5%, whichever larger
 
-    # --- Collect candidate boundaries ---
-    candidates: list[int] = []
+    # --- Collect candidate boundaries (tagged with source priority) ---
+    tagged: list[tuple[int, int]] = []  # (timestamp_ns, priority)
 
     # GPU activity start/end are always phase boundaries on the true timeline
     gpu_row = profile.query("""
@@ -323,38 +366,37 @@ def detect_phases(
         FROM CUPTI_ACTIVITY_KIND_KERNEL
     """)[0]
     if gpu_row["gpu_start"]:
-        candidates.append(int(gpu_row["gpu_start"]))
+        tagged.append((int(gpu_row["gpu_start"]), _PRI_GPU_EDGE))
     if gpu_row["gpu_end"]:
-        candidates.append(int(gpu_row["gpu_end"]))
+        tagged.append((int(gpu_row["gpu_end"]), _PRI_GPU_EDGE))
 
-    gap_bounds = _gap_boundaries(profile, n=min(20, max_phases * 4))
-    candidates.extend(gap_bounds)
+    gap_bounds = _gap_boundaries(profile)
+    tagged.extend((t, _PRI_GAP) for t in gap_bounds)
     nvtx_boundaries, all_nvtx = _nvtx_phase_boundaries(profile, span_ns, max_phases)
-    candidates.extend(nvtx_boundaries)
+    tagged.extend((t, _PRI_NVTX) for t in nvtx_boundaries)
     mpi_bounds = _mpi_cluster_boundaries(profile)
-    candidates.extend(mpi_bounds)
+    tagged.extend((t, _PRI_MPI) for t in mpi_bounds)
 
     if verbose:
-        print(f"{tag} Step 2 — candidate boundaries ({len(candidates)} total):")
+        print(f"{tag} Step 2 — candidate boundaries ({len(tagged)} total):")
         gpu_se = [int(gpu_row["gpu_start"] or 0), int(gpu_row["gpu_end"] or 0)]
         print(f"         GPU start/end:   {gpu_se}")
         print(f"         GPU idle gaps:   {gap_bounds}")
         print(f"         NVTX boundaries: {nvtx_boundaries}")
         print(f"         MPI clusters:    {mpi_bounds}")
-        print(f"         All candidates:  {sorted(candidates)}")
+        print(f"         All candidates:  {sorted(tagged)}")
 
-    # Clamp to (t0, t1) and drop candidates too close to the profile edges —
-    # those would create tiny phantom segments at the start/end because t0/t1
-    # are appended after _merge_nearby and never participate in its averaging.
-    candidates = [
-        c for c in candidates
-        if t0 < c < t1 and c - t0 > tolerance_ns and t1 - c > tolerance_ns
+    # Clamp to (t0, t1) and drop candidates too close to the profile edges.
+    tagged = [
+        (c, p) for c, p in tagged if t0 < c < t1 and c - t0 > tolerance_ns and t1 - c > tolerance_ns
     ]
-    boundaries = sorted(set([t0] + _merge_nearby(candidates, tolerance_ns) + [t1]))
+    boundaries = sorted(set([t0] + _merge_nearby(tagged, tolerance_ns) + [t1]))
 
     if verbose:
-        print(f"{tag} Step 3 — after merging nearby (tolerance={tolerance_ns}ns), "
-              f"{len(boundaries)} boundaries remain: {boundaries}")
+        print(
+            f"{tag} Step 3 — after merging nearby (tolerance={tolerance_ns}ns), "
+            f"{len(boundaries)} boundaries remain: {boundaries}"
+        )
 
     # --- Build and fingerprint initial segments ---
     segs = [
@@ -368,20 +410,54 @@ def detect_phases(
     if verbose:
         print(f"{tag} Step 4 — {len(segs)} initial segments after fingerprinting:")
         for i, s in enumerate(segs):
-            print(f"         [{i}] {s.start_ns}–{s.end_ns}ns  "
-                  f"gpu_util={s.gpu_util:.1f}%  dominant={s.dominant_kernel!r}")
+            print(
+                f"         [{i}] {s.start_ns}–{s.end_ns}ns  "
+                f"gpu_util={s.gpu_util:.1f}%  dominant={s.dominant_kernel!r}"
+            )
+
+    # --- Pre-pass: merge adjacent segments that are clearly identical ---
+    # Criteria: same dominant kernel (both non-None) AND gpu_util diff < 15%.
+    # Repeat until a full pass produces no merges, since a merge can expose
+    # a new qualifying pair at the same position.
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(segs) - 1:
+            a, b = segs[i], segs[i + 1]
+            if (
+                a.dominant_kernel is not None
+                and a.dominant_kernel == b.dominant_kernel
+                and abs(a.gpu_util - b.gpu_util) < 15.0
+            ):
+                if verbose:
+                    print(
+                        f"{tag} Step 5a — identical-phase merge: segs[{i}] + segs[{i + 1}] "
+                        f"(kernel={a.dominant_kernel!r}, "
+                        f"util_diff={abs(a.gpu_util - b.gpu_util):.1f}%)  "
+                        f"{len(segs)} → {len(segs) - 1} segments"
+                    )
+                segs = segs[:i] + [_merge_segs(a, b)] + segs[i + 2 :]
+                changed = True
+            else:
+                i += 1
+
+    if verbose:
+        print(f"{tag} Step 5a — {len(segs)} segments after identical-phase pre-pass")
 
     # --- Merge until <= max_phases ---
     while len(segs) > max_phases:
         scores = [_similarity(segs[i], segs[i + 1]) for i in range(len(segs) - 1)]
         best_i = scores.index(max(scores))
         if verbose:
-            print(f"{tag} Step 5 — merging segs[{best_i}] + segs[{best_i + 1}] "
-                  f"(similarity={scores[best_i]:.1f})  {len(segs)} → {len(segs) - 1} segments")
+            print(
+                f"{tag} Step 5b — merging segs[{best_i}] + segs[{best_i + 1}] "
+                f"(similarity={scores[best_i]:.1f})  {len(segs)} → {len(segs) - 1} segments"
+            )
         segs = segs[:best_i] + [_merge_segs(segs[best_i], segs[best_i + 1])] + segs[best_i + 2 :]
 
     if verbose:
-        print(f"{tag} Step 5 — final {len(segs)} segments (at or below max_phases={max_phases})")
+        print(f"{tag} Step 5b — final {len(segs)} segments (at or below max_phases={max_phases})")
 
     # --- Label and return ---
     phases = [PhaseWindow(_label(s, all_nvtx), s.start_ns, s.end_ns) for s in segs]
