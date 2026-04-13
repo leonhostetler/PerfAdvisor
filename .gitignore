@@ -1,9 +1,6 @@
 # Presentation
 presentation/
 
-# Independent hypothesis evaluator (not part of perf-advisor)
-eval/
-
 # Personal / session notes
 CLAUDE.md
 done.md

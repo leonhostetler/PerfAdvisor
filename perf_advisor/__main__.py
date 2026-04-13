@@ -876,6 +876,298 @@ def cmd_summary(args: argparse.Namespace) -> None:
         console.print(ph)
 
 
+def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity is inherent
+    import time
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    from perf_advisor.agent.loop import (
+        _parse_provider_and_model,
+        check_provider_available,
+    )
+    from perf_advisor.analysis.metrics import compute_profile_summary
+    from perf_advisor.eval.discover import discover_runs, load_ground_truth_meta
+    from perf_advisor.eval.report import (
+        load_results,
+        print_run_details,
+        print_summary_table,
+        save_results,
+    )
+    from perf_advisor.eval.scorer import RunScore, score_run
+    from perf_advisor.ingestion.profile import NsysProfile
+
+    # ── Resolve hypothesis-generation model ─────────────────────────────────
+    resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
+    missing = check_provider_available(resolved_provider)
+    if missing:
+        console.print(
+            f"[red]Error:[/red] {resolved_provider} provider requires a missing"
+            f" package: {missing}"
+        )
+        sys.exit(1)
+    console.print(
+        f"Hypothesis model: [cyan]{resolved_model}[/cyan]"
+        f" ({resolved_provider}, selected based on {reason})"
+    )
+
+    # ── Resolve judge model ──────────────────────────────────────────────────
+    judge_model_arg = args.judge_model or "claude-haiku-4-5-20251001"
+    judge_provider, judge_model, _ = _parse_provider_and_model(judge_model_arg)
+    if not args.skip_judge:
+        judge_missing = check_provider_available(judge_provider)
+        if judge_missing:
+            console.print(
+                f"[yellow]Warning:[/yellow] judge provider '{judge_provider}'"
+                f" requires {judge_missing}. Suggestion scoring will be skipped."
+            )
+            args.skip_judge = True
+        else:
+            console.print(
+                f"Judge model:      [cyan]{judge_model}[/cyan] ({judge_provider})"
+            )
+
+    # ── Cached mode: load hypotheses from a previous run ────────────────────
+    if args.cached:
+        cached_path = _Path(args.cached)
+        if not cached_path.exists():
+            console.print(f"[red]Error:[/red] --cached file not found: {cached_path}")
+            sys.exit(1)
+        console.print(f"\nLoading cached hypotheses from {cached_path}")
+        _cached_meta, cached_results = load_results(cached_path)
+
+        # Re-score using current ground_truth_meta.json (rubric may have changed)
+        bench_dir = _Path(args.ground_truth) if args.ground_truth else None
+        if bench_dir:
+            try:
+                gt_meta_all = load_ground_truth_meta(bench_dir)
+            except FileNotFoundError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                sys.exit(1)
+        else:
+            gt_meta_all = {}
+
+        results: list[RunScore] = []
+        for cached in cached_results:
+            gt_meta = gt_meta_all.get(cached.scenario)
+            gt_runtime = {
+                "scenario": cached.scenario,
+                "expected_bottleneck": cached.expected_bottleneck,
+            }
+            console.print(f"  Rescoring {cached.run_id} ({cached.scenario})…")
+            r = score_run(
+                run_id=cached.run_id,
+                gt_runtime=gt_runtime,
+                gt_meta=gt_meta,
+                hypotheses=cached.hypotheses,
+                sqlite_paths=cached.sqlite_paths,
+                judge_model=judge_model,
+                judge_provider=judge_provider,
+                skip_judge=args.skip_judge,
+                elapsed_s=cached.elapsed_s,
+            )
+            results.append(r)
+
+        console.print()
+        print_summary_table(results, console)
+        if args.verbose:
+            for r in results:
+                print_run_details(r, console)
+
+        if args.output:
+            _out = _Path(args.output)
+            save_results(
+                results,
+                _out,
+                metadata={
+                    "model": "cached",
+                    "judge_model": judge_model,
+                    "judge_provider": judge_provider,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "cached_from": str(cached_path),
+                },
+            )
+            console.print(f"\n  Results saved to {_out}")
+        return
+
+    # ── Discovery mode ───────────────────────────────────────────────────────
+    if not args.profiles_dir:
+        console.print(
+            "[red]Error:[/red] profiles_dir is required unless --cached is given."
+        )
+        sys.exit(1)
+
+    profiles_dir = _Path(args.profiles_dir)
+    bench_dir = _Path(args.ground_truth) if args.ground_truth else profiles_dir.parent
+
+    if not profiles_dir.is_dir():
+        console.print(f"[red]Error:[/red] profiles directory not found: {profiles_dir}")
+        sys.exit(1)
+
+    try:
+        runs = discover_runs(profiles_dir, bench_dir)
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if not runs:
+        console.print(
+            f"[yellow]Warning:[/yellow] no runs found under {profiles_dir}."
+            " Check that benchmark profiles have been generated."
+        )
+        sys.exit(0)
+
+    console.print(
+        f"\nFound [bold]{len(runs)}[/bold] run(s) under {profiles_dir}"
+        f" — subdirs: {', '.join(sorted({r.subdir for r in runs}))}"
+    )
+    for r in runs:
+        n = len(r.sqlite_paths)
+        rank_note = f" ({n} ranks)" if n > 1 else ""
+        meta_note = "" if r.gt_meta else " [yellow](no meta)[/yellow]"
+        console.print(
+            f"  {r.run_id:8s}  {r.scenario:35s}  {r.expected_bottleneck}{rank_note}{meta_note}"
+        )
+
+    judge_note = (
+        " + judge scoring" if not args.skip_judge else " (judge skipped)"
+    )
+    console.print(
+        f"\nWill run PerfAdvisor on each profile{judge_note}."
+    )
+    if not args.yes and sys.stdin.isatty():
+        try:
+            answer = input("Proceed? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+        if answer in ("n", "no"):
+            console.print("[yellow]Aborted.[/yellow]")
+            sys.exit(0)
+
+    # ── Per-run analysis + scoring ───────────────────────────────────────────
+    from perf_advisor.agent.loop import run_agent
+
+    results = []
+    for run_cfg in runs:
+        console.print(
+            f"\n[bold]── {run_cfg.run_id}[/bold]"
+            f"  scenario={run_cfg.scenario}"
+            f"  ({len(run_cfg.sqlite_paths)} profile(s))"
+        )
+        t0 = time.perf_counter()
+        hypotheses: list[dict] = []
+        error: str | None = None
+
+        try:
+            # Build per-rank summaries (mirrors cmd_analyze multi-rank path)
+            if run_cfg.is_multi_rank:
+                from perf_advisor.analysis.cross_rank import (
+                    align_phases,
+                    compute_cross_rank_summary,
+                    parse_rank_ids,
+                    select_primary_rank,
+                )
+
+                profile_paths = run_cfg.sqlite_paths
+                rank_ids, _ = parse_rank_ids(profile_paths)
+                rank_id_to_path = dict(zip(rank_ids, profile_paths))
+                summaries: dict = {}
+                for rid, path in sorted(rank_id_to_path.items()):
+                    with NsysProfile(path) as _prof:
+                        summaries[rid] = compute_profile_summary(
+                            _prof,
+                            max_phases=args.max_phases,
+                            verbose=False,
+                        )
+
+                primary_rank_id, _ = select_primary_rank(summaries)
+                primary_profile = str(rank_id_to_path[primary_rank_id])
+                alignment, _ = align_phases(summaries)
+
+                if alignment == "failed":
+                    cross_rank_summary = None
+                    summary = summaries[primary_rank_id]
+                    console.print(
+                        "  [yellow]Warning:[/yellow] cross-rank phase alignment"
+                        " failed; using primary rank only."
+                    )
+                else:
+                    cross_rank_summary = compute_cross_rank_summary(
+                        summaries, primary_rank_id, alignment
+                    )
+                    summary = summaries[primary_rank_id]
+            else:
+                primary_profile = str(run_cfg.sqlite_paths[0])
+                cross_rank_summary = None
+                with NsysProfile(primary_profile) as _prof:
+                    summary = compute_profile_summary(
+                        _prof,
+                        max_phases=args.max_phases,
+                        verbose=False,
+                    )
+
+            hypotheses = run_agent(
+                primary_profile,
+                summary=summary,
+                cross_rank_summary=cross_rank_summary,
+                verbose=False,
+                model=args.model,
+                max_turns=args.max_turns,
+                grounded=not args.allow_app_knowledge,
+                log=lambda msg: console.print(f"  {msg}", markup=False, highlight=False),
+            )
+            console.print(
+                f"  [green]✓[/green] {len(hypotheses)} hypothesis/hypotheses"
+                f" in {time.perf_counter() - t0:.1f}s"
+            )
+        except Exception as exc:
+            error = str(exc)
+            console.print(f"  [red]✗ ERROR:[/red] {error}")
+
+        elapsed = time.perf_counter() - t0
+        r = score_run(
+            run_id=run_cfg.run_id,
+            gt_runtime=run_cfg.gt_runtime,
+            gt_meta=run_cfg.gt_meta,
+            hypotheses=hypotheses,
+            sqlite_paths=[str(p) for p in run_cfg.sqlite_paths],
+            judge_model=judge_model,
+            judge_provider=judge_provider,
+            skip_judge=args.skip_judge,
+            elapsed_s=elapsed,
+        )
+        if error:
+            r.error = error
+
+        results.append(r)
+
+        # Persist after every run so a partial eval is still useful
+        if args.output:
+            save_results(
+                results,
+                _Path(args.output),
+                metadata={
+                    "model": resolved_model,
+                    "provider": resolved_provider,
+                    "judge_model": judge_model,
+                    "judge_provider": judge_provider,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "profiles_dir": str(profiles_dir),
+                    "ground_truth_dir": str(bench_dir),
+                },
+            )
+
+    # ── Final report ─────────────────────────────────────────────────────────
+    console.print()
+    print_summary_table(results, console)
+
+    if args.verbose:
+        for r in results:
+            print_run_details(r, console)
+
+    if args.output:
+        console.print(f"\n  Results saved to {args.output}")
+
+
 class _FullHelpParser(argparse.ArgumentParser):
     """ArgumentParser that appends each subcommand's full help to the top-level -h output."""
 
@@ -1074,6 +1366,106 @@ def main() -> None:
         help="Save the terminal transcript to PATH (implies --transcript).",
     )
 
+    p_evaluate = sub.add_parser(
+        "evaluate",
+        help="Score PerfAdvisor against the synthetic benchmark ground truth",
+        description=(
+            "Run PerfAdvisor on all benchmark profiles found under profiles_dir, "
+            "then score each run's hypotheses against ground_truth_meta.json using "
+            "a two-tier rubric: (1) bottleneck-type detection and (2) suggestion "
+            "coverage judged by an LLM. Pass --cached to rescore from saved results "
+            "without re-running PerfAdvisor."
+        ),
+    )
+    p_evaluate.add_argument(
+        "profiles_dir",
+        nargs="?",
+        help=(
+            "Directory containing {1gpu,4gpu,8gpu}/ subdirs with benchmark profiles. "
+            "Required unless --cached is given."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--ground-truth",
+        metavar="BENCH_DIR",
+        default=None,
+        help=(
+            "Directory containing ground_truth_meta.json (usually bench/). "
+            "Defaults to the parent of profiles_dir."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model for hypothesis generation. Same format as 'analyze --model'. "
+            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai)."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--judge-model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Model for LLM-judge suggestion scoring. Same provider:model format. "
+            "Default: claude-haiku-4-5-20251001."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--max-turns",
+        type=int,
+        default=MAX_TURNS,
+        help=f"Max PerfAdvisor tool-call turns per run (default: {MAX_TURNS}).",
+    )
+    p_evaluate.add_argument(
+        "--max-phases",
+        type=int,
+        default=6,
+        help="Max execution phases to detect per profile (default: 6).",
+    )
+    p_evaluate.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write full results (hypotheses + scores) to this JSON file. "
+            "Written incrementally after each run so a partial eval is preserved."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--cached",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Load hypotheses from a previously-saved --output file and re-run "
+            "scoring only (no PerfAdvisor calls). Useful for iterating on the "
+            "scoring rubric without paying for LLM hypothesis generation again."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--skip-judge",
+        action="store_true",
+        help=(
+            "Skip LLM-judge suggestion scoring; only evaluate bottleneck detection. "
+            "Faster and cheaper for quick checks."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--allow-app-knowledge",
+        action="store_true",
+        help="Same as 'analyze --allow-app-knowledge': lift the grounding constraint.",
+    )
+    p_evaluate.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-suggestion judge scores for every run.",
+    )
+    p_evaluate.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt.",
+    )
+
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
     p_summary.add_argument("profile", help="Path to .sqlite profile")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
@@ -1095,6 +1487,8 @@ def main() -> None:
             cmd_compare(args)
         elif args.command == "summary":
             cmd_summary(args)
+        elif args.command == "evaluate":
+            cmd_evaluate(args)
         else:
             parser.print_help()
             sys.exit(1)

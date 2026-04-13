@@ -165,3 +165,80 @@ bracketing each MPI call.
 remove the staging copies; or, if GPU-Direct is unavailable, use double-buffering
 so the next halo is staged concurrently with the current compute phase.
 
+---
+
+## Evaluating PerfAdvisor
+
+`ground_truth_meta.json` (this directory) holds the static evaluation rubric — one
+entry per scenario, keyed by the `scenario` field written into the runtime
+ground-truth JSONs. Each entry records:
+
+- `nsys_signature` — observable facts about the Nsight Systems timeline
+- `suggestions` — 3 expected recommendations, each with `action`, `mechanism`,
+  and `rationale`
+
+Use the `perf-advisor evaluate` subcommand to run PerfAdvisor against all benchmark
+profiles and score its output automatically.
+
+**Full evaluation** (from the repo root, after generating profiles):
+
+```bash
+python -m perf_advisor evaluate bench/profiles/ \
+    --ground-truth bench/ \
+    --model claude-opus-4-6 \
+    --output eval_results.json
+```
+
+This runs PerfAdvisor on every profile found under `bench/profiles/{1gpu,4gpu,8gpu}/`,
+scores each run's hypotheses on two axes, and writes results to `eval_results.json`.
+
+**Rescore without re-running PerfAdvisor** (after editing the rubric or judge prompt):
+
+```bash
+python -m perf_advisor evaluate \
+    --cached eval_results.json \
+    --ground-truth bench/
+```
+
+Loads saved hypotheses from the previous run and re-runs only the judge calls.
+Useful for iterating on `ground_truth_meta.json` without paying for hypothesis
+generation again.
+
+**Bottleneck-detection-only check** (no judge API calls, fast):
+
+```bash
+python -m perf_advisor evaluate bench/profiles/ \
+    --ground-truth bench/ \
+    --skip-judge --yes
+```
+
+**Per-suggestion detail** (shows judge score and explanation for every suggestion):
+
+```bash
+python -m perf_advisor evaluate bench/profiles/ \
+    --ground-truth bench/ \
+    --output eval_results.json \
+    --verbose
+```
+
+**Use a different model** (e.g. for cross-model comparison):
+
+```bash
+python -m perf_advisor evaluate bench/profiles/ \
+    --ground-truth bench/ \
+    --model openai:gpt-4o \
+    --judge-model openai:gpt-4o-mini \
+    --output eval_gpt4o.json
+```
+
+### Scoring
+
+| Axis | Method | Output |
+|---|---|---|
+| Bottleneck detection | Enum map + keyword fallback; deterministic | ✓ / ✗ per run |
+| Suggestion coverage | LLM judge (default: Haiku); scores 0 / 1 / 2 per expected suggestion | raw score + % |
+| False positives | Count hypotheses with no match to expected bottleneck | count per run |
+
+The judge model defaults to `claude-haiku-4-5-20251001` regardless of the
+hypothesis model. Override with `--judge-model`.
+
