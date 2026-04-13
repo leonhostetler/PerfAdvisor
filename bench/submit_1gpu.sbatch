@@ -12,7 +12,7 @@
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs #1–#9: single-GPU scenarios (single process, GPU 0 only).
+# Runs #1–#8: single-GPU scenarios (single process, GPU 0 only).
 # P2P scenarios (#10–#11) are in submit_4gpu.sbatch where 4 GPUs are allocated.
 
 module reset
@@ -83,20 +83,10 @@ run run_06 \
     --scenario scen_d \
     --n 33554432 --stride 32 --work-iters 1
 
-# ── Run #7: compute bound — SFU saturation via transcendental ops ─────────────
-run run_07 \
-    --scenario scen_e \
-    --work-iters 512 --reps 20
-
 # ── Run #8: low occupancy, moderate (smem=48 KB → ~37% occ on A100) ──────────
 run run_08 \
     --scenario scen_g \
     --smem-kb 48 --work-iters 32 --reps 50
-
-# ── Run #9: low occupancy, severe (smem=80 KB → ~25% occ on A100) ────────────
-run run_09 \
-    --scenario scen_g \
-    --smem-kb 80 --work-iters 32 --reps 50
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"

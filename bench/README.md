@@ -23,9 +23,9 @@ Use `--arch sm_90` for H100, `--debug` for Nsight source-level correlation.
 **2. Submit** the three job scripts in order or independently:
 
 ```bash
-sbatch submit_1gpu.sbatch   # runs #1–#9:   single-GPU scenarios
-sbatch submit_4gpu.sbatch   # runs #11–#13: intra-node multi-GPU scenarios
-sbatch submit_8gpu.sbatch   # runs #14–#16: inter-node MPI scenarios
+sbatch submit_1gpu.sbatch   # runs #1–#8:       single-GPU scenarios
+sbatch submit_4gpu.sbatch   # runs #11–#13:     intra-node multi-GPU scenarios
+sbatch submit_8gpu.sbatch   # runs #14, #16:    inter-node MPI scenarios
 ```
 
 All scripts must be submitted from the `bench/` directory — they use `pwd` to
@@ -122,19 +122,6 @@ global load before the strided processing step.
 
 ---
 
-**run_07 — compute-bound (SFU saturation)**
-
-512 iterations of transcendental-heavy compute (`sinf`, `cosf`, `expf`) per
-element. The Special Function Units (SFUs) are the bottleneck; the kernel is
-latency- and throughput-limited by SFU pipeline depth.
-
-*Resolution:* Reduce transcendental operations where possible. Replace with
-fast intrinsics (`__sinf`, `__cosf`, `__expf`) if reduced precision is
-acceptable. Consider polynomial approximations, lookup tables, or precomputing
-constants. Profile with Nsight Compute to confirm SFU issue stall dominance.
-
----
-
 **run_08 — low SM occupancy (moderate, ~37% on A100)**
 
 Shared memory per block set to 48 KB via `--smem-kb 48`. On A100 (164 KB
@@ -144,18 +131,6 @@ opt-in smem per SM), this limits concurrent warps to roughly 3 blocks per SM.
 buffered elements, or split the kernel into two passes. Use `__launch_bounds__`
 or the occupancy calculator to understand the register/smem trade-off. Verify
 with Nsight Compute's occupancy limiter analysis.
-
----
-
-**run_09 — low SM occupancy (severe, ~25% on A100)**
-
-Shared memory per block set to 80 KB via `--smem-kb 80`. Occupancy drops
-further; a significant fraction of SMs sit idle between waves.
-
-*Resolution:* Same as run_08, but more aggressive restructuring is needed.
-Evaluate whether the algorithm requires this much smem per block, or whether
-a reformulation (e.g., warp-level reductions using shuffle, register-file
-tiling) can dramatically reduce the smem footprint.
 
 ---
 
@@ -224,20 +199,6 @@ bracketing each MPI call.
 *Resolution:* See run_16 for the GPU-Direct version. Adopt CUDA-aware MPI to
 remove the staging copies; or, if GPU-Direct is unavailable, use double-buffering
 so the next halo is staged concurrently with the current compute phase.
-
----
-
-**run_15 — unnecessary host staging, inter-node**
-
-Identical workload and implementation to run_14, labeled separately in the
-ground truth as `unnecessary_host_staging_internode`. Tests whether the advisor
-flags the staging as an avoidable inefficiency (rather than just noting the
-access pattern) and recommends GPU-Direct as a concrete remedy.
-
-*Resolution:* Identical to run_14: use CUDA-aware MPI so `MPI_Sendrecv` operates
-directly on device pointers, letting GTL/GDRCopy transfer GPU memory to the NIC
-without a host copy. Verify no D2H/H2D memcpy events appear in the Nsight
-timeline for the MPI phase.
 
 ---
 

@@ -13,7 +13,7 @@
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs #14–#16: inter-node MPI scenarios (8 ranks, 4 GPUs × 2 nodes).
+# Runs #14, #16: inter-node MPI scenarios (8 ranks, 4 GPUs × 2 nodes).
 # Compares host-staged MPI vs GPUDirect RDMA transfers.
 # MPICH_GPU_SUPPORT_ENABLED / MPICH_RDMA_ENABLED_CUDA must be set before srun
 # for CUDA-aware MPI (run #16) to use device pointers directly.
@@ -72,11 +72,6 @@ profile_mpi() {
 # ── Run #14: inter-node halo exchange baseline — host-staged ring sendrecv ────
 profile_mpi run_14 8 \
     --scenario scen_l \
-    --transfer-size-mb 64 --reps 50
-
-# ── Run #15: inter-node host-staged MPI — explicit D2H → MPI_Sendrecv → H2D ──
-profile_mpi run_15 8 \
-    --scenario scen_m \
     --transfer-size-mb 64 --reps 50
 
 # ── Run #16: inter-node GPU-Direct RDMA — CUDA-aware MPI, device pointers ─────

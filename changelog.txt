@@ -3,6 +3,8 @@ changelog — perf_advisor
 
 2026-04-10
 ----------
+- bench/submit_1gpu.sbatch, bench/README.md: remove run_07 (SFU saturation — too narrow/specialized for typical HPC users) and run_09 (low occupancy severe — redundant with run_08).
+- bench/submit_8gpu.sbatch, bench/README.md: remove run_15 (inter-node host-staged — identical workload to run_14, differed only in ground-truth label).
 - perf_advisor/analysis/phases.py: reduce merge-nearby tolerance floor from 50ms to 5ms — the old floor was dominating for sub-second profiles (7% of a 719ms span), risking collapse of real phase boundaries.
 - perf_advisor/analysis/phases.py: add identical-phase pre-pass (step 5a) — merges adjacent segments unconditionally when they share the same dominant kernel and GPU utilization differs by less than 15%, looping until stable; the existing budget-reduction loop becomes step 5b and runs afterward.
 - perf_advisor/analysis/phases.py: raise gap outlier multiplier from 10 to 50 (via new _GAP_OUTLIER_MULTIPLIER constant) to reduce sensitivity on dense-kernel profiles; move gap outlier detection fully into SQL — median and threshold filter are now computed server-side so only outlier rows are returned, avoiding the 50K row truncation warning on large profiles; remove unused `statistics` import.
