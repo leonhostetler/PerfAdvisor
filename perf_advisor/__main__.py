@@ -876,8 +876,24 @@ def cmd_summary(args: argparse.Namespace) -> None:
         console.print(ph)
 
 
+class _FullHelpParser(argparse.ArgumentParser):
+    """ArgumentParser that appends each subcommand's full help to the top-level -h output."""
+
+    def format_help(self) -> str:
+        text = super().format_help()
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                parts = [text]
+                for name, subparser in action.choices.items():
+                    sep = "─" * 60
+                    parts.append(f"\n{sep}\nSubcommand: {name}\n{sep}")
+                    parts.append(subparser.format_help())
+                return "\n".join(parts)
+        return text
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="perf-advisor")
+    parser = _FullHelpParser(prog="perf-advisor")
     sub = parser.add_subparsers(dest="command")
 
     p_analyze = sub.add_parser(
