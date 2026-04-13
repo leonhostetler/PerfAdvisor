@@ -84,26 +84,15 @@ class NsysProfile:
     # Query helpers
     # ------------------------------------------------------------------
 
-    _QUERY_ROW_LIMIT = 50_000
-
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        """Execute a SQL query and return all rows, capped at _QUERY_ROW_LIMIT.
+        """Execute a SQL query and return all rows.
 
-        If the result is truncated a warning is printed to stderr so the caller
-        is never silently missing data.
+        No row limit is applied here — internal analysis callers are trusted to
+        include appropriate SQL LIMIT clauses.  LLM-instigated queries must go
+        through query_safe(), which enforces its own row cap.
         """
-        import sys
-
         cursor = self._conn.execute(sql, params)
-        rows = cursor.fetchmany(self._QUERY_ROW_LIMIT + 1)
-        if len(rows) > self._QUERY_ROW_LIMIT:
-            rows = rows[: self._QUERY_ROW_LIMIT]
-            print(
-                f"[perf_advisor] Warning: query result truncated at {self._QUERY_ROW_LIMIT:,} rows."
-                " The profile may be too large for full analysis.",
-                file=sys.stderr,
-            )
-        return rows
+        return cursor.fetchall()
 
     def query_safe(
         self,

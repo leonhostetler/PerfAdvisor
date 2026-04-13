@@ -1,6 +1,11 @@
 changelog — perf_advisor
 ========================
 
+2026-04-13
+----------
+- perf_advisor/ingestion/profile.py: remove 50,000-row cap and truncation warning from `NsysProfile.query()` — internal analysis callers (phases.py, metrics.py) are trusted and need unrestricted access; LLM-instigated queries go through `query_safe()` which already enforces a 200-row limit.
+- perf_advisor/analysis/phases.py: remove 50,000-row cap and warning from `_mpi_cluster_boundaries()` — raw rows are consumed internally and reduced to a list of phase-boundary timestamps; the LLM only ever receives the final bounded `PhaseSummary` models.
+
 2026-04-10
 ----------
 - bench/submit_1gpu.sbatch, bench/README.md: remove run_07 (SFU saturation — too narrow/specialized for typical HPC users) and run_09 (low occupancy severe — redundant with run_08).
