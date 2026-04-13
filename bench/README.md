@@ -23,9 +23,9 @@ Use `--arch sm_90` for H100, `--debug` for Nsight source-level correlation.
 **2. Submit** the three job scripts in order or independently:
 
 ```bash
-sbatch submit_1gpu.sbatch   # runs #1–#8:       single-GPU scenarios
+sbatch submit_1gpu.sbatch   # runs #1–#4:       single-GPU scenarios
 sbatch submit_4gpu.sbatch   # runs #11–#13:     intra-node multi-GPU scenarios
-sbatch submit_8gpu.sbatch   # runs #14, #16:    inter-node MPI scenarios
+sbatch submit_8gpu.sbatch   # run  #14:         inter-node MPI scenario
 ```
 
 All scripts must be submitted from the `bench/` directory — they use `pwd` to
@@ -71,66 +71,30 @@ syncs are on the critical path.
 
 ---
 
-**run_03 — PCIe transfer-bound (with pipelining)**
+**run_03 — PCIe transfer-bound**
 
-Large H2D → compute → D2H pipeline split across 16 chunks using multiple streams.
-Arithmetic intensity is low (`--work-iters 2`) so transfers dominate. Streams
-are configured to allow overlap.
+Large H2D → compute → D2H pipeline split across 16 chunks using multiple streams
+(`--work-iters 128`). Each chunk's compute stage (~25 µs) is visible in the
+timeline but dwarfed by PCIe transfers (~250 µs each way) — the GPU is spending
+almost all its time moving data across PCIe rather than computing.
 
-*Resolution:* Use pinned (page-locked) host memory (`cudaMallocHost`) to maximize
-PCIe throughput. Verify that H2D, compute, and D2H phases genuinely overlap in the
-timeline — if they do not, check stream dependencies. Consider keeping data
-GPU-resident across iterations to eliminate round-trip transfers.
+*Resolution:* Increase arithmetic intensity so more computation is done per byte
+transferred. Consider keeping data GPU-resident across iterations to eliminate the
+round-trip H2D/D2H entirely. Compare the Nsight timeline against run_04 to see
+the additional cost of losing pipeline overlap.
 
 ---
 
 **run_04 — transfer-compute overlap missing**
 
-Identical workload to run_03 but with `--force-serialize`: all streams are
-flushed after each chunk, collapsing the pipeline into a sequential H2D → compute
-→ D2H sequence with no overlap.
+Identical workload to run_03 but all streams are flushed after each chunk,
+collapsing the pipeline into a strictly sequential H2D → compute → D2H sequence
+with no overlap.
 
 *Resolution:* Issue `cudaMemcpyAsync` on a transfer stream while a separate
 compute stream processes the previous chunk. Ensure no implicit synchronization
 (e.g., `cudaDeviceSynchronize`, host-pinned memory faults) breaks the pipeline.
 Compare the Nsight timeline against run_03 to see the overlap that is missing.
-
----
-
-**run_05 — HBM bandwidth-bound (coalesced)**
-
-Strided memory kernel with `--stride 1` (fully coalesced). 128 M floats, 1
-work iteration — essentially a memory copy with trivial compute. SM utilization
-is high but throughput is capped by HBM bandwidth (~2 TB/s on A100).
-
-*Resolution:* Increase arithmetic intensity: perform more computation per cache
-line fetched. Shared-memory tiling, register blocking, or algorithm restructuring
-can reuse each loaded value multiple times before it is evicted.
-
----
-
-**run_06 — uncoalesced memory access**
-
-Same kernel as run_05 but with `--stride 32`. Each warp's 32 threads touch
-addresses 32 floats apart — 32 separate cache lines per warp instead of one,
-causing a ~32× increase in memory transactions.
-
-*Resolution:* Restructure the data layout so consecutive threads access
-consecutive addresses (Array-of-Structs → Struct-of-Arrays). If the access
-pattern is algorithm-driven, stage data through shared memory with a coalesced
-global load before the strided processing step.
-
----
-
-**run_08 — low SM occupancy (moderate, ~37% on A100)**
-
-Shared memory per block set to 48 KB via `--smem-kb 48`. On A100 (164 KB
-opt-in smem per SM), this limits concurrent warps to roughly 3 blocks per SM.
-
-*Resolution:* Reduce per-block shared memory usage: smaller tiles, fewer
-buffered elements, or split the kernel into two passes. Use `__launch_bounds__`
-or the occupancy calculator to understand the register/smem trade-off. Verify
-with Nsight Compute's occupancy limiter analysis.
 
 ---
 
@@ -142,7 +106,7 @@ with Nsight Compute's occupancy limiter analysis.
 
 **run_11 — unnecessary host staging, intra-node P2P**
 
-4-rank ring `MPI_Sendrecv` with 512 MB halo buffers, explicit D2H → MPI →
+4-rank ring `MPI_Sendrecv` with 64 MB halo buffers, explicit D2H → MPI →
 H2D staging. Every transfer copies data to the host before sending and back
 to the device after receiving, even though all GPUs are on the same node.
 
@@ -157,9 +121,9 @@ version of the same trade-off.
 **run_12 — MPI load imbalance (barrier stall)**
 
 4 ranks perform SFU-heavy compute where rank *k* does `work_iters × (k+1)`
-iterations, plus a `--stagger-us 1000` CPU sleep proportional to rank. All
-ranks then call `MPI_Barrier`. Fast ranks arrive early and idle, visible in
-the Nsight timeline as long CPU waits inside MPI.
+iterations (rank 0: 16 iters, rank 3: 64 iters). All ranks then call
+`MPI_Barrier`. Fast ranks finish their GPU work early and idle at the barrier,
+visible in the Nsight timeline as long CPU waits inside MPI.
 
 *Resolution:* Balance work across ranks — profile per-rank compute time and
 equalize iteration counts. For inherently uneven workloads, use asynchronous
@@ -171,7 +135,8 @@ critical path.
 
 **run_13 — host-staged collective (MPI_Allreduce)**
 
-4 ranks each do 4 iterations of compute then D2H → `MPI_Allreduce` → H2D.
+4 ranks each run one kernel (128 M-element FMA with `--work-iters 4` inner
+iterations per element) then D2H → `MPI_Allreduce` → H2D.
 Every reduction round-trips through host memory, adding two PCIe transfers per
 collective call.
 
@@ -200,16 +165,3 @@ bracketing each MPI call.
 remove the staging copies; or, if GPU-Direct is unavailable, use double-buffering
 so the next halo is staged concurrently with the current compute phase.
 
----
-
-**run_16 — inter-node GPU-Direct RDMA (optimized baseline)**
-
-8-rank ring `MPI_Sendrecv` with device pointers and CUDA-aware MPI
-(`--cuda-aware-mpi 1`). GTL uses GDRCopy to read/write GPU memory directly
-from the Slingshot NIC — no host copies, data stays in device memory throughout.
-
-*Resolution:* This is the optimized target for the inter-node scenarios.
-Remaining latency is network-bound. Further gains require reducing message count
-(aggregation), topology-aware routing (NCCL hierarchical algorithms), or
-overlapping communication with computation using asynchronous MPI operations
-and CUDA streams.

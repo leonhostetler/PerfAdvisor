@@ -257,7 +257,6 @@ struct Config {
   int  sync_every        = 0;     // explicit sync cadence; 0 = disabled
   bool pinned            = true;
   bool use_default_stream = false;
-  bool force_serialize   = false;
 
   // memory_bandwidth
   int stride = 1;             // 1 = coalesced; >1 = strided/uncoalesced
@@ -305,8 +304,7 @@ static void print_usage(const char *prog) {
     << "  --chunks INT\n"
     << "  --sync-every INT\n"
     << "  --pinned 0|1\n"
-    << "  --use-default-stream 0|1\n"
-    << "  --force-serialize 0|1\n\n"
+    << "  --use-default-stream 0|1\n\n"
     << "Memory scenario:\n"
     << "  --stride INT           1=coalesced, >1=strided/uncoalesced\n\n"
     << "Low-occupancy:\n"
@@ -350,7 +348,6 @@ static Config parse_args(int argc, char **argv) {
     else if (arg == "--sync-every")       cfg.sync_every     = std::stoi(next(arg));
     else if (arg == "--pinned")           cfg.pinned         = parse_bool(next(arg));
     else if (arg == "--use-default-stream") cfg.use_default_stream = parse_bool(next(arg));
-    else if (arg == "--force-serialize")  cfg.force_serialize = parse_bool(next(arg));
     else if (arg == "--stride")           cfg.stride         = std::stoi(next(arg));
     else if (arg == "--smem-kb")          cfg.smem_kb        = std::stoi(next(arg));
     else if (arg == "--peer-device")      cfg.peer_device    = std::stoi(next(arg));
@@ -589,6 +586,9 @@ static RunResult run_transfer_bound(const Config &cfg, const MpiCtx &mpi, bool s
   DeviceArrays dev;
   CUDA_CHECK(cudaMalloc(&dev.a, cfg.n * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&dev.b, cfg.n * sizeof(float)));
+  // dev.b is a read-only reference used by kernel_b; initialize once rather
+  // than re-copying it per chunk inside the timed rep loop.
+  CUDA_CHECK(cudaMemcpy(dev.b, h_in.ptr, cfg.n * sizeof(float), cudaMemcpyHostToDevice));
 
   std::vector<cudaStream_t> streams(cfg.nstreams, nullptr);
   if (!cfg.use_default_stream)
@@ -612,11 +612,10 @@ static RunResult run_transfer_bound(const Config &cfg, const MpiCtx &mpi, bool s
       const int blks = std::max(1, static_cast<int>((ne + cfg.threads - 1) / cfg.threads));
 
       CUDA_CHECK(cudaMemcpyAsync(dev.a + off, h_in.ptr + off, nb, cudaMemcpyHostToDevice, s));
-      CUDA_CHECK(cudaMemcpyAsync(dev.b + off, h_in.ptr + off, nb, cudaMemcpyHostToDevice, s));
       kernel_b<<<blks, cfg.threads, 0, s>>>(dev.a + off, dev.b + off, ne, cfg.work_iters);
       CUDA_CHECK(cudaMemcpyAsync(h_out.ptr + off, dev.a + off, nb, cudaMemcpyDeviceToHost, s));
 
-      if (serialized || cfg.force_serialize ||
+      if (serialized ||
           (cfg.sync_every > 0 && (c + 1) % cfg.sync_every == 0)) {
         CUDA_CHECK(cudaStreamSynchronize(s));
       }
@@ -1029,7 +1028,6 @@ static void write_ground_truth(const Config &cfg, const RunResult &result,
     << "    \"peer_device\": "    << cfg.peer_device      << ",\n"
     << "    \"stagger_us\": "     << cfg.stagger_us       << ",\n"
     << "    \"pinned\": "         << (cfg.pinned          ? "true" : "false") << ",\n"
-    << "    \"force_serialize\": "<< (cfg.force_serialize ? "true" : "false") << ",\n"
     << "    \"cuda_aware_mpi\": " << (cfg.cuda_aware_mpi  ? "true" : "false") << "\n"
     << "  },\n"
     << "  \"result\": {\n"
@@ -1123,7 +1121,7 @@ int main(int argc, char **argv) {
         std::cout << "scenario,total_ms,avg_ms,reps,n,threads,work_iters,launch_count,"
                      "nstreams,chunks,stride,smem_kb,"
                      "transfer_size_mb,peer_device,stagger_us,mpi_ranks,"
-                     "pinned,force_serialize,cuda_aware_mpi\n";
+                     "pinned,cuda_aware_mpi\n";
         std::cout << to_string(cfg.scenario) << ","
                   << std::fixed << std::setprecision(6)
                   << result.total_ms    << "," << result.avg_ms      << ","
@@ -1135,7 +1133,6 @@ int main(int argc, char **argv) {
                   << cfg.peer_device    << "," << cfg.stagger_us     << ","
                   << mpi.size           << ","
                   << (cfg.pinned          ? 1 : 0) << ","
-                  << (cfg.force_serialize ? 1 : 0) << ","
                   << (cfg.cuda_aware_mpi  ? 1 : 0) << "\n";
       } else {
         std::cout << std::fixed << std::setprecision(3)

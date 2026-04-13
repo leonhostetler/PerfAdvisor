@@ -12,7 +12,9 @@
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs #1–#8: single-GPU scenarios (single process, GPU 0 only).
+# Runs #1–#4: single-GPU scenarios (single process, GPU 0 only).
+# Runs #5, #6, #8 (HBM bandwidth, uncoalesced access, low occupancy) were removed —
+# those bottlenecks are not directly observable in Nsight Systems (require Nsight Compute).
 # P2P scenarios (#10–#11) are in submit_4gpu.sbatch where 4 GPUs are allocated.
 
 module reset
@@ -56,37 +58,22 @@ run() {
 # ── Run #1: kernel-launch overhead — many tiny short-lived kernels ────────────
 run run_01 \
     --scenario scen_a \
-    --n 16384 --launch-count 10000 --tiny-inner-ops 2 --reps 10
+    --n 16384 --launch-count 10000 --tiny-inner-ops 2 --host-sleep-us 5 --reps 10
 
 # ── Run #2: CPU sync stall — cudaStreamSynchronize after every launch ─────────
 run run_02 \
     --scenario scen_f \
     --n 2097152 --launch-count 2000 --tiny-inner-ops 16 --reps 10
 
-# ── Run #3: PCIe transfer-bound — H2D + compute + D2H, low arithmetic ────────
+# ── Run #3: PCIe transfer-bound — H2D + compute + D2H, transfers dominate ────
 run run_03 \
     --scenario scen_b \
-    --n 33554432 --work-iters 2 --chunks 16 --reps 20
+    --n 33554432 --work-iters 128 --chunks 16 --reps 20
 
 # ── Run #4: overlap missing — same as #3 but streams serialized ───────────────
 run run_04 \
     --scenario scen_c \
-    --n 33554432 --work-iters 2 --chunks 16 --reps 20
-
-# ── Run #5: HBM bandwidth bound — sequential coalesced access (stride=1) ─────
-run run_05 \
-    --scenario scen_d \
-    --n 33554432 --stride 1 --work-iters 1
-
-# ── Run #6: uncoalesced memory access — strided access pattern (stride=32) ───
-run run_06 \
-    --scenario scen_d \
-    --n 33554432 --stride 32 --work-iters 1
-
-# ── Run #8: low occupancy, moderate (smem=48 KB → ~37% occ on A100) ──────────
-run run_08 \
-    --scenario scen_g \
-    --smem-kb 48 --work-iters 32 --reps 50
+    --n 33554432 --work-iters 128 --chunks 16 --reps 20
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"

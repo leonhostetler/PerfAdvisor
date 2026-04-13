@@ -1,0 +1,227 @@
+{
+  "_comment": "Static evaluation rubric for the synthetic CUDA benchmark suite. Keyed by the 'scenario' field in runtime ground-truth JSONs. Used by PerfAdvisor to score hypothesis quality: did the advisor identify the right bottleneck and recommend the right fixes?",
+
+  "tiny_kernels": {
+    "run_id": "run_01",
+    "display_name": "Kernel launch overhead",
+    "expected_bottleneck": "kernel_launch_overhead",
+    "nsys_signature": [
+      "CPU timeline dense with cudaLaunchKernel API calls; GPU timeline shows a barcode of very short kernel executions separated by idle gaps",
+      "GPU utilization is near zero despite high CPU activity",
+      "Each kernel active period is shorter than the preceding idle gap (launch latency > execution time)"
+    ],
+    "suggestions": [
+      {
+        "action": "Use CUDA Graphs to record the launch sequence once and replay with near-zero per-launch CPU overhead",
+        "mechanism": "cudaGraphCreate / cudaGraphInstantiate / cudaGraphLaunch",
+        "rationale": "Replaying a graph avoids the driver overhead of N individual kernel submissions; ideal when the same sequence of kernels fires repeatedly"
+      },
+      {
+        "action": "Fuse multiple small kernels into a single larger kernel so each launch does more work",
+        "mechanism": "Manual kernel fusion or template-based work batching",
+        "rationale": "Reduces total launch count proportionally; each GPU active window grows, eliminating idle gaps"
+      },
+      {
+        "action": "For producer-consumer pipelines, use persistent kernels that loop internally rather than re-launching",
+        "mechanism": "Grid-stride loop with device-side work queues or cooperative groups",
+        "rationale": "Eliminates re-launch entirely; the kernel stays resident and picks up new work without CPU involvement"
+      }
+    ]
+  },
+
+  "sync_stall": {
+    "run_id": "run_02",
+    "display_name": "CPU sync stall",
+    "expected_bottleneck": "cpu_sync_stall",
+    "nsys_signature": [
+      "CPU timeline alternates between cudaLaunchKernel and cudaStreamSynchronize API calls",
+      "GPU is idle during each cudaStreamSynchronize; CPU thread is blocked waiting for GPU drain",
+      "No concurrent GPU activity across streams; effective GPU utilization is well below 50%"
+    ],
+    "suggestions": [
+      {
+        "action": "Remove per-launch cudaStreamSynchronize; synchronize only at genuine data-dependency boundaries (e.g., before a CPU read of GPU-produced data)",
+        "mechanism": "Identify critical-path syncs with Nsight Systems timeline; replace non-critical syncs with cudaEventRecord / cudaStreamWaitEvent",
+        "rationale": "Breaks the CPU-GPU serialization loop; GPU can stay resident across multiple launches while CPU queues the next batch"
+      },
+      {
+        "action": "Use CUDA events to express fine-grained dependencies between streams without blocking the CPU thread",
+        "mechanism": "cudaEventRecord on the producing stream; cudaStreamWaitEvent on the consuming stream",
+        "rationale": "GPU-side dependency tracking lets the driver sequence work correctly without stalling the CPU"
+      },
+      {
+        "action": "If the CPU genuinely needs results, batch the synchronization at the end of a full pipeline stage rather than after each kernel",
+        "mechanism": "cudaStreamSynchronize or cudaDeviceSynchronize at stage boundaries only",
+        "rationale": "Reduces sync frequency from O(N kernels) to O(N stages); amortizes the stall cost"
+      }
+    ]
+  },
+
+  "transfer_bound": {
+    "run_id": "run_03",
+    "display_name": "PCIe transfer-bound",
+    "expected_bottleneck": "pcie_transfer_bound",
+    "nsys_signature": [
+      "Timeline dominated by cudaMemcpyAsync H2D and D2H events; MemCpy rows are densely occupied",
+      "Compute kernels are visible between transfers but their duration is much shorter than the flanking transfer bars",
+      "Effective PCIe bandwidth is near the device maximum; GPU compute SMs are underutilized relative to the transfer engine"
+    ],
+    "suggestions": [
+      {
+        "action": "Increase arithmetic intensity: do significantly more computation per byte transferred so GPU time dominates transfer time",
+        "mechanism": "Increase work_iters or restructure the algorithm to operate on data while it is resident on the GPU across multiple passes",
+        "rationale": "Shifts the bottleneck from the PCIe link to the compute SMs; transfers become a smaller fraction of total time"
+      },
+      {
+        "action": "Keep data GPU-resident across iterations to eliminate H2D/D2H round-trips entirely",
+        "mechanism": "Allocate output buffers on the device; only transfer final results back to host",
+        "rationale": "Eliminates D2H + subsequent H2D for the same buffer; reduces total PCIe traffic proportionally"
+      },
+      {
+        "action": "Use pinned (page-locked) host memory to maximize PCIe throughput if transfers are unavoidable",
+        "mechanism": "cudaMallocHost / cudaFreeHost for host-side staging buffers",
+        "rationale": "Pinned memory allows DMA to proceed at full PCIe bandwidth without OS page-faulting"
+      }
+    ]
+  },
+
+  "overlap_missing": {
+    "run_id": "run_04",
+    "display_name": "Transfer-compute overlap missing",
+    "expected_bottleneck": "cpu_gpu_overlap_missing",
+    "nsys_signature": [
+      "Strictly sequential per-chunk H2D → kernel → D2H pattern; no two of these activities overlap in the timeline",
+      "All streams appear to execute in series; MemCpy and Kernel rows never have simultaneous activity",
+      "Total runtime is approximately N_chunks × (H2D_time + kernel_time + D2H_time) rather than approaching max(sum_H2D, sum_kernel, sum_D2H)"
+    ],
+    "suggestions": [
+      {
+        "action": "Pipeline chunks across streams: while stream A computes chunk K, stream B transfers chunk K+1 H2D and stream C transfers chunk K-1 D2H",
+        "mechanism": "Use at least 3 CUDA streams (transfer-in, compute, transfer-out); issue all operations asynchronously",
+        "rationale": "Hides transfer latency behind compute; ideal throughput approaches max(PCIe bandwidth, compute throughput)"
+      },
+      {
+        "action": "Eliminate any implicit synchronization that collapses the pipeline",
+        "mechanism": "Audit for cudaDeviceSynchronize, cudaStreamSynchronize, and host-pinned memory faults between chunk submissions",
+        "rationale": "A single implicit sync forces all in-flight work to drain before the next chunk begins, destroying the pipeline"
+      },
+      {
+        "action": "Use cudaMemcpyAsync (not cudaMemcpy) and ensure host buffers are page-locked so async copies can proceed concurrently with kernels",
+        "mechanism": "cudaMallocHost for host staging buffers; cudaMemcpyAsync with non-default stream",
+        "rationale": "cudaMemcpy is blocking by default; only the async variant can overlap with kernel execution on a separate stream"
+      }
+    ]
+  },
+
+  "p2p_staged": {
+    "run_id": "run_11",
+    "display_name": "Intra-node P2P with unnecessary host staging",
+    "expected_bottleneck": "unnecessary_host_staging_intranode",
+    "nsys_signature": [
+      "Per-halo-exchange triplet visible: D2H cudaMemcpy → MPI_Sendrecv → H2D cudaMemcpy",
+      "GPU is idle during MPI_Sendrecv; data is sitting on the host",
+      "PCIe utilization appears twice per exchange (once for D2H, once for H2D); total transfer volume is 2× the halo size"
+    ],
+    "suggestions": [
+      {
+        "action": "Pass device pointers directly to MPI_Sendrecv (CUDA-aware MPI); eliminate the explicit D2H/H2D copies",
+        "mechanism": "Remove cudaMemcpy D2H/H2D calls flanking MPI_Sendrecv; pass dev_buf directly to MPI; ensure MPICH_GPU_SUPPORT_ENABLED=1",
+        "rationale": "GTL handles the intra-node path via CUDA IPC or peer memcpy; the CPU is no longer on the data path"
+      },
+      {
+        "action": "For NVLink-connected GPUs on the same node, enable peer access so MPI can use direct device-to-device copies",
+        "mechanism": "cudaDeviceEnablePeerAccess between all rank pairs before MPI initialization",
+        "rationale": "NVLink bandwidth is 600 GB/s vs 32 GB/s PCIe; a single peer copy replaces two PCIe transfers"
+      },
+      {
+        "action": "If using CUDA-aware MPI is not feasible, at least overlap the host staging of the next halo with the compute of the current step (double-buffering)",
+        "mechanism": "Use two halo buffers and alternate; stage buffer B while computing with the data in buffer A",
+        "rationale": "Hides the D2H + MPI + H2D latency behind useful work even without GPU-Direct"
+      }
+    ]
+  },
+
+  "mpi_barrier_stall": {
+    "run_id": "run_12",
+    "display_name": "MPI load imbalance (barrier stall)",
+    "expected_bottleneck": "mpi_load_imbalance",
+    "nsys_signature": [
+      "Fast ranks show brief GPU kernel activity followed by a long CPU wait inside MPI_Barrier",
+      "Slow ranks (higher rank index) show proportionally longer GPU kernel execution before entering MPI_Barrier",
+      "The barrier wait time for rank 0 is approximately (max_rank_work - rank_0_work); wasted time is visible as a CPU-idle gap in the Nsight Systems MPI row"
+    ],
+    "suggestions": [
+      {
+        "action": "Balance work across ranks so each rank spends the same time in GPU compute before the barrier",
+        "mechanism": "Profile per-rank GPU kernel duration; equalize work_iters or partition the problem domain proportionally",
+        "rationale": "Reduces the barrier wait time to near zero; total throughput is limited by the slowest rank"
+      },
+      {
+        "action": "Replace MPI_Barrier with MPI_Ibarrier (non-blocking) so fast ranks can queue follow-on work while waiting",
+        "mechanism": "MPI_Ibarrier + MPI_Wait; queue independent GPU work between the two calls on fast ranks",
+        "rationale": "Fast ranks overlap their barrier wait with useful computation instead of spinning"
+      },
+      {
+        "action": "Restructure the algorithm to avoid a global synchronization point on the critical path",
+        "mechanism": "Replace global barrier with point-to-point synchronization (MPI_Send/Recv or MPI_Isend/Irecv) between dependent rank pairs only",
+        "rationale": "Scope of synchronization matches the actual data dependency; ranks not dependent on each other never stall"
+      }
+    ]
+  },
+
+  "mpi_allreduce": {
+    "run_id": "run_13",
+    "display_name": "Host-staged MPI_Allreduce",
+    "expected_bottleneck": "host_staged_collective",
+    "nsys_signature": [
+      "Per-reduction triplet visible on each rank: D2H cudaMemcpy → MPI_Allreduce → H2D cudaMemcpy",
+      "GPU is idle during MPI_Allreduce; both PCIe directions are fully utilized flanking the collective",
+      "Two full-array PCIe transfers (D2H + H2D) per collective call; for large buffers this dominates reduction time"
+    ],
+    "suggestions": [
+      {
+        "action": "Pass device pointers directly to MPI_Allreduce (CUDA-aware MPI) to eliminate the D2H/H2D staging",
+        "mechanism": "Remove cudaMemcpy D2H/H2D calls around MPI_Allreduce; pass dev_buf directly; ensure MPICH_GPU_SUPPORT_ENABLED=1",
+        "rationale": "GTL routes the collective through device memory; host is not on the data path"
+      },
+      {
+        "action": "Use NCCL ncclAllReduce for higher-bandwidth intra-node reductions and network-aware inter-node reductions",
+        "mechanism": "Replace MPI_Allreduce with ncclAllReduce; NCCL uses NVLink intra-node and RDMA inter-node without involving the CPU",
+        "rationale": "NCCL is tuned for GPU collectives; it avoids PCIe entirely for intra-node and saturates the NIC for inter-node"
+      },
+      {
+        "action": "If the reduction result is a scalar, perform the reduction on-device and transfer only the scalar result to the host",
+        "mechanism": "Use a device-side reduction kernel (e.g., cub::DeviceReduce) followed by a single 4-byte D2H transfer; then use MPI_Allreduce on the scalar",
+        "rationale": "Reduces PCIe traffic from O(N) to O(1) per rank; the MPI collective operates on tiny host scalars"
+      }
+    ]
+  },
+
+  "mpi_halo_exchange": {
+    "run_id": "run_14",
+    "display_name": "Inter-node halo exchange with host staging",
+    "expected_bottleneck": "host_staged_halo_exchange",
+    "nsys_signature": [
+      "Per-halo-exchange triplet across the network: D2H cudaMemcpy → MPI_Sendrecv (inter-node) → H2D cudaMemcpy",
+      "GPU idle during MPI_Sendrecv; two full-halo PCIe transfers (D2H send-side + H2D receive-side) visible per exchange",
+      "MPI_Sendrecv duration includes both network latency and the time the remote rank spends staging; visible as a long CPU event in the MPI row"
+    ],
+    "suggestions": [
+      {
+        "action": "Use CUDA-aware MPI with GPU-Direct RDMA so the Slingshot NIC reads/writes device memory directly without host staging",
+        "mechanism": "Pass device pointers to MPI_Sendrecv; set MPICH_GPU_SUPPORT_ENABLED=1 and MPICH_RDMA_ENABLED_CUDA=1; GTL uses GDRCopy for the RDMA path",
+        "rationale": "Eliminates both PCIe round-trips; the NIC DMAs directly from/to GPU HBM via GDRCopy; CPU is completely off the data path"
+      },
+      {
+        "action": "If GPU-Direct RDMA is unavailable, use double-buffering to overlap host staging of the next halo with computation on the current halo",
+        "mechanism": "Alternate between two device and two host halo buffers; issue D2H for buffer B while computing with the data just received in buffer A",
+        "rationale": "Hides the staging latency (D2H + network + H2D) behind useful GPU compute; amortizes the PCIe cost"
+      },
+      {
+        "action": "Reduce halo size or communication frequency by increasing the subdomain-to-surface ratio (stronger scaling in the volume dimension)",
+        "mechanism": "Use larger per-rank problem volumes so the ratio of compute work to halo size increases",
+        "rationale": "Arithmetic intensity of the communication pattern improves; the same network bandwidth serves more compute work"
+      }
+    ]
+  }
+}

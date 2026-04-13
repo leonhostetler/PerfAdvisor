@@ -66,12 +66,12 @@ profile_mpi() {
 # ── Run #11: intra-node P2P staged — D2H → MPI_Sendrecv → H2D ring, 4 ranks ─
 profile_mpi run_11 4 \
     --scenario scen_i \
-    --transfer-size-mb 512 --reps 50
+    --transfer-size-mb 64 --reps 50
 
-# ── Run #12: MPI load imbalance — staggered barrier stall (4 ranks) ───────────
+# ── Run #12: MPI load imbalance — GPU compute imbalance → barrier stall (4 ranks)
 profile_mpi run_12 4 \
     --scenario scen_j \
-    --n 4194304 --work-iters 16 --stagger-us 1000 --reps 20
+    --n 16777216 --work-iters 16 --reps 20
 
 # ── Run #13: host-staged collective — D2H → MPI_Allreduce → H2D (4 ranks) ────
 profile_mpi run_13 4 \

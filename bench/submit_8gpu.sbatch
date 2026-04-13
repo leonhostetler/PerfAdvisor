@@ -13,10 +13,9 @@
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs #14, #16: inter-node MPI scenarios (8 ranks, 4 GPUs × 2 nodes).
-# Compares host-staged MPI vs GPUDirect RDMA transfers.
-# MPICH_GPU_SUPPORT_ENABLED / MPICH_RDMA_ENABLED_CUDA must be set before srun
-# for CUDA-aware MPI (run #16) to use device pointers directly.
+# Run #14: inter-node MPI scenario (8 ranks, 4 GPUs × 2 nodes).
+# Run #16 (GPU-Direct RDMA, optimized baseline) was removed — it has no visible
+# deficiency in Nsight Systems and serves only as a reference, not a bad run.
 #
 # --distribution=cyclic interleaves ranks across nodes:
 #   rank 0 → node 0, rank 1 → node 1, rank 2 → node 0, rank 3 → node 1, …
@@ -73,11 +72,6 @@ profile_mpi() {
 profile_mpi run_14 8 \
     --scenario scen_l \
     --transfer-size-mb 64 --reps 50
-
-# ── Run #16: inter-node GPU-Direct RDMA — CUDA-aware MPI, device pointers ─────
-profile_mpi run_16 8 \
-    --scenario scen_n \
-    --transfer-size-mb 64 --reps 50 --cuda-aware-mpi 1
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"
