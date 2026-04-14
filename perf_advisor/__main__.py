@@ -474,6 +474,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             sys.exit(1)
     timings["agent_s"] = time.perf_counter() - t_agent
 
+    # Save hypothesis JSON next to the log file when logging is enabled.
+    if _log_requested and _log_path is not None:
+        from perf_advisor.analysis.models import HypothesisReport
+
+        _hyp_path = _log_path.parent / f"{_profile_stem}_{_ts}_hypotheses.json"
+        _report = HypothesisReport(
+            profile_path=primary_profile,
+            generated_at=_start_time.isoformat(),
+            provider=resolved_provider,
+            model=resolved_model,
+            hypotheses=hypotheses,
+        )
+        _hyp_path.write_text(_report.model_dump_json(indent=2), encoding="utf-8")
+        if not args.quiet:
+            console.print(f"  Hypotheses: {_hyp_path}")
+
     if args.json:
         print(json.dumps(hypotheses, indent=2))
         return

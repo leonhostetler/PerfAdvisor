@@ -384,3 +384,30 @@ class ComparisonReport(BaseModel):
 
     narrative: str
     key_differences: list[ComparisonDiff] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis report (persisted alongside the LLM interaction log)
+# ---------------------------------------------------------------------------
+
+
+class HypothesisReport(BaseModel):
+    """Structured output of a single PerfAdvisor analyze run.
+
+    Written as ``{profile_stem}_{timestamp}_hypotheses.json`` next to the
+    LLM interaction log when ``--log`` is requested.  Downstream agents can
+    consume this file to act on hypotheses without re-running PerfAdvisor.
+    """
+
+    profile_path: str
+    generated_at: str = Field(description="ISO 8601 timestamp of when the run started")
+    provider: str = Field(description="LLM provider used (anthropic, openai, gemini, claude_code)")
+    model: str = Field(description="Model identifier used for hypothesis generation")
+    hypotheses: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Ranked list of hypothesis dicts as returned by the agent. "
+            "Each dict has: bottleneck_type, phase, description, evidence, "
+            "suggestion, expected_impact, action_category."
+        ),
+    )
