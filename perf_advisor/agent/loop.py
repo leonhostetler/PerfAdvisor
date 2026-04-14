@@ -489,9 +489,7 @@ def _run_api(
     client = anthropic.Anthropic()
     schemas = tool_schemas()
     messages: list[dict] = (
-        _preseed_messages(profile, summary, cross_rank_summary)
-        if summary is not None
-        else []
+        _preseed_messages(profile, summary, cross_rank_summary) if summary is not None else []
     )
     _device_info = summary.device_info if summary is not None else None
     _system = [
@@ -626,6 +624,12 @@ def _run_api(
         elif turns_left == 0:
             tool_results.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
 
+        # Guard: Anthropic rejects user messages with empty content.
+        # This can happen when stop_reason is not "end_turn" but no tool_use
+        # blocks were emitted (e.g. max_tokens truncation mid-response).
+        if not tool_results:
+            tool_results.append({"type": "text", "text": "Please continue."})
+
         # Estimate context and cached size for the next turn.
         # All of _ctx_total will be cache_read next turn; the new increment
         # (assistant response + tool results) will be cache_creation.
@@ -749,9 +753,7 @@ def _preseed_messages_openai(
                 "function": {"name": "cross_rank_summary", "arguments": "{}"},
             }
         )
-        tool_results.append(
-            {"role": "tool", "tool_call_id": "pre_3", "content": cross_rank_result}
-        )
+        tool_results.append({"role": "tool", "tool_call_id": "pre_3", "content": cross_rank_result})
 
     return [
         {"role": "user", "content": "Begin analysis."},
@@ -1225,9 +1227,8 @@ def _run_claude_code(
         summary_json, grounded=grounded, device_info=summary.device_info
     )
     if cross_rank_summary is not None:
-        prompt += (
-            "\n\ncross_rank_summary (multi-rank MPI analysis):\n"
-            + json.dumps(cross_rank_summary.model_dump(), indent=2)
+        prompt += "\n\ncross_rank_summary (multi-rank MPI analysis):\n" + json.dumps(
+            cross_rank_summary.model_dump(), indent=2
         )
 
     if verbose:

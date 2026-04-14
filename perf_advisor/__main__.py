@@ -10,7 +10,9 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from perf_advisor.agent.logger import LLMLogger
 from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
@@ -51,8 +53,6 @@ def _print_timings(timings: dict[str, float]) -> None:
 
 def _print_cross_rank_tables(cross_rank_summary) -> None:
     """Print per-rank overview and per-phase imbalance tables."""
-    from rich.panel import Panel
-
     from perf_advisor.analysis.models import CrossRankSummary
 
     crs: CrossRankSummary = cross_rank_summary
@@ -182,8 +182,6 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if len(args.profile) > 1:
         from pathlib import Path as _Path
 
-        from rich.panel import Panel
-
         from perf_advisor.analysis.cross_rank import (
             align_phases,
             compute_cross_rank_summary,
@@ -204,8 +202,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         if not args.quiet:
             console.print(
-                f"  Multi-rank mode: {len(profile_paths)} profiles, "
-                f"rank IDs {sorted(rank_ids)}"
+                f"  Multi-rank mode: {len(profile_paths)} profiles, rank IDs {sorted(rank_ids)}"
             )
 
         if args.verbose:
@@ -244,9 +241,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         else:
             primary_rank_id, outlier_reason = select_primary_rank(summaries)
             if not args.quiet:
-                console.print(
-                    f"  Primary rank: [cyan]{primary_rank_id}[/cyan] ({outlier_reason})"
-                )
+                console.print(f"  Primary rank: [cyan]{primary_rank_id}[/cyan] ({outlier_reason})")
 
         primary_profile = str(rank_id_to_path[primary_rank_id])
 
@@ -273,9 +268,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                         border_style="yellow",
                     )
                 )
-            cross_rank_summary = compute_cross_rank_summary(
-                summaries, primary_rank_id, alignment
-            )
+            cross_rank_summary = compute_cross_rank_summary(summaries, primary_rank_id, alignment)
             summary = summaries[primary_rank_id]
 
             if not args.quiet:
@@ -494,37 +487,30 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print(json.dumps(hypotheses, indent=2))
         return
 
-    table = Table(title=f"Hypotheses — {Path(primary_profile).name}", show_lines=True)
-    table.add_column("#", style="dim", width=3)
-    table.add_column("Type", style="cyan")
-    table.add_column("Phase", style="dim")
-    table.add_column("Impact", style="bold")
-    table.add_column("Action", style="magenta")
-    table.add_column("Conf")
-    table.add_column("Runtime%", style="dim")
-    table.add_column("Speedup", style="dim")
-    table.add_column("Description")
-    table.add_column("Evidence", style="dim")
-    table.add_column("Suggestion")
-
     _ACTION_ABBREV = {
         "runtime_config": "runtime",
         "launch_config": "launch",
         "code_optimization": "code",
         "algorithm": "algorithm",
     }
+    _IMPACT_COLOR = {"high": "red", "medium": "yellow", "low": "green"}
+    _CONF_COLOR = {"high": "green", "medium": "yellow", "low": "dim"}
+    _PANEL_BORDER = {"high": "red", "medium": "yellow", "low": "blue"}
+
+    console.print(
+        f"\n[bold]Hypotheses — {Path(primary_profile).name}[/bold]",
+        justify="center",
+    )
 
     for i, h in enumerate(hypotheses, 1):
-        impact_color = {"high": "red", "medium": "yellow", "low": "green"}.get(
-            str(h.get("expected_impact", "")).lower(), "white"
-        )
+        impact_raw = str(h.get("expected_impact", "")).lower()
+        impact_color = _IMPACT_COLOR.get(impact_raw, "white")
+
         action_raw = str(h.get("action_category", "")).lower()
         action_str = _ACTION_ABBREV.get(action_raw, action_raw or "—")
+
         conf_raw = str(h.get("confidence", "")).lower()
-        conf_color = {"high": "green", "medium": "yellow", "low": "dim"}.get(conf_raw, "")
-        conf_str = (
-            f"[{conf_color}]{conf_raw}[/{conf_color}]" if conf_color else (conf_raw or "—")
-        )
+        conf_color = _CONF_COLOR.get(conf_raw, "")
 
         rt_pct = h.get("runtime_fraction_pct")
         rt_str = f"{rt_pct:.1f}%" if rt_pct is not None else "—"
@@ -534,27 +520,40 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         if spd_lo is not None and spd_hi is not None:
             speedup_str = f"{spd_lo:.0f}–{spd_hi:.0f}%"
         elif spd_lo is not None:
-            speedup_str = f"~{spd_lo:.0f}%"
+            speedup_str = f"≥{spd_lo:.0f}%"
         elif spd_hi is not None:
-            speedup_str = f"~{spd_hi:.0f}%"
+            speedup_str = f"≤{spd_hi:.0f}%"
         else:
             speedup_str = "—"
 
-        table.add_row(
-            str(i),
-            h.get("bottleneck_type", "—"),
-            h.get("phase", "—"),
-            f"[{impact_color}]{h.get('expected_impact', '—')}[/{impact_color}]",
-            action_str,
-            conf_str,
-            rt_str,
-            speedup_str,
-            h.get("description", ""),
-            h.get("evidence", ""),
-            h.get("suggestion", ""),
-        )
+        # Header bar: one compact line of metadata.
+        # Use style= on each append — Text.append() treats its string as plain
+        # text, so embedding Rich markup tags produces literal output.
+        header = Text()
+        header.append(f"[{i}] {h.get('bottleneck_type', '—')}", style="bold cyan")
+        header.append(f"  ·  phase: {h.get('phase', '—')}", style="dim")
+        header.append("  ·  impact: ", style="dim")
+        header.append(impact_raw or "—", style=f"bold {impact_color}")
+        header.append("  ·  action: ", style="dim")
+        header.append(action_str, style="magenta")
+        header.append("  ·  conf: ", style="dim")
+        header.append(conf_raw or "—", style=conf_color or "")
+        header.append(f"  ·  runtime {rt_str}", style="dim")
+        if speedup_str != "—":
+            header.append(f"  ·  speedup {speedup_str}", style="dim")
 
-    console.print(table)
+        # Body: three labeled text blocks
+        body = Text()
+        body.append("Description\n", style="bold")
+        body.append(h.get("description", "—"))
+        body.append("\n\nEvidence\n", style="bold dim")
+        body.append(h.get("evidence", "—"), style="dim")
+        body.append("\n\nSuggestion\n", style="bold")
+        body.append(h.get("suggestion", "—"))
+
+        panel_content = Text.assemble(header, "\n\n", body)
+        border_color = _PANEL_BORDER.get(impact_raw, "white")
+        console.print(Panel(panel_content, border_style=border_color, expand=True))
 
     if not args.quiet:
         _print_timings(timings)
@@ -870,9 +869,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     from perf_advisor.ingestion.profile import NsysProfile
 
     with NsysProfile(args.profile) as profile:
-        summary = compute_profile_summary(
-            profile, max_phases=args.max_phases, verbose=args.verbose
-        )
+        summary = compute_profile_summary(profile, max_phases=args.max_phases, verbose=args.verbose)
 
     if args.json:
         print(summary.model_dump_json(indent=2))
@@ -955,8 +952,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
     missing = check_provider_available(resolved_provider)
     if missing:
         console.print(
-            f"[red]Error:[/red] {resolved_provider} provider requires a missing"
-            f" package: {missing}"
+            f"[red]Error:[/red] {resolved_provider} provider requires a missing package: {missing}"
         )
         sys.exit(1)
     console.print(
@@ -976,9 +972,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             )
             args.skip_judge = True
         else:
-            console.print(
-                f"Judge model:      [cyan]{judge_model}[/cyan] ({judge_provider})"
-            )
+            console.print(f"Judge model:      [cyan]{judge_model}[/cyan] ({judge_provider})")
 
     # ── Cached mode: load hypotheses from a previous run ────────────────────
     if args.cached:
@@ -1044,9 +1038,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
 
         _transcript_requested = args.transcript or bool(args.transcript_file)
         if _transcript_requested:
-            _transcript_dir = (
-                _Path(args.output).parent if args.output else _Path.cwd()
-            )
+            _transcript_dir = _Path(args.output).parent if args.output else _Path.cwd()
             _transcript_path = (
                 _Path(args.transcript_file)
                 if args.transcript_file
@@ -1058,9 +1050,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
 
     # ── Discovery mode ───────────────────────────────────────────────────────
     if not args.profiles_dir:
-        console.print(
-            "[red]Error:[/red] profiles_dir is required unless --cached is given."
-        )
+        console.print("[red]Error:[/red] profiles_dir is required unless --cached is given.")
         sys.exit(1)
 
     profiles_dir = _Path(args.profiles_dir)
@@ -1095,12 +1085,8 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             f"  {r.run_id:8s}  {r.scenario:35s}  {r.expected_bottleneck}{rank_note}{meta_note}"
         )
 
-    judge_note = (
-        " + judge scoring" if not args.skip_judge else " (judge skipped)"
-    )
-    console.print(
-        f"\nWill run PerfAdvisor on each profile{judge_note}."
-    )
+    judge_note = " + judge scoring" if not args.skip_judge else " (judge skipped)"
+    console.print(f"\nWill run PerfAdvisor on each profile{judge_note}.")
     if not args.yes and sys.stdin.isatty():
         try:
             answer = input("Proceed? [Y/n] ").strip().lower()
@@ -1265,9 +1251,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
 
     _transcript_requested = args.transcript or bool(args.transcript_file)
     if _transcript_requested:
-        _transcript_dir = (
-            _Path(args.output).parent if args.output else profiles_dir
-        )
+        _transcript_dir = _Path(args.output).parent if args.output else profiles_dir
         _transcript_path = (
             _Path(args.transcript_file)
             if args.transcript_file
