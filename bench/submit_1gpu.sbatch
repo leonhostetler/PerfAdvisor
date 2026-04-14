@@ -56,22 +56,22 @@ run() {
 }
 
 # ── Run #1: kernel-launch overhead — many tiny short-lived kernels ────────────
-run run_01 \
+run test_01 \
     --scenario scen_a \
     --n 16384 --launch-count 10000 --tiny-inner-ops 2 --host-sleep-us 5 --reps 10
 
 # ── Run #2: CPU sync stall — cudaStreamSynchronize after every launch ─────────
-run run_02 \
+run test_02 \
     --scenario scen_f \
     --n 2097152 --launch-count 2000 --tiny-inner-ops 16 --reps 10
 
 # ── Run #3: PCIe transfer-bound — H2D + compute + D2H, transfers dominate ────
-run run_03 \
+run test_03 \
     --scenario scen_b \
     --n 33554432 --work-iters 128 --chunks 16 --reps 20
 
 # ── Run #4: overlap missing — same as #3 but streams serialized ───────────────
-run run_04 \
+run test_04 \
     --scenario scen_c \
     --n 33554432 --work-iters 128 --chunks 16 --reps 20
 

@@ -2,7 +2,7 @@
   "_comment": "Static evaluation rubric for the synthetic CUDA benchmark suite. Keyed by the 'scenario' field in runtime ground-truth JSONs. Used by PerfAdvisor to score hypothesis quality: did the advisor identify the right bottleneck and recommend the right fixes?",
 
   "tiny_kernels": {
-    "run_id": "run_01",
+    "run_id": "test_01",
     "display_name": "Kernel launch overhead",
     "expected_bottleneck": "kernel_launch_overhead",
     "nsys_signature": [
@@ -30,7 +30,7 @@
   },
 
   "sync_stall": {
-    "run_id": "run_02",
+    "run_id": "test_02",
     "display_name": "CPU sync stall",
     "expected_bottleneck": "cpu_sync_stall",
     "nsys_signature": [
@@ -58,7 +58,7 @@
   },
 
   "transfer_bound": {
-    "run_id": "run_03",
+    "run_id": "test_03",
     "display_name": "PCIe transfer-bound",
     "expected_bottleneck": "pcie_transfer_bound",
     "nsys_signature": [
@@ -86,7 +86,7 @@
   },
 
   "overlap_missing": {
-    "run_id": "run_04",
+    "run_id": "test_04",
     "display_name": "Transfer-compute overlap missing",
     "expected_bottleneck": "cpu_gpu_overlap_missing",
     "nsys_signature": [
@@ -114,7 +114,7 @@
   },
 
   "p2p_staged": {
-    "run_id": "run_11",
+    "run_id": "test_05",
     "display_name": "Intra-node P2P with unnecessary host staging",
     "expected_bottleneck": "unnecessary_host_staging_intranode",
     "nsys_signature": [
@@ -142,7 +142,7 @@
   },
 
   "mpi_barrier_stall": {
-    "run_id": "run_12",
+    "run_id": "test_06",
     "display_name": "MPI load imbalance (barrier stall)",
     "expected_bottleneck": "mpi_load_imbalance",
     "nsys_signature": [
@@ -170,7 +170,7 @@
   },
 
   "mpi_allreduce": {
-    "run_id": "run_13",
+    "run_id": "test_07",
     "display_name": "Host-staged MPI_Allreduce",
     "expected_bottleneck": "host_staged_collective",
     "nsys_signature": [
@@ -198,7 +198,7 @@
   },
 
   "mpi_halo_exchange": {
-    "run_id": "run_14",
+    "run_id": "test_08",
     "display_name": "Inter-node halo exchange with host staging",
     "expected_bottleneck": "host_staged_halo_exchange",
     "nsys_signature": [

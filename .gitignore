@@ -28,6 +28,8 @@ build/
 *.sqlite
 *_log.txt
 bench/profiles/
+eval_*_transcript.txt
+eval_*.json
 
 # Environment / secrets
 .env

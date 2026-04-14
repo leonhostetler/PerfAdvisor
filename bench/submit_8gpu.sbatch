@@ -69,7 +69,7 @@ profile_mpi() {
 }
 
 # ── Run #14: inter-node halo exchange baseline — host-staged ring sendrecv ────
-profile_mpi run_14 8 \
+profile_mpi test_08 8 \
     --scenario scen_l \
     --transfer-size-mb 64 --reps 50
 

@@ -3,6 +3,7 @@ changelog — perf_advisor
 
 2026-04-13
 ----------
+- bench/, perf_advisor/eval/discover.py: rename all benchmark run IDs from run_NN to test_NN (run_01–04 → test_01–04; run_11–14 → test_05–08); updated ground_truth_meta.json run_id fields, submit_1gpu/4gpu/8gpu.sbatch profile names, README.md headings and cross-references; filesystem files in bench/profiles/ renamed to match.
 - perf_advisor/agent/tools.py: fix tool_top_kernels — occupancy and launch-overhead fields were null when called with start_ns/end_ns time bounds because device_info and launch_overhead were never computed in that code path; now computed once and passed to both _window_top_kernels and compute_top_kernels; same fix applied to tool_phase_summary, which also failed to pass these to compute_phase_summary.
 - perf_advisor/analysis/phases.py: fix _label — reserved "idle" for phases with zero GPU kernel activity (kernel_ns == 0); previously a phase with 2.6% GPU utilization but 150,000 kernel calls was labeled "idle" because the threshold was gpu_util < 5.0%; now falls through to the dominant-kernel name, so launch-overhead-dominated phases are labeled by their kernel rather than misleadingly labeled as idle.
 - perf_advisor/agent/tools.py, loop.py: clarify get_table_schema semantics in both the tool description and the system prompt — wording now says "use this *instead of* SELECT * LIMIT 1; never issue SELECT * just to discover columns" to prevent the pattern of calling both get_table_schema and a SELECT * query for the same table.
