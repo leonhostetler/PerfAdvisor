@@ -13,6 +13,7 @@ import threading
 from typing import Any
 
 from perf_advisor.analysis.metrics import (
+    _compute_launch_overhead,
     _window_idle_time,
     _window_kernel_time,
     _window_memcpy_by_kind,
@@ -20,6 +21,7 @@ from perf_advisor.analysis.metrics import (
     _window_nvtx_ranges,
     _window_streams,
     _window_top_kernels,
+    compute_device_info,
     compute_gap_histogram,
     compute_gpu_kernel_time,
     compute_memcpy_by_kind,
@@ -55,12 +57,24 @@ def tool_top_kernels(profile: NsysProfile, args: dict[str, Any]) -> dict:
     limit = int(args.get("limit", 15))
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
+    device_info = compute_device_info(profile)
+    launch_overhead = _compute_launch_overhead(profile)
     if start_ns is not None and end_ns is not None:
         start_ns, end_ns = int(start_ns), int(end_ns)
         total_kernel_s = _window_kernel_time(profile, start_ns, end_ns)
-        kernels = _window_top_kernels(profile, start_ns, end_ns, total_kernel_s, limit=limit)
+        kernels = _window_top_kernels(
+            profile,
+            start_ns,
+            end_ns,
+            total_kernel_s,
+            limit=limit,
+            device_info=device_info,
+            launch_overhead=launch_overhead,
+        )
     else:
-        kernels = compute_top_kernels(profile, limit=limit)
+        kernels = compute_top_kernels(
+            profile, limit=limit, device_info=device_info, launch_overhead=launch_overhead
+        )
     return {"kernels": [k.model_dump() for k in kernels]}
 
 
@@ -133,8 +147,19 @@ def tool_phase_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     if not phases:
         return {"phases": []}
 
+    device_info = compute_device_info(profile)
+    launch_overhead = _compute_launch_overhead(profile)
     profile_start_ns = phases[0].start_ns
-    summaries = [compute_phase_summary(profile, p, profile_start_ns) for p in phases]
+    summaries = [
+        compute_phase_summary(
+            profile,
+            p,
+            profile_start_ns,
+            device_info=device_info,
+            launch_overhead=launch_overhead,
+        )
+        for p in phases
+    ]
     return {"phases": [s.model_dump() for s in summaries]}
 
 
@@ -440,8 +465,8 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "name": "get_table_schema",
             "description": (
                 "Return the column names for a specific table in the profile SQLite database. "
-                "Use this before writing a sql_query if you are unsure of a table's exact "
-                "column names. More efficient than SELECT * LIMIT 1."
+                "Use this *instead of* SELECT * LIMIT 1 whenever you need to inspect column "
+                "names — never issue a SELECT * query just to discover the schema."
             ),
             "input_schema": {
                 "type": "object",

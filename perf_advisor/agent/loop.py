@@ -153,7 +153,8 @@ Key column names for sql_query (all timestamps are in nanoseconds):
   StringIds: id, value   ← join with: JOIN StringIds s ON s.id = <fk_column>
 
 Not all tables are present in every profile. The profile_summary tool lists available tables.
-Use the get_table_schema tool to inspect an unfamiliar table's column names.\
+Use the get_table_schema tool to inspect an unfamiliar table's column names — use it instead of \
+SELECT * LIMIT 1; never issue SELECT * just to discover columns.\
 """
 
 _SYSTEM_PROMPT_API_BASE = (

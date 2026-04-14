@@ -304,7 +304,10 @@ def _label(seg: _Seg, nvtx_ranges: list[tuple[int, int, str]]) -> str:
         best_name = max(coverage, key=lambda n: coverage[n])
         if coverage[best_name] >= 0.3 * window:
             return best_name
-    if seg.gpu_util < 5.0:
+    # Reserve "idle" for phases with genuinely zero GPU kernel activity.
+    # A phase with kernels but low GPU utilization (e.g. launch-overhead-dominated)
+    # should be labeled by its dominant kernel, not "idle".
+    if seg.kernel_ns == 0:
         return "idle"
     if seg.dominant_kernel:
         return seg.dominant_kernel
