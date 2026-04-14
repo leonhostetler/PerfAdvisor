@@ -334,7 +334,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
     # Pre-flight token estimate
-    _system_prompt = _build_system_prompt(grounded=not args.allow_app_knowledge)
+    _system_prompt = _build_system_prompt(
+        grounded=not args.allow_app_knowledge,
+        device_info=summary.device_info,
+    )
     _summary_json = summary.model_dump_json(indent=2)
     _schemas = tool_schemas()
     _schemas_json = json.dumps(_schemas)

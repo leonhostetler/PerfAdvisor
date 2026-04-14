@@ -180,9 +180,9 @@ def test_synthetic_mpi_barrier_time(synthetic_profile):
 
 def test_synthetic_device_info(synthetic_profile):
     info = compute_device_info(synthetic_profile)
-    assert info["sm_count"] == 108
-    assert info["max_threads_per_sm"] == 64 * 32  # 2048
-    assert abs(info["peak_bandwidth_GBs"] - 2000.0) < 1.0
+    assert info.sm_count == 108
+    assert info.max_threads_per_sm == 64 * 32  # 2048
+    assert abs(info.peak_memory_bandwidth_GBs - 2000.0) < 1.0
 
 
 def test_synthetic_occupancy_computed(synthetic_profile):
@@ -195,7 +195,7 @@ def test_synthetic_occupancy_computed(synthetic_profile):
 
 def test_synthetic_bandwidth_pct_computed(synthetic_profile):
     device_info = compute_device_info(synthetic_profile)
-    peak_bw = device_info["peak_bandwidth_GBs"]
+    peak_bw = device_info.peak_memory_bandwidth_GBs
     kinds = compute_memcpy_by_kind(synthetic_profile, peak_bandwidth_GBs=peak_bw)
     assert kinds[0].pct_of_peak_bandwidth is not None
     assert kinds[0].pct_of_peak_bandwidth > 0.0

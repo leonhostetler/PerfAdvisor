@@ -14,6 +14,7 @@ import time
 from perf_advisor.ingestion.profile import NsysProfile
 
 from .models import (
+    DeviceInfo,
     GapBucket,
     KernelSummary,
     MemcpySummary,
@@ -110,7 +111,7 @@ def compute_gpu_sync_time(profile: NsysProfile) -> float:
 def compute_top_kernels(
     profile: NsysProfile,
     limit: int = 15,
-    device_info: dict | None = None,
+    device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
     total_gpu_s = compute_gpu_kernel_time(profile)
@@ -142,8 +143,8 @@ def compute_top_kernels(
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
-    sm_count = (device_info or {}).get("sm_count")
-    max_threads_per_sm = (device_info or {}).get("max_threads_per_sm")
+    sm_count = device_info.sm_count if device_info else None
+    max_threads_per_sm = device_info.max_threads_per_sm if device_info else None
     result = []
     for r in rows:
         n = r["calls"]
@@ -310,41 +311,83 @@ def compute_nvtx_ranges(profile: NsysProfile, limit: int = 20) -> list[NvtxRange
     ]
 
 
-def compute_device_info(profile: NsysProfile) -> dict:
-    """Query TARGET_INFO_GPU for hardware properties used in occupancy and bandwidth metrics.
+def compute_device_info(profile: NsysProfile) -> DeviceInfo:
+    """Query TARGET_INFO_GPU for hardware properties.
 
-    Returns a dict with keys ``sm_count``, ``max_threads_per_sm``, ``peak_bandwidth_GBs``.
-    Any value may be ``None`` if TARGET_INFO_GPU is absent or the column is missing.
+    Returns a ``DeviceInfo`` instance.  All fields will be ``None`` if
+    ``TARGET_INFO_GPU`` is absent from the profile (e.g. older Nsight Systems
+    exports).  The return value is always a valid ``DeviceInfo`` object so
+    callers never need to null-check it.
     """
-    empty: dict = {"sm_count": None, "max_threads_per_sm": None, "peak_bandwidth_GBs": None}
     if not profile.has_table("TARGET_INFO_GPU"):
-        return empty
+        return DeviceInfo()
 
     cols = set(profile.columns("TARGET_INFO_GPU"))
     rows = profile.query("SELECT * FROM TARGET_INFO_GPU LIMIT 1")
     if not rows:
-        return empty
+        return DeviceInfo()
     r = rows[0]
 
-    sm_count = int(r["smCount"]) if "smCount" in cols and r["smCount"] else None
+    def _int(col: str) -> int | None:
+        return int(r[col]) if col in cols and r[col] is not None else None
+
+    def _float(col: str) -> float | None:
+        return float(r[col]) if col in cols and r[col] is not None else None
+
+    sm_count = _int("smCount")
 
     max_threads_per_sm = None
     if "maxWarpsPerSm" in cols and "threadsPerWarp" in cols:
         warps = r["maxWarpsPerSm"]
         warp_size = r["threadsPerWarp"]
-        if warps and warp_size:
+        if warps is not None and warp_size is not None:
             max_threads_per_sm = int(warps) * int(warp_size)
 
-    # memoryBandwidth is stored in bytes/s
-    peak_bandwidth_GBs = None
+    # memoryBandwidth is stored in bytes/s; convert to GB/s
+    peak_bw_GBs = None
     if "memoryBandwidth" in cols and r["memoryBandwidth"]:
-        peak_bandwidth_GBs = round(float(r["memoryBandwidth"]) / 1e9, 1)
+        peak_bw_GBs = round(float(r["memoryBandwidth"]) / 1e9, 1)
 
-    return {
-        "sm_count": sm_count,
-        "max_threads_per_sm": max_threads_per_sm,
-        "peak_bandwidth_GBs": peak_bandwidth_GBs,
-    }
+    compute_cap = None
+    major = _int("computeMajor")
+    minor = _int("computeMinor")
+    if major is not None and minor is not None:
+        compute_cap = f"{major}.{minor}"
+
+    total_mem_GiB = None
+    if "totalMemory" in cols and r["totalMemory"]:
+        total_mem_GiB = round(float(r["totalMemory"]) / (1024**3), 1)
+
+    l2_MiB = None
+    if "l2CacheSize" in cols and r["l2CacheSize"]:
+        l2_MiB = round(float(r["l2CacheSize"]) / (1024**2), 1)
+
+    clock_MHz = None
+    if "clockRate" in cols and r["clockRate"]:
+        clock_MHz = round(float(r["clockRate"]) / 1e6, 0)
+
+    shmem_KiB = None
+    if "maxShmemPerBlock" in cols and r["maxShmemPerBlock"]:
+        shmem_KiB = round(float(r["maxShmemPerBlock"]) / 1024, 1)
+
+    shmem_optin_KiB = None
+    if "maxShmemPerBlockOptin" in cols and r["maxShmemPerBlockOptin"]:
+        shmem_optin_KiB = round(float(r["maxShmemPerBlockOptin"]) / 1024, 1)
+
+    return DeviceInfo(
+        name=r["name"] if "name" in cols and r["name"] else None,
+        compute_capability=compute_cap,
+        sm_count=sm_count,
+        max_threads_per_sm=max_threads_per_sm,
+        peak_memory_bandwidth_GBs=peak_bw_GBs,
+        total_memory_GiB=total_mem_GiB,
+        l2_cache_MiB=l2_MiB,
+        max_threads_per_block=_int("maxThreadsPerBlock"),
+        max_registers_per_block=_int("maxRegistersPerBlock"),
+        max_shared_mem_per_block_KiB=shmem_KiB,
+        max_shared_mem_per_block_optin_KiB=shmem_optin_KiB,
+        clock_rate_MHz=clock_MHz,
+    )
 
 
 def _compute_launch_overhead(profile: NsysProfile) -> dict[str, tuple[float, float]]:
@@ -612,7 +655,7 @@ def _window_top_kernels(
     end_ns: int,
     total_kernel_s: float,
     limit: int = 5,
-    device_info: dict | None = None,
+    device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
     kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
@@ -644,8 +687,8 @@ def _window_top_kernels(
         ORDER BY total_s DESC
         LIMIT {limit}
     """)
-    sm_count = (device_info or {}).get("sm_count")
-    max_threads_per_sm = (device_info or {}).get("max_threads_per_sm")
+    sm_count = device_info.sm_count if device_info else None
+    max_threads_per_sm = device_info.max_threads_per_sm if device_info else None
     result = []
     for r in rows:
         n = r["calls"]
@@ -831,7 +874,7 @@ def compute_phase_summary(
     profile_start_ns: int,
     *,
     mpi_ops: list[MpiOpSummary] | None = None,
-    device_info: dict | None = None,
+    device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> PhaseSummary:
     """Compute full metrics for a single PhaseWindow.
@@ -896,7 +939,7 @@ def compute_profile_summary(
     t_start = time.perf_counter()
 
     device_info = compute_device_info(profile)
-    peak_bw = device_info.get("peak_bandwidth_GBs")
+    peak_bw = device_info.peak_memory_bandwidth_GBs
 
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
@@ -931,6 +974,7 @@ def compute_profile_summary(
 
     return ProfileSummary(
         profile_path=str(profile.path),
+        device_info=device_info,
         profile_span_s=round(span_s, 3),
         gpu_kernel_s=round(kernel_s, 3),
         gpu_memcpy_s=round(memcpy_s, 3),

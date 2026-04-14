@@ -93,6 +93,52 @@ class StreamSummary(BaseModel):
     pct_of_gpu_time: float
 
 
+class DeviceInfo(BaseModel):
+    """Hardware properties extracted from TARGET_INFO_GPU.
+
+    All fields are optional: they will be None if TARGET_INFO_GPU is absent
+    from the profile (e.g., older Nsight Systems exports).
+    """
+
+    name: str | None = Field(
+        default=None, description="GPU device name (e.g., 'NVIDIA A100-SXM4-40GB')"
+    )
+    compute_capability: str | None = Field(
+        default=None, description="CUDA compute capability, e.g. '8.0'"
+    )
+    sm_count: int | None = Field(
+        default=None, description="Number of streaming multiprocessors"
+    )
+    max_threads_per_sm: int | None = Field(
+        default=None,
+        description="Max concurrent threads per SM (maxWarpsPerSm × threadsPerWarp)",
+    )
+    peak_memory_bandwidth_GBs: float | None = Field(
+        default=None, description="Peak HBM/DRAM bandwidth in GB/s"
+    )
+    total_memory_GiB: float | None = Field(
+        default=None, description="Total GPU memory in GiB"
+    )
+    l2_cache_MiB: float | None = Field(
+        default=None, description="L2 cache size in MiB"
+    )
+    max_threads_per_block: int | None = Field(
+        default=None, description="Maximum threads per block"
+    )
+    max_registers_per_block: int | None = Field(
+        default=None, description="Maximum registers per block"
+    )
+    max_shared_mem_per_block_KiB: float | None = Field(
+        default=None, description="Standard shared memory limit per block in KiB"
+    )
+    max_shared_mem_per_block_optin_KiB: float | None = Field(
+        default=None, description="Opt-in (carveout) shared memory limit per block in KiB"
+    )
+    clock_rate_MHz: float | None = Field(
+        default=None, description="GPU clock rate in MHz"
+    )
+
+
 class PhaseSummary(BaseModel):
     """Metrics for a single execution phase within a profile.
 
@@ -144,6 +190,12 @@ class ProfileSummary(BaseModel):
     nvtx_ranges: list[NvtxRangeSummary] = Field(default_factory=list)
 
     # GPU hardware info (from TARGET_INFO_GPU, absent in older profiles)
+    device_info: DeviceInfo = Field(
+        default_factory=DeviceInfo,
+        description=(
+            "Hardware properties from TARGET_INFO_GPU; injected into the agent system prompt"
+        ),
+    )
     peak_memory_bandwidth_GBs: float | None = Field(
         default=None,
         description="Device peak memory bandwidth in GB/s (from TARGET_INFO_GPU.memoryBandwidth)",

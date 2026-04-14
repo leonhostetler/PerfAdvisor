@@ -33,7 +33,7 @@ from typing import Any
 from perf_advisor.agent.logger import LLMLogger
 from perf_advisor.agent.tools import dispatch, tool_schemas
 from perf_advisor.analysis.metrics import compute_profile_summary
-from perf_advisor.analysis.models import ProfileSummary
+from perf_advisor.analysis.models import DeviceInfo, ProfileSummary
 from perf_advisor.ingestion.profile import NsysProfile
 
 MODEL = "claude-opus-4-6"
@@ -184,22 +184,87 @@ objects (not wrapped in markdown fences) and nothing else after it.
 )
 
 
-def _build_system_prompt(grounded: bool = True) -> str:
-    parts = [_SYSTEM_PROMPT_API_BASE, _UNTRUSTED_DATA_NOTE]
+def _format_device_context(device_info: DeviceInfo) -> str:
+    """Format a compact hardware context block for injection into the system prompt.
+
+    Only produces output when at least the device name is known.
+    """
+    if not device_info.name:
+        return ""
+
+    cap = (
+        f" (Compute Capability {device_info.compute_capability})"
+        if device_info.compute_capability
+        else ""
+    )
+    line1 = f"GPU: {device_info.name}{cap}"
+
+    parts2 = []
+    if device_info.sm_count is not None:
+        parts2.append(f"SMs: {device_info.sm_count}")
+    if device_info.max_threads_per_sm is not None:
+        parts2.append(f"Threads/SM: {device_info.max_threads_per_sm:,}")
+    if device_info.peak_memory_bandwidth_GBs is not None:
+        parts2.append(f"Peak HBM BW: {device_info.peak_memory_bandwidth_GBs:,.1f} GB/s")
+    line2 = "  |  ".join(parts2)
+
+    parts3 = []
+    if device_info.total_memory_GiB is not None:
+        parts3.append(f"HBM: {device_info.total_memory_GiB:.1f} GiB")
+    if device_info.l2_cache_MiB is not None:
+        parts3.append(f"L2: {device_info.l2_cache_MiB:.0f} MiB")
+    if device_info.clock_rate_MHz is not None:
+        parts3.append(f"Clock: {int(device_info.clock_rate_MHz):,} MHz")
+    line3 = "  |  ".join(parts3)
+
+    parts4 = []
+    if device_info.max_threads_per_block is not None:
+        parts4.append(f"Max threads/block: {device_info.max_threads_per_block:,}")
+    if device_info.max_registers_per_block is not None:
+        parts4.append(f"Max regs/block: {device_info.max_registers_per_block:,}")
+    line4 = "  |  ".join(parts4)
+
+    shmem_parts = []
+    if device_info.max_shared_mem_per_block_KiB is not None:
+        shmem_parts.append(f"{device_info.max_shared_mem_per_block_KiB:.0f} KiB standard")
+    if device_info.max_shared_mem_per_block_optin_KiB is not None:
+        shmem_parts.append(
+            f"{device_info.max_shared_mem_per_block_optin_KiB:.0f} KiB opt-in carveout"
+        )
+    line5 = "Shared mem/block: " + " / ".join(shmem_parts) if shmem_parts else ""
+
+    body_lines = [ln for ln in [line1, line2, line3, line4, line5] if ln]
+    return "## Target Hardware\n\n" + "\n".join(body_lines) + "\n"
+
+
+def _build_system_prompt(grounded: bool = True, device_info: DeviceInfo | None = None) -> str:
+    parts = [_SYSTEM_PROMPT_API_BASE]
+    if device_info is not None:
+        ctx = _format_device_context(device_info)
+        if ctx:
+            parts.append(ctx)
+    parts.append(_UNTRUSTED_DATA_NOTE)
     if grounded:
         parts.append(_GROUNDING_CONSTRAINT)
     return "\n".join(parts)
 
 
-def _format_summary_prompt(summary_json: str, grounded: bool = True) -> str:
+def _format_summary_prompt(
+    summary_json: str, grounded: bool = True, device_info: DeviceInfo | None = None
+) -> str:
     grounding_section = f"\n{_GROUNDING_CONSTRAINT}\n" if grounded else ""
+    device_section = ""
+    if device_info is not None:
+        ctx = _format_device_context(device_info)
+        if ctx:
+            device_section = f"\n{ctx}\n"
     return f"""\
 You are an expert GPU performance engineer. Analyze the following Nsight Systems profile summary
 and produce a ranked list of actionable performance hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
 {_UNTRUSTED_DATA_NOTE}
-{grounding_section}
+{grounding_section}{device_section}
 The summary includes a 'phases' field that partitions the profile into sequential, non-overlapping
 execution phases (e.g., initialization, solvers, teardown). Each phase has its own GPU utilization,
 top kernels, and MPI breakdown. Analyze phases independently — global averages can be misleading
@@ -414,10 +479,11 @@ def _run_api(
         if summary is not None
         else []
     )
+    _device_info = summary.device_info if summary is not None else None
     _system = [
         {
             "type": "text",
-            "text": _build_system_prompt(grounded),
+            "text": _build_system_prompt(grounded, device_info=_device_info),
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -437,7 +503,7 @@ def _run_api(
     # Estimated total and cached context sizes for the upcoming turn.
     # Turn 1: full heuristic (no prior usage data); subsequent turns: exact from usage.
     _next_ctx_estimate = (
-        estimate_prose_tokens(_build_system_prompt(grounded))
+        estimate_prose_tokens(_build_system_prompt(grounded, device_info=_device_info))
         + estimate_json_tokens(json.dumps(messages, default=str))
         + estimate_json_tokens(json.dumps(schemas))
     )
@@ -711,7 +777,10 @@ def _run_openai(
         else [{"role": "user", "content": "Begin analysis."}]
     )
     # Prepend system prompt as a system message
-    messages = [{"role": "system", "content": _build_system_prompt(grounded)}] + messages
+    _device_info = summary.device_info if summary is not None else None
+    messages = [
+        {"role": "system", "content": _build_system_prompt(grounded, device_info=_device_info)}
+    ] + messages
     input_tokens = 0
     output_tokens = 0
     # Older models use max_tokens; newer models (o-series, gpt-4.1+) require max_completion_tokens.
@@ -946,8 +1015,9 @@ def _run_gemini(
         )
         for s in schemas
     ]
+    _device_info = summary.device_info if summary is not None else None
     config = genai_types.GenerateContentConfig(
-        system_instruction=_build_system_prompt(grounded),
+        system_instruction=_build_system_prompt(grounded, device_info=_device_info),
         tools=[genai_types.Tool(function_declarations=declarations)],
     )
 
@@ -1008,7 +1078,7 @@ def _run_gemini(
         logger.write_request(
             _log_turn,
             {
-                "system_instruction": _build_system_prompt(grounded),
+                "system_instruction": _build_system_prompt(grounded, device_info=_device_info),
                 "tool_declarations": [s["name"] for s in schemas],
                 "message": init_msg,
             },
@@ -1137,7 +1207,9 @@ def _run_claude_code(
         summary = compute_profile_summary(profile)
 
     summary_json = summary.model_dump_json(indent=2, exclude={"profile_path"})
-    prompt = _format_summary_prompt(summary_json, grounded=grounded)
+    prompt = _format_summary_prompt(
+        summary_json, grounded=grounded, device_info=summary.device_info
+    )
     if cross_rank_summary is not None:
         prompt += (
             "\n\ncross_rank_summary (multi-rank MPI analysis):\n"
