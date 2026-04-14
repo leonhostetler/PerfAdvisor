@@ -43,6 +43,7 @@ The pipeline has two distinct stages:
 - **CPU–GPU overlap** — time the CPU spent blocked in `*Synchronize` calls
 - **Stream utilization** — per-CUDA-stream GPU time and percentage
 - **NVTX ranges** — if the application uses NVTX annotations
+- **Hardware properties** — SM count, peak memory bandwidth, total HBM, L2 cache size, thread/register/shared-memory limits, and clock rate from `TARGET_INFO_GPU`; injected into the agent's system prompt so the model can reason about hardware constraints (e.g. whether a kernel is approaching the memory bandwidth ceiling for this specific GPU)
 
 This stage runs entirely locally. No LLM is contacted. You can inspect the output with the `summary` subcommand.
 
@@ -77,7 +78,7 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 
 The `profile_summary`, `phase_summary`, and (in multi-rank mode) `cross_rank_summary` results are pre-seeded from Stage 1 — the agent does not need to call those tools and will not spend tokens on them.
 
-Saving files to disk is opt-in. Pass `--log` to record every API request and response, and `--transcript` to save a transcript of terminal output (see Usage for details).
+Saving files to disk is opt-in. Pass `--log` to record every API request and response and to save the final hypotheses as a machine-readable JSON file; pass `--transcript` to save a transcript of terminal output (see Usage for details).
 
 ---
 
@@ -166,13 +167,17 @@ perf-advisor analyze profile.sqlite --yes
 # char/4 heuristic (adds one small API call; falls back to heuristic for other providers)
 perf-advisor analyze profile.sqlite --exact-token-count
 
-# Save a complete log of everything sent to and received from the LLM.
-# Written in real time; a partial log is available even if the run fails.
-# The file is placed next to the profile as {stem}_{timestamp}_log.txt.
+# Save a complete log of everything sent to and received from the LLM,
+# plus a structured hypothesis JSON file for downstream consumption.
+# Both files are written next to the profile:
+#   {stem}_{timestamp}_log.txt        — full API request/response log
+#   {stem}_{timestamp}_hypotheses.json — HypothesisReport (metadata + hypotheses)
+# The log is written in real time; a partial log is available even if the run fails.
 perf-advisor analyze profile.sqlite --log
 
-# Save the log to a specific path instead
+# Save the log (and hypotheses JSON) to a specific directory instead
 perf-advisor analyze profile.sqlite --log-file /tmp/my_run.log
+# hypotheses land at /tmp/{stem}_{timestamp}_hypotheses.json
 
 # Save a transcript of everything printed to the terminal.
 # Placed next to the profile as {stem}_{timestamp}_transcript.txt.
@@ -432,7 +437,7 @@ perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 
 **Prompt injection from untrusted profiles.** Profile data — including NVTX annotation text, kernel names, and MPI operation names — is inserted verbatim into the LLM prompt. A maliciously crafted profile could embed instruction-like text designed to manipulate the model's analysis output. Only analyze profiles from sources you trust.
 
-**Saved files.** When `--log` or `--transcript` is used, the corresponding files are written next to the profile. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
+**Saved files.** When `--log` is used, two files are written: `{stem}_{timestamp}_log.txt` (full API request/response log) and `{stem}_{timestamp}_hypotheses.json` (structured hypothesis output). When `--transcript` is used, `{stem}_{timestamp}_transcript.txt` is written. All files land next to the profile by default, or next to the path given by `--log-file`. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
 
 ---
 

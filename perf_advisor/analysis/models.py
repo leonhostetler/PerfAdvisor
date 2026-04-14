@@ -348,6 +348,18 @@ class MpiDiff(BaseModel):
     total_s_delta_pct: float | None = None
 
 
+class PhaseDiff(BaseModel):
+    """Per-phase scalar diffs between two matched phases (phase_aware mode only)."""
+
+    phase_name: str
+    phase_index: int
+    duration_s: ScalarDiff
+    gpu_utilization_pct: ScalarDiff
+    gpu_kernel_s: ScalarDiff
+    gpu_memcpy_s: ScalarDiff
+    total_gpu_idle_s: ScalarDiff
+
+
 class ProfileDiff(BaseModel):
     """Structured comparison between two ProfileSummary objects."""
 
@@ -365,14 +377,32 @@ class ProfileDiff(BaseModel):
     gpu_memcpy_s: ScalarDiff
     gpu_sync_s: ScalarDiff
     total_gpu_idle_s: ScalarDiff
+    # CPU–GPU overlap (None when cpu_sync_blocked_s is absent from both profiles)
+    cpu_sync_blocked_s: ScalarDiff | None = None
+    cpu_sync_blocked_pct: ScalarDiff | None = None
+    # Stream topology
+    stream_count_a: int = 0
+    stream_count_b: int = 0
+    dominant_stream_pct_a: float | None = None
+    dominant_stream_pct_b: float | None = None
     # Per-entity diffs (kernel_diffs empty for summary_no_kernel mode)
     kernel_diffs: list[KernelDiff] = Field(default_factory=list)
     memcpy_diffs: list[MemcpyDiff] = Field(default_factory=list)
     mpi_diffs: list[MpiDiff] = Field(default_factory=list)
+    # Per-phase diffs (populated only in phase_aware mode)
+    phase_diffs: list[PhaseDiff] = Field(default_factory=list)
 
 
 class ComparisonDiff(BaseModel):
     metric: str
+    phase: str = Field(
+        default="whole_profile",
+        description=(
+            "Phase this difference belongs to. Use the exact phase name from phase_diffs "
+            "when the difference is scoped to a specific phase; use 'whole_profile' for "
+            "top-level or cross-phase metrics."
+        ),
+    )
     profile_a: str
     profile_b: str
     magnitude_pct: float | None = None

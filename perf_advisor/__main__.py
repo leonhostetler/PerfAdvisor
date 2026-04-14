@@ -786,6 +786,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
         name_b = Path(args.profile_b).name
         t = Table(title="Key Differences", show_lines=True)
         t.add_column("Metric")
+        t.add_column("Phase")
         t.add_column(f"A: {name_a}", justify="right")
         t.add_column(f"B: {name_b}", justify="right")
         t.add_column("Delta %", justify="right")
@@ -799,8 +800,13 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 delta_str = f"{mag:+.1f}%"
                 abs_mag = abs(mag)
                 delta_color = "bold" if abs_mag >= 50 else "yellow" if abs_mag >= 20 else "dim"
+            phase_val = d.get("phase", "whole_profile")
+            phase_str = (
+                "[dim]—[/dim]" if phase_val == "whole_profile" else f"[cyan]{phase_val}[/cyan]"
+            )
             t.add_row(
                 d.get("metric", ""),
+                phase_str,
                 d.get("profile_a", ""),
                 d.get("profile_b", ""),
                 f"[{delta_color}]{delta_str}[/{delta_color}]",

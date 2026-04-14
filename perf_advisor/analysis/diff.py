@@ -18,6 +18,7 @@ from .models import (
     KernelDiff,
     MemcpyDiff,
     MpiDiff,
+    PhaseDiff,
     ProfileDiff,
     ProfileSummary,
     ScalarDiff,
@@ -29,6 +30,17 @@ _KERNEL_OVERLAP_THRESHOLD = 20.0  # Jaccard % below which per-kernel diff is ski
 def _sdiff(a: float, b: float) -> ScalarDiff:
     delta_pct = round((b - a) / a * 100, 1) if a != 0 else None
     return ScalarDiff(a=a, b=b, delta_pct=delta_pct)
+
+
+def _sdiff_opt(a: float | None, b: float | None) -> ScalarDiff | None:
+    """Like _sdiff but returns None when both inputs are None.
+
+    When only one side is None it is treated as 0.0 so the diff is still
+    informative (e.g., cpu_sync_blocked_s present in one profile but not the other).
+    """
+    if a is None and b is None:
+        return None
+    return _sdiff(a if a is not None else 0.0, b if b is not None else 0.0)
 
 
 def _delta_pct(a: float | None, b: float | None) -> float | None:
@@ -164,6 +176,52 @@ def compute_profile_diff(
             )
         )
 
+    # ------------------------------------------------------------------
+    # CPU–GPU overlap diffs
+    # ------------------------------------------------------------------
+    cpu_sync_blocked_s_diff = _sdiff_opt(
+        summary_a.cpu_sync_blocked_s, summary_b.cpu_sync_blocked_s
+    )
+    cpu_sync_blocked_pct_diff = _sdiff_opt(
+        summary_a.cpu_sync_blocked_pct, summary_b.cpu_sync_blocked_pct
+    )
+
+    # ------------------------------------------------------------------
+    # Stream topology
+    # ------------------------------------------------------------------
+    stream_count_a = len(summary_a.streams)
+    stream_count_b = len(summary_b.streams)
+    dominant_stream_pct_a = (
+        max((s.pct_of_gpu_time for s in summary_a.streams), default=None)
+        if summary_a.streams
+        else None
+    )
+    dominant_stream_pct_b = (
+        max((s.pct_of_gpu_time for s in summary_b.streams), default=None)
+        if summary_b.streams
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # Per-phase diffs (phase_aware mode only)
+    # ------------------------------------------------------------------
+    phase_diffs: list[PhaseDiff] = []
+    if phases_match:
+        for idx, (pa, pb) in enumerate(zip(summary_a.phases, summary_b.phases)):
+            phase_diffs.append(
+                PhaseDiff(
+                    phase_name=pa.name,
+                    phase_index=idx,
+                    duration_s=_sdiff(pa.duration_s, pb.duration_s),
+                    gpu_utilization_pct=_sdiff(
+                        pa.gpu_utilization_pct, pb.gpu_utilization_pct
+                    ),
+                    gpu_kernel_s=_sdiff(pa.gpu_kernel_s, pb.gpu_kernel_s),
+                    gpu_memcpy_s=_sdiff(pa.gpu_memcpy_s, pb.gpu_memcpy_s),
+                    total_gpu_idle_s=_sdiff(pa.total_gpu_idle_s, pb.total_gpu_idle_s),
+                )
+            )
+
     return ProfileDiff(
         profile_a_name=Path(summary_a.profile_path).name,
         profile_b_name=Path(summary_b.profile_path).name,
@@ -176,7 +234,14 @@ def compute_profile_diff(
         gpu_memcpy_s=_sdiff(summary_a.gpu_memcpy_s, summary_b.gpu_memcpy_s),
         gpu_sync_s=_sdiff(summary_a.gpu_sync_s, summary_b.gpu_sync_s),
         total_gpu_idle_s=_sdiff(summary_a.total_gpu_idle_s, summary_b.total_gpu_idle_s),
+        cpu_sync_blocked_s=cpu_sync_blocked_s_diff,
+        cpu_sync_blocked_pct=cpu_sync_blocked_pct_diff,
+        stream_count_a=stream_count_a,
+        stream_count_b=stream_count_b,
+        dominant_stream_pct_a=dominant_stream_pct_a,
+        dominant_stream_pct_b=dominant_stream_pct_b,
         kernel_diffs=kernel_diffs,
         memcpy_diffs=memcpy_diffs,
         mpi_diffs=mpi_diffs,
+        phase_diffs=phase_diffs,
     )

@@ -44,6 +44,7 @@ Output ONLY a JSON object (not an array, not wrapped in markdown fences) with th
   "key_differences": [
     {
       "metric": "brief metric name",
+      "phase": "exact phase name from phase_diffs, or \\"whole_profile\\" if not phase-specific",
       "profile_a": "formatted value for profile A",
       "profile_b": "formatted value for profile B",
       "magnitude_pct": <relative change as a float (positive = B larger),"""
@@ -53,6 +54,10 @@ Output ONLY a JSON object (not an array, not wrapped in markdown fences) with th
   ]
 }
 
+For the "phase" field: use "whole_profile" for top-level or cross-phase metrics. \
+When the difference is specific to one execution phase (phase_aware mode), \
+use the exact phase name as it appears in the phase_diffs array — do not invent names.
+
 Order key_differences by absolute magnitude (largest change first).
 Include at least the top 5 differences and no more than 15.
 """
@@ -61,7 +66,9 @@ Include at least the top 5 differences and no more than 15.
 _MODE_DESCRIPTION: dict[str, str] = {
     "phase_aware": (
         "Both profiles have the same execution phase structure. "
-        "Analyze differences within each matching phase, then summarize overall."
+        "Analyze differences within each matching phase, then summarize overall. "
+        "Set the 'phase' field of each key_difference to the exact phase name from "
+        "phase_diffs when the finding is phase-specific, or 'whole_profile' otherwise."
     ),
     "summary": (
         "The profiles have different phase structures so phase-level comparison is not possible. "
