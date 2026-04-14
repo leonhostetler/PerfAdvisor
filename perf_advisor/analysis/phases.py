@@ -52,10 +52,11 @@ class _Seg:
 
 
 def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
-    sources = [
-        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL",
-        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY",
-    ]
+    sources = []
+    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL")
+    if profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
+        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY")
     if profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
         sources.append(
             "SELECT start, end FROM CUPTI_ACTIVITY_KIND_RUNTIME "
@@ -78,6 +79,8 @@ def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
             sources.append(
                 f"SELECT start, end FROM {_mpi_tbl} WHERE start IS NOT NULL AND end IS NOT NULL"
             )
+    if not sources:
+        return 0, 0
     union_sql = " UNION ALL ".join(sources)
     row = profile.query(f"SELECT MIN(start) AS t0, MAX(end) AS t1 FROM ({union_sql})")[0]
     return int(row["t0"] or 0), int(row["t1"] or 0)
@@ -348,14 +351,15 @@ def detect_phases(
     tagged: list[tuple[int, int]] = []  # (timestamp_ns, priority)
 
     # GPU activity start/end are always phase boundaries on the true timeline
-    gpu_row = profile.query("""
-        SELECT MIN(start) AS gpu_start, MAX(end) AS gpu_end
-        FROM CUPTI_ACTIVITY_KIND_KERNEL
-    """)[0]
-    if gpu_row["gpu_start"]:
-        tagged.append((int(gpu_row["gpu_start"]), _PRI_GPU_EDGE))
-    if gpu_row["gpu_end"]:
-        tagged.append((int(gpu_row["gpu_end"]), _PRI_GPU_EDGE))
+    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+        gpu_row = profile.query("""
+            SELECT MIN(start) AS gpu_start, MAX(end) AS gpu_end
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+        """)[0]
+        if gpu_row["gpu_start"]:
+            tagged.append((int(gpu_row["gpu_start"]), _PRI_GPU_EDGE))
+        if gpu_row["gpu_end"]:
+            tagged.append((int(gpu_row["gpu_end"]), _PRI_GPU_EDGE))
 
     gap_bounds = _gap_boundaries(profile)
     tagged.extend((t, _PRI_GAP) for t in gap_bounds)

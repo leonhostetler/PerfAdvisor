@@ -62,8 +62,9 @@ class NsysProfile:
         return self.has_table("NVTX_EVENTS")
 
     def columns(self, table: str) -> list[str]:
+        """Return column names for table, or [] if the table does not exist."""
         if table not in self.tables:
-            raise ValueError(f"Unknown table: {table!r}")
+            return []
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return [r["name"] for r in rows]
 
@@ -90,9 +91,18 @@ class NsysProfile:
         No row limit is applied here — internal analysis callers are trusted to
         include appropriate SQL LIMIT clauses.  LLM-instigated queries must go
         through query_safe(), which enforces its own row cap.
+
+        Returns [] if the query references a table that does not exist in this
+        profile (e.g. CUPTI_ACTIVITY_KIND_KERNEL in a kernel-less MPI profile).
+        All other OperationalErrors are re-raised.
         """
-        cursor = self._conn.execute(sql, params)
-        return cursor.fetchall()
+        try:
+            cursor = self._conn.execute(sql, params)
+            return cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
 
     def query_safe(
         self,

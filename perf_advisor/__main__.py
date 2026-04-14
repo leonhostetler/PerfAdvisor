@@ -896,6 +896,9 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
     from perf_advisor.eval.scorer import RunScore, score_run
     from perf_advisor.ingestion.profile import NsysProfile
 
+    _start_time = datetime.now()
+    _ts = _start_time.strftime("%Y%m%d_%H%M%S")
+
     # ── Resolve hypothesis-generation model ─────────────────────────────────
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
     missing = check_provider_available(resolved_provider)
@@ -987,6 +990,19 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                 },
             )
             console.print(f"\n  Results saved to {_out}")
+
+        _transcript_requested = args.transcript or bool(args.transcript_file)
+        if _transcript_requested:
+            _transcript_dir = (
+                _Path(args.output).parent if args.output else _Path.cwd()
+            )
+            _transcript_path = (
+                _Path(args.transcript_file)
+                if args.transcript_file
+                else _transcript_dir / f"eval_{_ts}_transcript.txt"
+            )
+            _transcript_path.write_text(console.export_text(clear=False), encoding="utf-8")
+            console.print(f"  Transcript: {_transcript_path}")
         return
 
     # ── Discovery mode ───────────────────────────────────────────────────────
@@ -1045,6 +1061,17 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
 
     # ── Per-run analysis + scoring ───────────────────────────────────────────
     from perf_advisor.agent.loop import run_agent
+
+    # Resolve per-run log directory (None = logging disabled).
+    _log_requested = args.log or bool(args.log_file)
+    _log_dir: _Path | None = None
+    if _log_requested:
+        if args.log_file:
+            _log_dir = _Path(args.log_file)
+            _log_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # Default: place logs next to each run's primary sqlite
+            _log_dir = None  # resolved per-run below using the sqlite parent
 
     results = []
     for run_cfg in runs:
@@ -1105,16 +1132,34 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                         verbose=False,
                     )
 
-            hypotheses = run_agent(
-                primary_profile,
-                summary=summary,
-                cross_rank_summary=cross_rank_summary,
-                verbose=False,
-                model=args.model,
-                max_turns=args.max_turns,
-                grounded=not args.allow_app_knowledge,
-                log=lambda msg: console.print(f"  {msg}", markup=False, highlight=False),
-            )
+            # Resolve per-run log path
+            _run_log_path: _Path | None = None
+            if _log_requested:
+                _run_log_dir = _log_dir or _Path(primary_profile).parent
+                _run_log_path = _run_log_dir / f"{run_cfg.run_id}_{_ts}_log.txt"
+                console.print(f"  LLM log:  {_run_log_path}")
+
+            with LLMLogger(_run_log_path) if _run_log_path else _null_context() as _logger:
+                if _run_log_path and _logger is not None:
+                    _logger.write_header(
+                        command="evaluate",
+                        argv=sys.argv,
+                        provider=resolved_provider,
+                        model=resolved_model,
+                        profile_path=primary_profile,
+                        start_time=_start_time,
+                    )
+                hypotheses = run_agent(
+                    primary_profile,
+                    summary=summary,
+                    cross_rank_summary=cross_rank_summary,
+                    verbose=False,
+                    model=args.model,
+                    max_turns=args.max_turns,
+                    grounded=not args.allow_app_knowledge,
+                    log=lambda msg: console.print(f"  {msg}", markup=False, highlight=False),
+                    logger=_logger,
+                )
             console.print(
                 f"  [green]✓[/green] {len(hypotheses)} hypothesis/hypotheses"
                 f" in {time.perf_counter() - t0:.1f}s"
@@ -1166,6 +1211,19 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
 
     if args.output:
         console.print(f"\n  Results saved to {args.output}")
+
+    _transcript_requested = args.transcript or bool(args.transcript_file)
+    if _transcript_requested:
+        _transcript_dir = (
+            _Path(args.output).parent if args.output else profiles_dir
+        )
+        _transcript_path = (
+            _Path(args.transcript_file)
+            if args.transcript_file
+            else _transcript_dir / f"eval_{_ts}_transcript.txt"
+        )
+        _transcript_path.write_text(console.export_text(clear=False), encoding="utf-8")
+        console.print(f"  Transcript: {_transcript_path}")
 
 
 class _FullHelpParser(argparse.ArgumentParser):
@@ -1464,6 +1522,34 @@ def main() -> None:
         "--yes",
         action="store_true",
         help="Skip the confirmation prompt.",
+    )
+    p_evaluate.add_argument(
+        "--log",
+        action="store_true",
+        help=(
+            "Save a full LLM interaction log for each run. "
+            "By default, logs are written next to each run's primary SQLite file "
+            "as {run_id}_{timestamp}_log.txt. See also --log-file."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--log-file",
+        metavar="DIR",
+        help=(
+            "Directory to write per-run LLM interaction logs (implies --log). "
+            "Each run produces {run_id}_{timestamp}_log.txt in this directory. "
+            "The directory is created if it does not exist."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--transcript",
+        action="store_true",
+        help="Save a transcript of the entire evaluation session to a file.",
+    )
+    p_evaluate.add_argument(
+        "--transcript-file",
+        metavar="PATH",
+        help="Save the session transcript to PATH (implies --transcript).",
     )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")

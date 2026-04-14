@@ -284,12 +284,17 @@ def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
     def _default(p: str) -> str:
         return model if model else _DEFAULT_MODELS[p]
 
+    def _reason(env_var: str) -> str:
+        if model:
+            return f"--model flag (provider auto-detected from {env_var})"
+        return f"presence of {env_var}"
+
     if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic", _default("anthropic"), "presence of ANTHROPIC_API_KEY"
+        return "anthropic", _default("anthropic"), _reason("ANTHROPIC_API_KEY")
     if os.environ.get("OPENAI_API_KEY"):
-        return "openai", _default("openai"), "presence of OPENAI_API_KEY"
+        return "openai", _default("openai"), _reason("OPENAI_API_KEY")
     if os.environ.get("GOOGLE_API_KEY"):
-        return "gemini", _default("gemini"), "presence of GOOGLE_API_KEY"
+        return "gemini", _default("gemini"), _reason("GOOGLE_API_KEY")
 
     return (
         "claude_code",

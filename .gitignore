@@ -27,6 +27,7 @@ build/
 # Profile exports and agent output logs
 *.sqlite
 *_log.txt
+bench/profiles/
 
 # Environment / secrets
 .env

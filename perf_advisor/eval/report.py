@@ -101,10 +101,17 @@ def print_run_details(r: RunScore, console: Console) -> None:
         console.print(f"\n[bold]{r.run_id}[/bold]  [red]ERROR: {r.error}[/red]")
         return
 
-    det = "[green]✓[/green]" if r.bottleneck_detected else "[red]✗[/red]"
+    if r.matched_hypothesis_idx is not None and r.hypotheses:
+        detected_type = r.hypotheses[r.matched_hypothesis_idx].get("bottleneck_type", "—")
+    elif r.hypotheses:
+        detected_type = r.hypotheses[0].get("bottleneck_type", "—")
+    else:
+        detected_type = "none"
+    det_mark = "[green]✓[/green]" if r.bottleneck_detected else "[red]✗[/red]"
     console.print(
         f"\n[bold]{r.run_id}[/bold]  scenario={r.scenario}"
-        f"  expected={r.expected_bottleneck}  detection={det}"
+        f"  expected_bottleneck={r.expected_bottleneck}"
+        f"  detected_bottleneck={detected_type} {det_mark}"
         f"  ({r.match_type or '—'})"
     )
 

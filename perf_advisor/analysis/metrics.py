@@ -58,10 +58,11 @@ def compute_profile_span(profile: NsysProfile) -> float:
     Includes CPU-side CUDA API calls (RUNTIME) and NVTX annotations so that the
     reported span matches the timeline shown in the Nsight Systems GUI.
     """
-    sources = [
-        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL",
-        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY",
-    ]
+    sources = []
+    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL")
+    if profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
+        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY")
     if profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
         sources.append(
             "SELECT start, end FROM CUPTI_ACTIVITY_KIND_RUNTIME "
@@ -72,12 +73,16 @@ def compute_profile_span(profile: NsysProfile) -> float:
             "SELECT start, end FROM NVTX_EVENTS "
             "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
         )
+    if not sources:
+        return 0.0
     union_sql = " UNION ALL ".join(sources)
     row = profile.query(f"SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s FROM ({union_sql})")[0]
     return float(row["span_s"] or 0.0)
 
 
 def compute_gpu_kernel_time(profile: NsysProfile) -> float:
+    if not profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+        return 0.0
     row = profile.query(
         "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_KERNEL"
     )[0]
@@ -545,6 +550,8 @@ def _compute_all_mpi_stats(
 
 
 def _window_kernel_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
+    if not profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+        return 0.0
     row = profile.query(f"""
         SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t
         FROM CUPTI_ACTIVITY_KIND_KERNEL
