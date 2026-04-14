@@ -138,6 +138,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     from perf_advisor.agent.preflight import (
         count_tokens_exact,
         estimate_cache_breakdown,
+        estimate_gemini_cache_breakdown,
         estimate_json_tokens,
         estimate_prose_tokens,
         estimate_total_session_tokens,
@@ -387,6 +388,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 f"  Cost-equiv:  ~{_cache_est['cost_equivalent']:,} tokens  ({_input_label})\n"
                 f"  Model:       {resolved_model} ({resolved_provider})"
             )
+        elif resolved_provider == "gemini":
+            _gemini_est = estimate_gemini_cache_breakdown(_input_tokens, _max_turns)
+            console.print(
+                f"\n[bold]Token estimate (Gemini, explicit context cache):[/bold]\n"
+                f"  Cached prefix: ~{_gemini_est['cache_write']:,} tokens"
+                f"  (0.25× each of {_max_turns} turns)\n"
+                f"  Cache reads:   ~{_gemini_est['cache_read']:,} tokens"
+                f"  (total across all turns)\n"
+                f"  Non-cached:    ~{_gemini_est['input']:,} tokens"
+                f"  (incremental per-turn history)\n"
+                f"  Output:        ~{_output_lo:,} – {_output_hi:,}"
+                f" (5 – {_max_turns} turns)\n"
+                f"  Cost-equiv:    ~{_gemini_est['cost_equivalent']:,} tokens"
+                f"  ({_input_label})\n"
+                f"  Model:         {resolved_model} ({resolved_provider})"
+            )
         else:
             _lo_turns = min(5, _max_turns)
             _total_lo = estimate_total_session_tokens(_input_tokens, _lo_turns)
@@ -566,7 +583,13 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             cost_str = f"  Cost: [yellow]${cost:.4f}[/yellow]" if cost is not None else ""
             if cache_write or cache_read:
                 _total = inp + cache_write + cache_read + out
-                _cost_equiv = int(cache_write * 1.25 + cache_read * 0.10 + inp)
+                _run_provider = token_usage.get("provider", "anthropic")
+                if _run_provider == "gemini":
+                    # Gemini: creation at 1.0×, reads at 0.25×
+                    _cost_equiv = int(cache_write * 1.0 + cache_read * 0.25 + inp)
+                else:
+                    # Anthropic: creation at 1.25×, reads at 0.10×
+                    _cost_equiv = int(cache_write * 1.25 + cache_read * 0.10 + inp)
                 console.print(
                     f"  Tokens: [cyan]{inp:,}[/cyan] non-cached"
                     f" / [cyan]{cache_write:,}[/cyan] cache-write"

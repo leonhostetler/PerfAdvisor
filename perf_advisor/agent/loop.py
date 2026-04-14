@@ -1039,13 +1039,10 @@ def _run_gemini(
         for s in schemas
     ]
     _device_info = summary.device_info if summary is not None else None
-    config = genai_types.GenerateContentConfig(
-        system_instruction=_build_system_prompt(grounded, device_info=_device_info),
-        tools=[genai_types.Tool(function_declarations=declarations)],
-    )
+    _system_prompt_text = _build_system_prompt(grounded, device_info=_device_info)
 
     # Gemini doesn't support injecting pre-computed tool results into history;
-    # include the pre-computed summary directly in the initial user message.
+    # build the summary text for use in the initial user message (or the cache).
     if summary is not None:
         profile_result = json.dumps(
             {
@@ -1058,28 +1055,72 @@ def _run_gemini(
             }
         )
         phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
-        init_msg = (
+        _summary_text: str | None = (
             "Begin analysis. Pre-computed profile data is provided below.\n\n"
             f"profile_summary:\n{profile_result}\n\n"
             f"phase_summary:\n{phase_result}"
         )
         if cross_rank_summary is not None:
             cross_rank_result = json.dumps(cross_rank_summary.model_dump())
-            init_msg += f"\n\ncross_rank_summary:\n{cross_rank_result}"
+            _summary_text += f"\n\ncross_rank_summary:\n{cross_rank_result}"
     else:
+        _summary_text = None
+
+    # Attempt explicit context caching: pre-create a named CachedContent containing
+    # the system instruction, tool declarations, and pre-computed profile summary.
+    # Every subsequent turn reads this fixed prefix at the cached-token rate (0.25×
+    # for Gemini 2.5 models) rather than re-billing the full input cost each turn.
+    # The cache has a 600 s TTL — ample for any analysis run — and expires automatically.
+    # Falls back to injecting the summary into the first user message if creation fails
+    # (e.g. token minimum not met, model does not support caching).
+    _cached_content = None
+    _cache_creation_tokens = 0
+    if _summary_text is not None:
+        try:
+            _cached_content = client.caches.create(
+                model=model,
+                config=genai_types.CreateCachedContentConfig(
+                    system_instruction=_system_prompt_text,
+                    tools=[genai_types.Tool(function_declarations=declarations)],
+                    contents=[
+                        genai_types.Content(
+                            role="user",
+                            parts=[genai_types.Part.from_text(_summary_text)],
+                        )
+                    ],
+                    ttl="600s",
+                ),
+            )
+            _um = getattr(_cached_content, "usage_metadata", None)
+            _cache_creation_tokens = getattr(_um, "total_token_count", 0) or 0
+        except Exception:
+            _cached_content = None
+
+    if _cached_content is not None:
+        # Cache created: reference it by name; summary is already inside the cache.
+        config = genai_types.GenerateContentConfig(cached_content=_cached_content.name)
         init_msg = "Begin analysis."
+    else:
+        # Fallback: no cache — put system + tools in config, summary in first message.
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_system_prompt_text,
+            tools=[genai_types.Tool(function_declarations=declarations)],
+        )
+        init_msg = _summary_text if _summary_text is not None else "Begin analysis."
 
     chat = client.chats.create(model=model, config=config)
     input_tokens = 0
     output_tokens = 0
+    cache_read_tokens = 0
     _log_turn = 0
 
     def _add_gemini_usage(r: Any) -> None:
-        nonlocal input_tokens, output_tokens
+        nonlocal input_tokens, output_tokens, cache_read_tokens
         um = getattr(r, "usage_metadata", None)
         if um:
             input_tokens += getattr(um, "prompt_token_count", 0) or 0
             output_tokens += getattr(um, "candidates_token_count", 0) or 0
+            cache_read_tokens += getattr(um, "cached_content_token_count", 0) or 0
 
     def _gemini_text(r: Any) -> str:
         """Extract text from a Gemini response without triggering the SDK warning
@@ -1099,6 +1140,7 @@ def _run_gemini(
             ],
             "usage_metadata": {
                 "prompt_token_count": getattr(um, "prompt_token_count", None),
+                "cached_content_token_count": getattr(um, "cached_content_token_count", None),
                 "candidates_token_count": getattr(um, "candidates_token_count", None),
             }
             if um
@@ -1110,8 +1152,12 @@ def _run_gemini(
         logger.write_request(
             _log_turn,
             {
-                "system_instruction": _build_system_prompt(grounded, device_info=_device_info),
+                "system_instruction": "(in cache)"
+                if _cached_content is not None
+                else _system_prompt_text,
                 "tool_declarations": [s["name"] for s in schemas],
+                "cached_content_name": getattr(_cached_content, "name", None),
+                "cached_content_tokens": _cache_creation_tokens or None,
                 "message": init_msg,
             },
         )
@@ -1131,9 +1177,10 @@ def _run_gemini(
                 cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
                 if ctx_tokens:
                     if cached_tokens:
+                        _cached_pct = cached_tokens / ctx_tokens * 100
                         log(
                             f"[local] Context size ≈ {ctx_tokens:,} tokens"
-                            f" ({cached_tokens:,} cached)"
+                            f" ({cached_tokens:,} cached, {_cached_pct:.0f}%)"
                         )
                     else:
                         log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
@@ -1147,8 +1194,14 @@ def _run_gemini(
             text = response.text or ""
             hypotheses = _extract_hypotheses(text)
             if hypotheses:
-                return hypotheses, input_tokens, 0, 0, output_tokens
-            return [], input_tokens, 0, 0, output_tokens
+                return (
+                    hypotheses,
+                    input_tokens,
+                    _cache_creation_tokens,
+                    cache_read_tokens,
+                    output_tokens,
+                )
+            return [], input_tokens, _cache_creation_tokens, cache_read_tokens, output_tokens
 
         parts = []
         parts_data: list[dict] = []
@@ -1206,13 +1259,19 @@ def _run_gemini(
         text = response_forced.text or ""
         hypotheses = _extract_hypotheses(text)
         if hypotheses:
-            return hypotheses, input_tokens, 0, 0, output_tokens
+            return (
+                hypotheses,
+                input_tokens,
+                _cache_creation_tokens,
+                cache_read_tokens,
+                output_tokens,
+            )
     except Exception as exc:
         if verbose:
             log(f"[local] Forced output turn failed: {exc}")
     if verbose:
         log("[local] Warning: no hypotheses extracted after forced output turn.")
-    return [], input_tokens, 0, 0, output_tokens
+    return [], input_tokens, _cache_creation_tokens, cache_read_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1398,6 +1457,7 @@ def run_agent(
         profile.close()
 
     if token_usage is not None:
+        token_usage["provider"] = resolved_provider
         token_usage["input_tokens"] = inp
         token_usage["cache_creation_tokens"] = cache_write
         token_usage["cache_read_tokens"] = cache_read

@@ -318,7 +318,9 @@ The pre-flight estimate for Anthropic runs shows the expected cache_write, cache
 
 **OpenAI — automatic caching:** OpenAI automatically caches repeated input prefixes longer than 1,024 tokens at a ~50% discount. No developer action is required; perf-advisor does not do anything special for OpenAI and the savings happen transparently.
 
-**Google Gemini — not implemented:** Gemini supports explicit context caching via an "upload once, reference by ID" API that is architecturally different from the per-request marker approach. It is not currently implemented in perf-advisor.
+**Google Gemini — explicit context cache (implemented):** Gemini's caching model differs fundamentally from Anthropic's. Rather than marking positions in the live conversation, perf-advisor pre-creates a named `CachedContent` object before the first turn containing the system instruction, tool declarations, and pre-computed profile summary. Every subsequent turn references this cache by name, so the fixed prefix is read at the cached-token rate (0.25× for Gemini 2.5 models) instead of being re-billed at full input cost. The cache is created with a 10-minute TTL and expires automatically after the run. If creation fails (e.g. token minimum not met, unsupported model variant), the backend falls back transparently to injecting the summary into the first user message.
+
+Unlike Anthropic's sliding window, the Gemini cache is a fixed snapshot — it covers only the static prefix and does not grow to include per-turn tool results. Those are re-sent in full each turn. For a 20-turn run on a typical profile, the explicit cache eliminates roughly 50–65% of billable input tokens.
 
 ---
 
@@ -339,11 +341,25 @@ Token estimate (Anthropic, sliding prompt cache):
 Proceed? [Y/n]
 ```
 
-For OpenAI and Gemini runs (full session total):
+For Gemini runs (with explicit context cache):
+
+```
+Token estimate (Gemini, explicit context cache):
+  Cached prefix: ~8,000 tokens  (0.25× each of 20 turns)
+  Cache reads:   ~160,000 tokens  (total across all turns)
+  Non-cached:    ~285,000 tokens  (incremental per-turn history)
+  Output:        ~3,800 – 12,800 (5 – 20 turns)
+  Cost-equiv:    ~333,000 tokens  (heuristic)
+  Model:         gemini-2.5-flash (gemini)
+Proceed? [Y/n]
+```
+
+For OpenAI runs (full session total):
 
 ```
 Token estimate (total across up to 20 turns):
   Input:  ~370,000 (heuristic)
+  (OpenAI applies automatic ~50% caching to repeated prefixes)
   Output: ~3,800 – 12,800
   Model:  gpt-4o (openai)
 Proceed? [Y/n]
@@ -390,9 +406,11 @@ perf-advisor analyze profile.sqlite --max-turns 5    # cheapest, summarizes afte
 
 Smaller models like Haiku tend to use more turns for the same analysis. A lower `--max-turns` bounds the cost while the built-in wrap-up warning and forced final turn ensure you still get output rather than an error.
 
-**Prompt caching** (already active for Anthropic — no action required):
+**Prompt caching** (active for Anthropic and Gemini — no action required):
 
-Anthropic runs benefit from sliding prompt caching automatically. The pre-flight estimate will show the expected cache breakdown. For long runs (many turns, large profiles) the cache savings dominate: a 20-turn run on a large profile that would cost ~500k billed tokens without caching costs ~100k with it.
+Anthropic runs use a sliding prompt cache. The pre-flight estimate shows the expected cache breakdown. For long runs on large profiles the savings dominate: a 20-turn run that would cost ~500k billed tokens without caching costs ~100k with it.
+
+Gemini runs use explicit context caching automatically. The pre-flight estimate shows the cached-prefix size, total cache reads, and cost-equivalent token count. A 20-turn run typically saves 50–65% of billable input tokens compared to an uncached session.
 
 **Use a smaller model:**
 

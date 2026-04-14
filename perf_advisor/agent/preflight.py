@@ -90,6 +90,36 @@ def estimate_total_session_tokens(
     return initial_tokens * max_turns + avg_increment * max_turns * (max_turns - 1) // 2
 
 
+def estimate_gemini_cache_breakdown(
+    initial_tokens: int,
+    max_turns: int,
+    avg_increment: int = _AVG_INCREMENT_TOKENS,
+) -> dict[str, int]:
+    """Estimate Gemini explicit context cache token breakdown for a multi-turn run.
+
+    Gemini caches a fixed prefix (system instruction + tool declarations + profile
+    summary) once at the start of the session.  Every turn reads this prefix at the
+    cached-token rate (0.25× for Gemini 2.5 models).  Only the incremental per-turn
+    history (tool results + assistant reasoning) is billed at the full input rate.
+
+    Returns a dict with:
+      cache_write     — tokens in the created cache object (billed at 1.0×, one-time)
+      cache_read      — total cached tokens read across all turns (billed at 0.25× each)
+      input           — non-cached input tokens (per-turn incremental history, summed)
+      cost_equivalent — weighted total: write×1.0 + read×0.25 + input×1.0
+    """
+    cache_write = initial_tokens
+    cache_read = initial_tokens * max_turns
+    input_non_cached = avg_increment * max_turns * (max_turns - 1) // 2
+    cost_equivalent = int(cache_write + cache_read * 0.25 + input_non_cached)
+    return {
+        "cache_write": cache_write,
+        "cache_read": cache_read,
+        "input": input_non_cached,
+        "cost_equivalent": cost_equivalent,
+    }
+
+
 def estimate_cache_breakdown(
     initial_tokens: int,
     max_turns: int,
