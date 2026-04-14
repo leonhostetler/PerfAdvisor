@@ -19,6 +19,8 @@ changelog — perf_advisor
 - paper/perf_advisor.bib: add 11 new bibliography entries (cui2025llmperf, astra2025, pragma2025, opal2025, gigiprofiler2025, kernelbench2025, cudallm2025, kernelmep2025, alphaevolve2025, kernelfoundry2026, polo2025) to support the expanded related-work discussion.
 - paper/perf_advisor.tex: expand Motivation and Significance section with a new paragraph surveying the surge of agentic LLM kernel-optimization work (Astra, PRAGMA, CUDA-LLM, Opal, POLO, MEP, AlphaEvolve, KernelFoundry, KernelBench, Cui et al.), and a second paragraph on profiling-guided diagnosis (gigiProfiler); sharpens PerfAdvisor's positioning as a system-level diagnosis tool rather than a kernel code generator; recompiled to 14 pages (presentation/draft_3.pdf).
 - paper/perf_advisor.tex: add \\usepackage[T1]{fontenc} to preamble to support the Croatian \\dj glyph in the Opal author name (Inđić).
+- perf_advisor/agent/loop.py: extend _HYPOTHESIS_SCHEMA with four new fields: runtime_fraction_pct (fraction of phase wall-clock time attributable to this bottleneck, agent computes from profile data), estimated_speedup_pct_lower / estimated_speedup_pct_upper (Amdahl-derived speedup range for partial vs. full mitigation), and confidence (high/medium/low tied to evidence quality: directly visible vs. derived vs. plausible).
+- perf_advisor/__main__.py (cmd_analyze): add Conf, Runtime%, and Speedup columns to the hypotheses rich table; Conf renders green/yellow/dim by tier; Speedup shows "L–U%" range or "—" when null.
 
 2026-04-13
 ----------

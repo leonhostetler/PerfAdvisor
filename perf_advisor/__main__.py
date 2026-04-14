@@ -500,6 +500,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     table.add_column("Phase", style="dim")
     table.add_column("Impact", style="bold")
     table.add_column("Action", style="magenta")
+    table.add_column("Conf")
+    table.add_column("Runtime%", style="dim")
+    table.add_column("Speedup", style="dim")
     table.add_column("Description")
     table.add_column("Evidence", style="dim")
     table.add_column("Suggestion")
@@ -517,12 +520,35 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         )
         action_raw = str(h.get("action_category", "")).lower()
         action_str = _ACTION_ABBREV.get(action_raw, action_raw or "—")
+        conf_raw = str(h.get("confidence", "")).lower()
+        conf_color = {"high": "green", "medium": "yellow", "low": "dim"}.get(conf_raw, "")
+        conf_str = (
+            f"[{conf_color}]{conf_raw}[/{conf_color}]" if conf_color else (conf_raw or "—")
+        )
+
+        rt_pct = h.get("runtime_fraction_pct")
+        rt_str = f"{rt_pct:.1f}%" if rt_pct is not None else "—"
+
+        spd_lo = h.get("estimated_speedup_pct_lower")
+        spd_hi = h.get("estimated_speedup_pct_upper")
+        if spd_lo is not None and spd_hi is not None:
+            speedup_str = f"{spd_lo:.0f}–{spd_hi:.0f}%"
+        elif spd_lo is not None:
+            speedup_str = f"~{spd_lo:.0f}%"
+        elif spd_hi is not None:
+            speedup_str = f"~{spd_hi:.0f}%"
+        else:
+            speedup_str = "—"
+
         table.add_row(
             str(i),
             h.get("bottleneck_type", "—"),
             h.get("phase", "—"),
             f"[{impact_color}]{h.get('expected_impact', '—')}[/{impact_color}]",
             action_str,
+            conf_str,
+            rt_str,
+            speedup_str,
             h.get("description", ""),
             h.get("evidence", ""),
             h.get("suggestion", ""),

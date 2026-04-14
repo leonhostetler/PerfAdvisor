@@ -105,7 +105,21 @@ Each hypothesis object must have these fields:
       code_optimization — kernel rewrites, memory layout, stream pipelining, async transfers
       algorithm         — solver change, preconditioner, deflation, mathematical reformulation
     Boundary rule: if the change alters *what* is computed → algorithm;
-    if it changes only *how* → code_optimization or lower.\
+    if it changes only *how* → code_optimization or lower.
+  - runtime_fraction_pct: fraction (0–100) of this phase's wall-clock time attributable to this
+           bottleneck. Compute directly from profile data where possible (e.g.
+           MPI_Barrier total_s / phase duration_s × 100). Use null if not computable.
+  - estimated_speedup_pct_lower: lower-bound speedup from partial (50%) mitigation of this
+           bottleneck, expressed as percent phase-time reduction. Formula:
+           (1 / (1 − 0.5 × F) − 1) × 100 where F = runtime_fraction_pct / 100. Null if
+           runtime_fraction_pct is null.
+  - estimated_speedup_pct_upper: upper-bound speedup if the bottleneck is fully eliminated (%).
+           Formula: (1 / (1 − F) − 1) × 100 where F = runtime_fraction_pct / 100. Null if
+           runtime_fraction_pct is null.
+  - confidence: quality of evidence supporting this hypothesis:
+      high   — directly visible in timeline data (explicit timing, kernel duration in profile)
+      medium — inferred from derived metrics (gap histogram, utilization ratio, phase aggregates)
+      low    — plausible but not directly confirmed by available profile data\
 """
 
 _GROUNDING_CONSTRAINT = """\
