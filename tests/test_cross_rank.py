@@ -231,10 +231,21 @@ class TestComputeCrossRankSummary:
         ]
         phases_rank0 = [_make_phase("cg", gpu_kernel_s=8.0, gpu_idle_s=2.0, mpi_ops=mpi_phase)]
         phases_rank1 = [_make_phase("cg", gpu_kernel_s=8.5, gpu_idle_s=1.5, mpi_ops=mpi_phase)]
-        phases_rank2 = [_make_phase("cg", gpu_kernel_s=14.0, gpu_idle_s=2.0, mpi_ops=[
-            MpiOpSummary(op="MPI_Barrier", calls=10, total_s=0.5, avg_ms=50.0, max_ms=100.0),
-            MpiOpSummary(op="MPI_Allreduce", calls=5, total_s=0.3, avg_ms=60.0, max_ms=80.0),
-        ])]
+        phases_rank2 = [
+            _make_phase(
+                "cg",
+                gpu_kernel_s=14.0,
+                gpu_idle_s=2.0,
+                mpi_ops=[
+                    MpiOpSummary(
+                        op="MPI_Barrier", calls=10, total_s=0.5, avg_ms=50.0, max_ms=100.0
+                    ),
+                    MpiOpSummary(
+                        op="MPI_Allreduce", calls=5, total_s=0.3, avg_ms=60.0, max_ms=80.0
+                    ),
+                ],
+            )
+        ]
         return {
             0: _make_summary(gpu_kernel_s=8.0, total_gpu_idle_s=12.0, phases=phases_rank0),
             1: _make_summary(gpu_kernel_s=8.5, total_gpu_idle_s=11.5, phases=phases_rank1),

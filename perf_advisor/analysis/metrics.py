@@ -733,7 +733,6 @@ def _window_top_kernels(
     return result
 
 
-
 def _window_mpi_ops(
     profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 5
 ) -> list[MpiOpSummary]:

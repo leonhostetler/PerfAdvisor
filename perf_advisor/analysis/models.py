@@ -106,9 +106,7 @@ class DeviceInfo(BaseModel):
     compute_capability: str | None = Field(
         default=None, description="CUDA compute capability, e.g. '8.0'"
     )
-    sm_count: int | None = Field(
-        default=None, description="Number of streaming multiprocessors"
-    )
+    sm_count: int | None = Field(default=None, description="Number of streaming multiprocessors")
     max_threads_per_sm: int | None = Field(
         default=None,
         description="Max concurrent threads per SM (maxWarpsPerSm × threadsPerWarp)",
@@ -116,15 +114,9 @@ class DeviceInfo(BaseModel):
     peak_memory_bandwidth_GBs: float | None = Field(
         default=None, description="Peak HBM/DRAM bandwidth in GB/s"
     )
-    total_memory_GiB: float | None = Field(
-        default=None, description="Total GPU memory in GiB"
-    )
-    l2_cache_MiB: float | None = Field(
-        default=None, description="L2 cache size in MiB"
-    )
-    max_threads_per_block: int | None = Field(
-        default=None, description="Maximum threads per block"
-    )
+    total_memory_GiB: float | None = Field(default=None, description="Total GPU memory in GiB")
+    l2_cache_MiB: float | None = Field(default=None, description="L2 cache size in MiB")
+    max_threads_per_block: int | None = Field(default=None, description="Maximum threads per block")
     max_registers_per_block: int | None = Field(
         default=None, description="Maximum registers per block"
     )
@@ -134,9 +126,7 @@ class DeviceInfo(BaseModel):
     max_shared_mem_per_block_optin_KiB: float | None = Field(
         default=None, description="Opt-in (carveout) shared memory limit per block in KiB"
     )
-    clock_rate_MHz: float | None = Field(
-        default=None, description="GPU clock rate in MHz"
-    )
+    clock_rate_MHz: float | None = Field(default=None, description="GPU clock rate in MHz")
 
 
 class PhaseSummary(BaseModel):
@@ -267,9 +257,7 @@ class CrossRankPhaseSummary(BaseModel):
     gpu_kernel_std_s: float
     gpu_kernel_min_s: float
     gpu_kernel_max_s: float
-    gpu_kernel_imbalance: float = Field(
-        description="(max - min) / mean; 0 = perfectly balanced"
-    )
+    gpu_kernel_imbalance: float = Field(description="(max - min) / mean; 0 = perfectly balanced")
     gpu_kernel_slowest_rank_id: int
     # MPI wait time stats across ranks
     mpi_wait_mean_s: float

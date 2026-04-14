@@ -48,19 +48,13 @@ def parse_rank_ids(paths: list[Path]) -> tuple[list[int], bool]:
     """
     names = [p.stem for p in paths]
     # Extract all non-negative integers from each stem, in order.
-    int_seqs: list[list[int]] = [
-        [int(m) for m in re.findall(r"\d+", name)] for name in names
-    ]
+    int_seqs: list[list[int]] = [[int(m) for m in re.findall(r"\d+", name)] for name in names]
 
     # All stems must yield the same number of integer tokens to compare slots.
     lengths = {len(seq) for seq in int_seqs}
     if len(lengths) == 1 and lengths != {0}:
         n_slots = lengths.pop()
-        varying = [
-            i
-            for i in range(n_slots)
-            if len({seq[i] for seq in int_seqs}) > 1
-        ]
+        varying = [i for i in range(n_slots) if len({seq[i] for seq in int_seqs}) > 1]
         if len(varying) == 1:
             slot = varying[0]
             return [seq[slot] for seq in int_seqs], True
@@ -88,11 +82,7 @@ def select_primary_rank(
     med = statistics.median(idle_values)
 
     if med > 0:
-        outliers = [
-            r
-            for r in rank_ids
-            if idle_by_rank[r] > med * (1 + OUTLIER_IDLE_THRESHOLD)
-        ]
+        outliers = [r for r in rank_ids if idle_by_rank[r] > med * (1 + OUTLIER_IDLE_THRESHOLD)]
     else:
         outliers = []
 
@@ -141,10 +131,7 @@ def align_phases(
     if len(set(phase_counts.values())) > 1:
         detail_lines = [f"  rank {r}: {phase_counts[r]} phases" for r in rank_ids]
         detail = "\n".join(detail_lines)
-        msg = (
-            "Phase count differs across ranks — cross-rank analysis cannot proceed.\n"
-            + detail
-        )
+        msg = "Phase count differs across ranks — cross-rank analysis cannot proceed.\n" + detail
         return "failed", msg
 
     # --- Check 2: phase names must match (or durations must agree) ---
@@ -157,17 +144,16 @@ def align_phases(
     # Names differ — check if durations agree within tolerance.
     n_phases = phase_counts[rank_ids[0]]
     for phase_idx in range(n_phases):
-        durations = [
-            summaries[r].phases[phase_idx].duration_s for r in rank_ids
-        ]
+        durations = [summaries[r].phases[phase_idx].duration_s for r in rank_ids]
         mean_dur = statistics.mean(durations)
         if mean_dur <= 0:
             continue
         if any(abs(d - mean_dur) / mean_dur > PHASE_DURATION_TOLERANCE for d in durations):
             # Duration divergence — likely a phase detection artifact.
-            worst_rank = max(rank_ids, key=lambda r: abs(
-                summaries[r].phases[phase_idx].duration_s - mean_dur
-            ) / mean_dur)
+            worst_rank = max(
+                rank_ids,
+                key=lambda r: abs(summaries[r].phases[phase_idx].duration_s - mean_dur) / mean_dur,
+            )
             worst_dur = summaries[worst_rank].phases[phase_idx].duration_s
             msg = (
                 f"Phase names differ across ranks and phase {phase_idx} durations diverge "
@@ -249,9 +235,7 @@ def compute_cross_rank_summary(
     for phase_idx in range(n_phases):
         phase_name = summaries[rank_ids[0]].phases[phase_idx].name
 
-        gpu_kernel_vals = [
-            summaries[r].phases[phase_idx].gpu_kernel_s for r in rank_ids
-        ]
+        gpu_kernel_vals = [summaries[r].phases[phase_idx].gpu_kernel_s for r in rank_ids]
         mpi_wait_vals = [_mpi_wait_s(summaries[r], phase_idx) for r in rank_ids]
 
         gpu_mean = statistics.mean(gpu_kernel_vals)
@@ -271,9 +255,7 @@ def compute_cross_rank_summary(
             op_vals = []
             for r in rank_ids:
                 matching = [
-                    o.total_s
-                    for o in summaries[r].phases[phase_idx].mpi_ops
-                    if o.op == op_name
+                    o.total_s for o in summaries[r].phases[phase_idx].mpi_ops if o.op == op_name
                 ]
                 op_vals.append(matching[0] if matching else 0.0)
             op_mean = statistics.mean(op_vals)

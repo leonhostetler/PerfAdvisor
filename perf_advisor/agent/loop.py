@@ -492,22 +492,29 @@ def _run_api(
         _preseed_messages(profile, summary, cross_rank_summary) if summary is not None else []
     )
     _device_info = summary.device_info if summary is not None else None
-    _system = [
-        {
-            "type": "text",
-            "text": _build_system_prompt(grounded, device_info=_device_info),
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
+    _system_text = _build_system_prompt(grounded, device_info=_device_info)
+    # When pre-seeding is active, the single permanent cache marker lives on the
+    # last pre-seed tool result (set in _preseed_messages).  That checkpoint covers
+    # tools + system + preseed in one unit, leaving 3 of the 4 allowed markers for
+    # the 2-slot sliding window plus one in reserve.
+    # When pre-seeding is absent (summary is None), fall back to marking the system
+    # prompt directly so at least the static system text is cached.
+    _system_cache = {"type": "ephemeral"} if summary is None else None
+    _system_block: dict = {"type": "text", "text": _system_text}
+    if _system_cache is not None:
+        _system_block["cache_control"] = _system_cache
+    _system = [_system_block]
     input_tokens = 0
     output_tokens = 0
     cache_creation_tokens = 0
     cache_read_tokens = 0
     # Anthropic allows at most 4 cache_control blocks per request.
-    # We use 2 permanent markers (system + preseed) and keep the 2 most-recent
-    # per-turn user messages marked, giving true sliding cache:
+    # We use 1 permanent marker (on the last pre-seed tool result, which implicitly
+    # covers tools + system + preseed) and keep the 2 most-recent per-turn user
+    # messages marked, giving true sliding cache:
     #   turn N reads everything through turn N-1 from cache (0.10×)
     #   turn N writes only the new increment to cache (1.25×)
+    # The fourth marker slot is left free for future use.
     # When a third per-turn message is about to be added, the oldest is stripped.
     _cache_prev: dict | None = None  # turn N-1 (keep marker)
     _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)

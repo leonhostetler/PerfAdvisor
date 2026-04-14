@@ -179,9 +179,7 @@ def compute_profile_diff(
     # ------------------------------------------------------------------
     # CPU–GPU overlap diffs
     # ------------------------------------------------------------------
-    cpu_sync_blocked_s_diff = _sdiff_opt(
-        summary_a.cpu_sync_blocked_s, summary_b.cpu_sync_blocked_s
-    )
+    cpu_sync_blocked_s_diff = _sdiff_opt(summary_a.cpu_sync_blocked_s, summary_b.cpu_sync_blocked_s)
     cpu_sync_blocked_pct_diff = _sdiff_opt(
         summary_a.cpu_sync_blocked_pct, summary_b.cpu_sync_blocked_pct
     )
@@ -213,9 +211,7 @@ def compute_profile_diff(
                     phase_name=pa.name,
                     phase_index=idx,
                     duration_s=_sdiff(pa.duration_s, pb.duration_s),
-                    gpu_utilization_pct=_sdiff(
-                        pa.gpu_utilization_pct, pb.gpu_utilization_pct
-                    ),
+                    gpu_utilization_pct=_sdiff(pa.gpu_utilization_pct, pb.gpu_utilization_pct),
                     gpu_kernel_s=_sdiff(pa.gpu_kernel_s, pb.gpu_kernel_s),
                     gpu_memcpy_s=_sdiff(pa.gpu_memcpy_s, pb.gpu_memcpy_s),
                     total_gpu_idle_s=_sdiff(pa.total_gpu_idle_s, pb.total_gpu_idle_s),
