@@ -3,6 +3,9 @@ changelog — perf_advisor
 
 2026-04-14
 ----------
+- README.md: add runtime_fraction_pct, estimated_speedup_pct_lower/upper, and confidence to the Stage 2 hypothesis field list.
+- paper/perf_advisor.tex: add four new hypothesis fields (runtime_fraction_pct, estimated_speedup_pct_lower/upper, confidence) to §2.1.4; replace "rich table" with stacked-panel description; update §3.2 cache structure from two permanent markers to one (pre-seed checkpoint implicitly covers tools + system + preseed); fix §4.1 NVTX annotation claim (annotations were removed from benchmark to avoid biasing the agent); fix §5.1 to clarify hypothesis JSON output requires --log; fix §5.2 multi-rank CLI (no --multi-rank flag, all profiles are positional args); update §6 Impact cache-marker description to match. Recompiled to 14 pages (presentation/draft_4.pdf).
+- CLAUDE.md: update current draft pointer to draft_4.pdf.
 - perf_advisor/agent/loop.py (_run_api): consolidate permanent prompt-cache markers from 2 to 1; remove cache_control from the system prompt block when pre-seeding is active (the single marker on the last pre-seed tool result implicitly caches tools + system + preseed as one unit, covering the same bytes); fall back to a system-prompt marker when summary is None; frees the fourth allowed marker as a reserve. Update cache strategy comment accordingly.
 - perf_advisor/analysis/cross_rank.py, diff.py, metrics.py, models.py, tests/test_cross_rank.py: ruff format pre-existing style fixes (no logic changes).
 - perf_advisor/agent/loop.py (_run_api): guard against empty tool_results before appending the user message; if stop_reason is not "end_turn" but no tool_use blocks were emitted (e.g. max_tokens truncation), inject a "Please continue." text block to prevent Anthropic API 400 "user messages must have non-empty content".

@@ -61,6 +61,10 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
   - `launch_config` — block/grid dimensions, shared memory, occupancy tuning (recompile only)
   - `code_optimization` — kernel rewrites, memory layout, stream pipelining, async transfers
   - `algorithm` — solver change, preconditioner, deflation, mathematical reformulation
+- `runtime_fraction_pct` — fraction (0–100) of the phase's wall-clock time attributable to this bottleneck, computed directly from profile data where possible; `null` if not computable
+- `estimated_speedup_pct_lower` — lower-bound speedup from 50% mitigation of the bottleneck (Amdahl's law); `null` if `runtime_fraction_pct` is `null`
+- `estimated_speedup_pct_upper` — upper-bound speedup from full elimination of the bottleneck; `null` if `runtime_fraction_pct` is `null`
+- `confidence` — quality of evidence: `high` (directly visible timing in profile), `medium` (inferred from derived metrics), `low` (plausible but not directly confirmed)
 
 **Tools available to the agent** (all read-only SQL queries against the local profile):
 
