@@ -3,6 +3,8 @@ changelog — perf_advisor
 
 2026-04-14
 ----------
+- perf_advisor/agent/loop.py, perf_advisor/__main__.py, README.md: replace gemini-2.0-flash (unavailable) with gemini-2.5-flash as the default Gemini model; update README example from gemini-1.5-pro to gemini-2.5-pro.
+- perf_advisor/agent/loop.py: add _gemini_text() helper to extract text from Gemini responses by reading candidates[0].content.parts directly, avoiding the SDK warning about non-text parts (function_call) that fired during logging and verbose display.
 - README.md: add runtime_fraction_pct, estimated_speedup_pct_lower/upper, and confidence to the Stage 2 hypothesis field list.
 - paper/perf_advisor.tex: add four new hypothesis fields (runtime_fraction_pct, estimated_speedup_pct_lower/upper, confidence) to §2.1.4; replace "rich table" with stacked-panel description; update §3.2 cache structure from two permanent markers to one (pre-seed checkpoint implicitly covers tools + system + preseed); fix §4.1 NVTX annotation claim (annotations were removed from benchmark to avoid biasing the agent); fix §5.1 to clarify hypothesis JSON output requires --log; fix §5.2 multi-rank CLI (no --multi-rank flag, all profiles are positional args); update §6 Impact cache-marker description to match. Recompiled to 14 pages (presentation/draft_4.pdf).
 - CLAUDE.md: update current draft pointer to draft_4.pdf.

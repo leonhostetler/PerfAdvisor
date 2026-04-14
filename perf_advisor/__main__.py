@@ -1341,7 +1341,7 @@ def main() -> None:
             "'openai:gpt-4o' (provider prefix + model), "
             "'openai' (provider only, uses default model), "
             "'claude-haiku-4-5-20251001' (model only, provider auto-detected). "
-            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai), gemini-2.0-flash (gemini)."
+            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai), gemini-2.5-flash (gemini)."
         ),
     )
     p_analyze.add_argument(

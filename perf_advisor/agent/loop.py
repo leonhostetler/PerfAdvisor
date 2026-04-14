@@ -13,7 +13,7 @@ Three backends are supported:
 Select a provider via --model:
   openai:gpt-4o          (provider prefix + model)
   openai                 (provider only, uses default model)
-  gemini:gemini-2.0-flash
+  gemini:gemini-2.5-flash
   anthropic:claude-opus-4-6
 
 LLM interaction logging (opt-in via --log / --log-file):
@@ -41,7 +41,7 @@ MODEL = "claude-opus-4-6"
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-opus-4-6",
     "openai": "gpt-4o",
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-2.5-flash",
     "claude_code": "claude-opus-4-6",
 }
 MAX_TURNS = 20
@@ -1081,10 +1081,19 @@ def _run_gemini(
             input_tokens += getattr(um, "prompt_token_count", 0) or 0
             output_tokens += getattr(um, "candidates_token_count", 0) or 0
 
+    def _gemini_text(r: Any) -> str:
+        """Extract text from a Gemini response without triggering the SDK warning
+        that fires when non-text parts (function_call) are also present."""
+        try:
+            parts = r.candidates[0].content.parts
+            return "".join(p.text for p in parts if getattr(p, "text", None))
+        except (AttributeError, IndexError):
+            return ""
+
     def _gemini_response_payload(r: Any) -> dict:
         um = getattr(r, "usage_metadata", None)
         return {
-            "text": r.text,
+            "text": _gemini_text(r),
             "function_calls": [
                 {"name": fc.name, "args": dict(fc.args)} for fc in (r.function_calls or [])
             ],
@@ -1128,7 +1137,7 @@ def _run_gemini(
                         )
                     else:
                         log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
-            text = response.text or ""
+            text = _gemini_text(response)
             if text:
                 log(f"[← llm] {_trunc(text)}")
             for fc in function_calls:
