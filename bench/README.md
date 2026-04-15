@@ -233,12 +233,56 @@ python -m perf_advisor evaluate bench/profiles/ \
 
 ### Scoring
 
-| Axis | Method | Output |
-|---|---|---|
-| Bottleneck detection | Enum map + keyword fallback; deterministic | ✓ / ✗ per run |
-| Suggestion coverage | LLM judge (default: Haiku); scores 0 / 1 / 2 per expected suggestion | raw score + % |
-| False positives | Count hypotheses with no match to expected bottleneck | count per run |
+| Axis                 | Method                                                               | Output        |
+| -------------------- | -------------------------------------------------------------------- | ------------- |
+| Bottleneck detection | Enum map + keyword fallback; deterministic                           | ✓ / ✗ per run |
+| Suggestion coverage  | LLM judge (default: Haiku); scores 0 / 1 / 2 per expected suggestion | raw score + % |
+| False positives      | Count hypotheses with no match to expected bottleneck                | count per run |
 
 The judge model defaults to `claude-haiku-4-5-20251001` regardless of the
 hypothesis model. Override with `--judge-model`.
 
+## Eval Results — 2026-04-15
+
+8 test scenarios: tiny_kernels, sync_stall, transfer_bound, overlap_missing, p2p_staged, mpi_barrier_stall,
+ mpi_allreduce, mpi_halo_exchange
+
+```
+  ┌────────────────────────┬──────────┬──────────────┬───────────────┬────────┐                                        
+  │         Model          │ Detected │ Avg Coverage │ Avg False Pos │ Errors │                            
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤
+  │ claude-opus-4-6        │ 8/8      │ 62.5%        │ 2.75          │ 0      │                                      
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤
+  │ gpt-5.4                │ 8/8      │ 54.2%        │ 2.50          │ 0      │                                        
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤                                        
+  │ claude-haiku-4-5       │ 8/8      │ 50.0%        │ 3.00          │ 0      │                                        
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤                                        
+  │ gpt-4o                 │ 6/8      │ 31.1%        │ 2.00          │ 0      │                            
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤                                        
+  │ gemini-2.5-flash       │ 5/8      │ 18.8%        │ 1.25          │ 2      │                                      
+  ├────────────────────────┼──────────┼──────────────┼───────────────┼────────┤                                        
+  │ gemini-3.1-pro-preview │ 0/8      │ 0.0%         │ 0             │ 8/8    │                            
+  └────────────────────────┴──────────┴──────────────┴───────────────┴────────┘                                                         
+```
+
+Key observations:
+
+- Opus-4-6 leads on detection rate (8/8) and suggestion coverage (62.5%), though false positives are slightly higher
+  than gpt-5.4.
+
+- GPT-5.4 is close runner-up — 8/8 detection, 54.2% coverage, and the lowest false positives among the 8/8 group
+  (2.50 avg).
+
+- Haiku-4-5 matches on detection but has the most false positives (3.0 avg), and drops to 50% coverage.
+
+- GPT-4o misses two scenarios entirely (sync_stall, overlap_missing) and coverage drops sharply on the multi-GPU MPI 
+  tests (test_05, test_08 both 0%).
+
+- Gemini-2.5-flash was partially functional — 2 API errors (tests 03, 04), and while it detected 5/8 bottlenecks,  
+  coverage was weak (0% on both 4-GPU MPI tests). Also missed test_07 entirely.
+
+- Gemini-3.1-pro-preview was fully down — all 8 runs hit 503 UNAVAILABLE errors; zero usable results.
+  
+  Common weakness across all models: MPI-specific suggestions (CUDA-aware MPI, GPU-Direct RDMA, NCCL, peer access) are 
+  consistently missed or only partially covered. The single-GPU kernel scenarios score better than the multi-GPU MPI  
+  tests across the board.
