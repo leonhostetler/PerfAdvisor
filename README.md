@@ -101,17 +101,24 @@ pip install -e ".[gemini]"    # Google Gemini models
 pip install -e ".[dev]"       # Tests and linting
 ```
 
-### Preparing a profile
+---
+
+## Usage
+
+### Profiles
+
+**NVIDIA Nsight Systems** ( `.sqlite`) is the only supported profile format. The profiler must be configured to capture GPU activity (`-t cuda` at minimum); NVTX annotations (`nvtx`) and MPI tracing (`mpi`) are supported when present.
+
+Versions tested:
+
+- 2025.5 (NVIDIA HPC SDK 25.5)
+- 2025.5.2
 
 Nsight Systems profiles must be exported to SQLite before use:
 
 ```bash
 nsys export --type sqlite --output profile.sqlite profile.nsys-rep
 ```
-
----
-
-## Usage
 
 ### Print metrics without running the LLM
 
@@ -460,17 +467,3 @@ perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 **Prompt injection from untrusted profiles.** Profile data — including NVTX annotation text, kernel names, and MPI operation names — is inserted verbatim into the LLM prompt. A maliciously crafted profile could embed instruction-like text designed to manipulate the model's analysis output. Only analyze profiles from sources you trust.
 
 **Saved files.** When `--log` is used, two files are written: `{stem}_{timestamp}_log.txt` (full API request/response log) and `{stem}_{timestamp}_hypotheses.json` (structured hypothesis output). When `--transcript` is used, `{stem}_{timestamp}_transcript.txt` is written. All files land next to the profile by default, or next to the path given by `--log-file`. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.
-
----
-
-## Testing
-
-Tests use a synthetic SQLite fixture and require no real Nsight profile or API key.
-
-```bash
-python -m pytest                                # run all tests
-python -m pytest tests/test_synthetic.py::test_name -v    # single test
-ruff check . && ruff format .                   # lint and format
-```
-
-Tested on Ubuntu 24.04.4 LTS with Nsight Systems 2025.3.1.90 (SQLite schema version 3.20.2).
