@@ -23,8 +23,7 @@ from typing import Any
 from perf_advisor.agent.logger import LLMLogger
 from perf_advisor.analysis.models import ProfileDiff, ProfileSummary
 
-_COMPARE_SYSTEM_PROMPT = (
-    """\
+_COMPARE_SYSTEM_PROMPT_BASE = """\
 You are a GPU performance engineer comparing two Nsight Systems profiles.
 Your goal is to identify and describe the most significant differences in GPU behavior — \
 utilization, kernel mix, memory bandwidth usage, MPI overhead, idle time — \
@@ -47,8 +46,7 @@ Output ONLY a JSON object (not an array, not wrapped in markdown fences) with th
       "phase": "exact phase name from phase_diffs, or \\"whole_profile\\" if not phase-specific",
       "profile_a": "formatted value for profile A",
       "profile_b": "formatted value for profile B",
-      "magnitude_pct": <relative change as a float (positive = B larger),"""
-    """ or null if not meaningful>,
+      "magnitude_pct": <relative change as float (positive = B larger), or null if not meaningful>,
       "note": "one sentence factual interpretation of this difference"
     }
   ]
@@ -61,7 +59,23 @@ use the exact phase name as it appears in the phase_diffs array — do not inven
 Order key_differences by absolute magnitude (largest change first).
 Include at least the top 5 differences and no more than 15.
 """
-)
+
+_COMPARE_GROUNDING_CONSTRAINT = """\
+Ground all observations strictly in the profile data provided.
+Do not draw on application-specific knowledge (e.g. environment variables, library options, \
+or algorithmic details inferred from kernel names) unless the profile data explicitly \
+demonstrates the relevant behavior. \
+If you are uncertain whether a specific option exists or applies, omit it or phrase the \
+observation in generic terms that any engineer could verify."""
+
+# Legacy alias kept for callers that imported the constant directly (e.g. preflight estimates).
+_COMPARE_SYSTEM_PROMPT = _COMPARE_SYSTEM_PROMPT_BASE + "\n" + _COMPARE_GROUNDING_CONSTRAINT
+
+
+def _build_compare_system_prompt(grounded: bool = True) -> str:
+    if grounded:
+        return _COMPARE_SYSTEM_PROMPT_BASE + "\n" + _COMPARE_GROUNDING_CONSTRAINT
+    return _COMPARE_SYSTEM_PROMPT_BASE
 
 _MODE_DESCRIPTION: dict[str, str] = {
     "phase_aware": (
@@ -125,14 +139,14 @@ def _extract_report(text: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _call_anthropic(prompt: str, model: str) -> tuple[str, int, int]:
+def _call_anthropic(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
     import anthropic
 
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=_COMPARE_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
     )
     text = ""
@@ -143,7 +157,7 @@ def _call_anthropic(prompt: str, model: str) -> tuple[str, int, int]:
     return text, response.usage.input_tokens, response.usage.output_tokens
 
 
-def _call_openai(prompt: str, model: str) -> tuple[str, int, int]:
+def _call_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
     try:
         from openai import OpenAI
     except ImportError:
@@ -159,7 +173,7 @@ def _call_openai(prompt: str, model: str) -> tuple[str, int, int]:
         kwargs: dict[str, Any] = dict(
             model=model,
             messages=[
-                {"role": "system", "content": _COMPARE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             **{_limit_param: 4096},
@@ -180,7 +194,7 @@ def _call_openai(prompt: str, model: str) -> tuple[str, int, int]:
     return text, inp, out
 
 
-def _call_gemini(prompt: str, model: str) -> tuple[str, int, int]:
+def _call_gemini(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
     try:
         from google import genai
         from google.genai import types as genai_types
@@ -191,7 +205,7 @@ def _call_gemini(prompt: str, model: str) -> tuple[str, int, int]:
         raise RuntimeError("GOOGLE_API_KEY environment variable is not set")
     client = genai.Client(api_key=api_key)
     config = genai_types.GenerateContentConfig(
-        system_instruction=_COMPARE_SYSTEM_PROMPT,
+        system_instruction=system_prompt,
     )
     response = client.models.generate_content(
         model=model,
@@ -246,6 +260,7 @@ def run_compare(
     diff: ProfileDiff,
     model: str | None = None,
     verbose: bool = True,
+    grounded: bool = True,
     token_usage: dict[str, Any] | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -263,6 +278,7 @@ def run_compare(
     resolved_provider, resolved_model, _ = _parse_provider_and_model(model)
 
     prompt = _build_prompt(summary_a, summary_b, diff)
+    system_prompt = _build_compare_system_prompt(grounded)
 
     if verbose:
         log(
@@ -273,18 +289,18 @@ def run_compare(
     if logger:
         logger.write_request(
             1,
-            {"system": _COMPARE_SYSTEM_PROMPT, "message": prompt},
+            {"system": system_prompt, "message": prompt},
         )
 
     cost_usd: float | None = None
     if resolved_provider == "anthropic":
-        text, inp, out = _call_anthropic(prompt, resolved_model)
+        text, inp, out = _call_anthropic(prompt, resolved_model, system_prompt)
     elif resolved_provider == "openai":
-        text, inp, out = _call_openai(prompt, resolved_model)
+        text, inp, out = _call_openai(prompt, resolved_model, system_prompt)
     elif resolved_provider == "gemini":
-        text, inp, out = _call_gemini(prompt, resolved_model)
+        text, inp, out = _call_gemini(prompt, resolved_model, system_prompt)
     else:
-        text, inp, out, cost_usd = _call_claude_code(f"{_COMPARE_SYSTEM_PROMPT}\n\n{prompt}")
+        text, inp, out, cost_usd = _call_claude_code(f"{system_prompt}\n\n{prompt}")
 
     if logger:
         logger.write_response(

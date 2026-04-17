@@ -1,6 +1,11 @@
 changelog — perf_advisor
 ========================
 
+2026-04-17
+----------
+- perf_advisor/agent/compare.py: add --allow-app-knowledge support to the compare subcommand. Replaced _COMPARE_SYSTEM_PROMPT constant with _COMPARE_SYSTEM_PROMPT_BASE + _COMPARE_GROUNDING_CONSTRAINT and a _build_compare_system_prompt(grounded) builder (mirrors _build_system_prompt in loop.py). Added grounded parameter to run_compare() and all _call_* backends; system prompt is built once and passed through.
+- perf_advisor/__main__.py: add --allow-app-knowledge argument to p_compare; thread grounded=not args.allow_app_knowledge into run_compare() and the preflight token estimate.
+
 2026-04-14
 ----------
 - README.md: remove Testing section; move "Preparing a profile" content into a new "Profiles" subsection under Usage; add tested Nsight Systems versions (2025.3.1.90, 2025.5 via HPC SDK 25.5, 2025.5.2).

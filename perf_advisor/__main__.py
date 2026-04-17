@@ -649,7 +649,7 @@ def _print_phase_table(summary, title: str) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
-    from perf_advisor.agent.compare import _COMPARE_SYSTEM_PROMPT, _build_prompt, run_compare
+    from perf_advisor.agent.compare import _build_compare_system_prompt, _build_prompt, run_compare
     from perf_advisor.agent.loop import (
         _parse_provider_and_model,
         check_provider_available,
@@ -729,12 +729,13 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     # Pre-flight token estimate
     _compare_prompt = _build_prompt(summary_a, summary_b, diff)
+    _compare_system_prompt = _build_compare_system_prompt(grounded=not args.allow_app_knowledge)
 
     if args.exact_token_count:
         _input_tokens = count_tokens_exact(
             resolved_provider,
             resolved_model,
-            _COMPARE_SYSTEM_PROMPT,
+            _compare_system_prompt,
             _compare_prompt,
         )
         if _input_tokens is None:
@@ -743,14 +744,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     f"[dim](exact count unavailable for {resolved_provider}"
                     " — using heuristic)[/dim]"
                 )
-            _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
-                _compare_prompt, resolved_provider
-            )
+            _input_tokens = estimate_prose_tokens(
+                _compare_system_prompt
+            ) + estimate_json_tokens(_compare_prompt, resolved_provider)
             _input_label = "heuristic"
         else:
             _input_label = "exact"
     else:
-        _input_tokens = estimate_prose_tokens(_COMPARE_SYSTEM_PROMPT) + estimate_json_tokens(
+        _input_tokens = estimate_prose_tokens(_compare_system_prompt) + estimate_json_tokens(
             _compare_prompt, resolved_provider
         )
         _input_label = "heuristic"
@@ -810,6 +811,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 diff=diff,
                 model=args.model,
                 verbose=not args.quiet,
+                grounded=not args.allow_app_knowledge,
                 token_usage=token_usage,
                 log=log,
                 logger=_logger,
@@ -1445,6 +1447,15 @@ def main() -> None:
         help=(
             "Model for comparison. Same format as analyze --model: "
             "'openai:gpt-4o', 'openai', or a bare model ID."
+        ),
+    )
+    p_compare.add_argument(
+        "--allow-app-knowledge",
+        action="store_true",
+        help=(
+            "Allow the model to draw on application-specific knowledge from training data "
+            "when interpreting differences. "
+            "By default observations are grounded strictly in the profile data."
         ),
     )
     p_compare.add_argument(
