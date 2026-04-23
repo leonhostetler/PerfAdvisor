@@ -1085,7 +1085,7 @@ def _run_gemini(
                     contents=[
                         genai_types.Content(
                             role="user",
-                            parts=[genai_types.Part.from_text(_summary_text)],
+                            parts=[genai_types.Part.from_text(text=_summary_text)],
                         )
                     ],
                     ttl="600s",
@@ -1221,14 +1221,14 @@ def _run_gemini(
 
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
-            parts.append(genai_types.Part.from_text(_WRAP_UP_WARNING.format(remaining=turns_left)))
+            parts.append(genai_types.Part.from_text(text=_WRAP_UP_WARNING.format(remaining=turns_left)))
             parts_data.append(
                 {"type": "text", "text": _WRAP_UP_WARNING.format(remaining=turns_left)}
             )
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
-            parts.append(genai_types.Part.from_text(_FINAL_FORCED_PROMPT))
+            parts.append(genai_types.Part.from_text(text=_FINAL_FORCED_PROMPT))
             parts_data.append({"type": "text", "text": _FINAL_FORCED_PROMPT})
 
         _log_turn += 1
