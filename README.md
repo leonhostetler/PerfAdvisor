@@ -125,7 +125,7 @@ nsys export --type sqlite --output profile.sqlite profile.nsys-rep
 ```bash
 perf-advisor summary profile.sqlite
 perf-advisor summary profile.sqlite --json        # machine-readable JSON
-perf-advisor summary profile.sqlite --max-phases 3
+perf-advisor summary profile.sqlite --max-phases 3   # default is 10
 ```
 
 This runs Stage 1 only — fast, free, no API key required.
@@ -159,7 +159,7 @@ perf-advisor analyze profile.sqlite --json
 # parameters that are incorrect or do not exist.
 perf-advisor analyze profile.sqlite --allow-app-knowledge
 
-# Limit phase detection (fewer phases = less context = fewer tokens)
+# Limit phase detection (fewer phases = less context = fewer tokens; default: 10)
 perf-advisor analyze profile.sqlite --max-phases 3
 perf-advisor analyze profile.sqlite --max-phases 1   # disable phase segmentation entirely
 
@@ -260,7 +260,7 @@ perf-advisor compare profile_a.sqlite profile_b.sqlite --yes
 # Exact token count via Anthropic API
 perf-advisor compare profile_a.sqlite profile_b.sqlite --exact-token-count
 
-# Limit phase detection (reduces context size and token cost)
+# Limit phase detection (reduces context size and token cost; default: 10)
 perf-advisor compare profile_a.sqlite profile_b.sqlite --max-phases 3
 
 # Save LLM interaction log and terminal transcript
@@ -402,7 +402,7 @@ perf-advisor analyze profile.sqlite --max-phases 2
 perf-advisor analyze profile.sqlite --max-phases 1   # global metrics only, no phases
 ```
 
-Each phase adds its own per-phase kernel table, MPI breakdown, and gap histogram to the pre-seeded context. Reducing from 6 to 1 can cut pre-seed size by 60–80%.
+Each phase adds its own per-phase kernel table, MPI breakdown, and gap histogram to the pre-seeded context. Reducing from the default of 10 to 1 can cut pre-seed size by 60–80%.
 
 **Cap the turn count** (reduces worst-case cost and avoids runaway tool loops):
 

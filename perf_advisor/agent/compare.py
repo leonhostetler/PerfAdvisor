@@ -77,6 +77,7 @@ def _build_compare_system_prompt(grounded: bool = True) -> str:
         return _COMPARE_SYSTEM_PROMPT_BASE + "\n" + _COMPARE_GROUNDING_CONSTRAINT
     return _COMPARE_SYSTEM_PROMPT_BASE
 
+
 _MODE_DESCRIPTION: dict[str, str] = {
     "phase_aware": (
         "Both profiles have the same execution phase structure. "

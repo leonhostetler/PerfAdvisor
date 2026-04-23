@@ -19,6 +19,13 @@ from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
 
 console = Console(record=True)
 
+_PHASE_WARNING = (
+    "[orange1]Warning: automated phase detection has no semantic understanding of the "
+    "application and can produce logically incorrect segmentations. Cross-reference results "
+    "against your knowledge of the application's natural compute stages and the Nsight Systems "
+    "GUI timeline; adjust --max-phases if the segmentation does not match expectations.[/orange1]"
+)
+
 
 class _null_context:
     """Minimal no-op context manager used when logging is not requested."""
@@ -187,8 +194,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             align_phases,
             compute_cross_rank_summary,
             parse_rank_ids,
+            select_consensus_k,
             select_primary_rank,
         )
+        from perf_advisor.analysis.phases import compute_phase_cost_curve
 
         profile_paths = [_Path(p) for p in args.profile]
         rank_ids, parsed_ok = parse_rank_ids(profile_paths)
@@ -211,6 +220,26 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             for rid, path in sorted(rank_id_to_path.items()):
                 print(f"         rank={rid}  {path}")
 
+        # Pass 1 — lightweight cost-curve extraction for consensus k selection
+        _cost_curves: dict[int, dict[int, float]] = {}
+        _selected_ks: dict[int, int] = {}
+        for rid, path in sorted(rank_id_to_path.items()):
+            with NsysProfile(path) as _prof:
+                _selected_ks[rid], _cost_curves[rid] = compute_phase_cost_curve(
+                    _prof, max_phases=args.max_phases, rank=rid
+                )
+
+        _consensus_k, _consensus_abort = select_consensus_k(
+            _cost_curves, _selected_ks, args.max_phases, verbose=args.verbose
+        )
+
+        if not args.quiet and _consensus_abort is None and len(set(_selected_ks.values())) > 1:
+            _ks_str = ", ".join(f"rank {r}: k={_selected_ks[r]}" for r in sorted(_selected_ks))
+            console.print(
+                f"  Phase consensus: k={_consensus_k} (per-rank selections differed — {_ks_str})"
+            )
+
+        # Pass 2 — full pipeline; forced_k=None if consensus aborted (each rank uses its elbow)
         timings: dict[str, float] = {}
         summaries: dict = {}
         for rid, path in sorted(rank_id_to_path.items()):
@@ -219,6 +248,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 summaries[rid] = compute_profile_summary(
                     _prof,
                     max_phases=args.max_phases,
+                    forced_k=_consensus_k,
                     timings=_rank_timings,
                     verbose=args.verbose,
                     rank=rid,
@@ -246,34 +276,47 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         primary_profile = str(rank_id_to_path[primary_rank_id])
 
-        # Phase alignment check
-        alignment, alignment_msg = align_phases(summaries)
-
-        if alignment == "failed":
+        if _consensus_abort is not None:
+            # Phase count diverged across ranks — skip cross-rank analysis entirely
             console.print(
                 Panel(
-                    f"[red]{alignment_msg}[/red]\n\n"
+                    f"[red]{_consensus_abort}[/red]\n\n"
                     f"Falling back to single-rank analysis on rank {primary_rank_id}.",
-                    title="[red]Error: Cross-rank Phase Alignment Failed[/red]",
+                    title="[red]Error: Cross-rank Phase Detection Diverged[/red]",
                     border_style="red",
                 )
             )
-            # Fall through with no cross_rank_summary; use primary rank only.
             summary = summaries[primary_rank_id]
         else:
-            if alignment == "index_order" and not args.quiet:
+            # Phase alignment check (names / durations)
+            alignment, alignment_msg = align_phases(summaries)
+
+            if alignment == "failed":
                 console.print(
                     Panel(
-                        f"[yellow]{alignment_msg}[/yellow]",
-                        title="[yellow]Warning: Phase Alignment[/yellow]",
-                        border_style="yellow",
+                        f"[red]{alignment_msg}[/red]\n\n"
+                        f"Falling back to single-rank analysis on rank {primary_rank_id}.",
+                        title="[red]Error: Cross-rank Phase Alignment Failed[/red]",
+                        border_style="red",
                     )
                 )
-            cross_rank_summary = compute_cross_rank_summary(summaries, primary_rank_id, alignment)
-            summary = summaries[primary_rank_id]
+                summary = summaries[primary_rank_id]
+            else:
+                if alignment_msg and not args.quiet:
+                    console.print(
+                        Panel(
+                            f"[yellow]{alignment_msg}[/yellow]",
+                            title="[yellow]Warning: Phase Alignment[/yellow]",
+                            border_style="yellow",
+                        )
+                    )
+                cross_rank_summary = compute_cross_rank_summary(
+                    summaries, primary_rank_id, alignment
+                )
+                summary = summaries[primary_rank_id]
 
-            if not args.quiet:
-                _print_cross_rank_tables(cross_rank_summary)
+                if not args.quiet:
+                    _print_cross_rank_tables(cross_rank_summary)
 
     else:
         # Single-rank path (original behaviour)
@@ -321,6 +364,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 row.append(top_mpi)
             ph.add_row(*row)
         console.print(ph)
+        if args.max_phases > 1:
+            console.print(_PHASE_WARNING)
 
     if args.verbose:
         console.print("\n[bold]── ProfileSummary sent to AI ──[/bold]")
@@ -618,7 +663,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             console.print(f"  Transcript: {_transcript_path}")
 
 
-def _print_phase_table(summary, title: str) -> None:
+def _print_phase_table(summary, title: str, max_phases: int = 10) -> None:
     """Print a phases table for one profile, or a note if no phases were detected."""
     if not summary.phases:
         console.print(f"[dim]{title}: no phases detected[/dim]")
@@ -646,6 +691,8 @@ def _print_phase_table(summary, title: str) -> None:
             top_kernel,
         )
     console.print(ph)
+    if max_phases > 1:
+        console.print(_PHASE_WARNING)
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
@@ -700,8 +747,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"\n  Profile A: [cyan]{Path(args.profile_a).name}[/cyan]"
             f"\n  Profile B: [cyan]{Path(args.profile_b).name}[/cyan]"
         )
-    _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}")
-    _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}")
+    _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}", args.max_phases)
+    _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}", args.max_phases)
 
     # Compute diff — also determines comparison_mode
     diff = compute_profile_diff(summary_a, summary_b)
@@ -744,9 +791,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     f"[dim](exact count unavailable for {resolved_provider}"
                     " — using heuristic)[/dim]"
                 )
-            _input_tokens = estimate_prose_tokens(
-                _compare_system_prompt
-            ) + estimate_json_tokens(_compare_prompt, resolved_provider)
+            _input_tokens = estimate_prose_tokens(_compare_system_prompt) + estimate_json_tokens(
+                _compare_prompt, resolved_provider
+            )
             _input_label = "heuristic"
         else:
             _input_label = "exact"
@@ -947,6 +994,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
                 top,
             )
         console.print(ph)
+        if args.max_phases > 1:
+            console.print(_PHASE_WARNING)
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity is inherent
@@ -1153,37 +1202,67 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                     align_phases,
                     compute_cross_rank_summary,
                     parse_rank_ids,
+                    select_consensus_k,
                     select_primary_rank,
                 )
+                from perf_advisor.analysis.phases import compute_phase_cost_curve
 
                 profile_paths = run_cfg.sqlite_paths
                 rank_ids, _ = parse_rank_ids(profile_paths)
                 rank_id_to_path = dict(zip(rank_ids, profile_paths))
+
+                # Pass 1 — cost curves for consensus k
+                _eval_cost_curves: dict[int, dict[int, float]] = {}
+                _eval_selected_ks: dict[int, int] = {}
+                for rid, path in sorted(rank_id_to_path.items()):
+                    with NsysProfile(path) as _prof:
+                        _eval_selected_ks[rid], _eval_cost_curves[rid] = compute_phase_cost_curve(
+                            _prof, max_phases=args.max_phases
+                        )
+
+                _eval_consensus_k, _eval_consensus_abort = select_consensus_k(
+                    _eval_cost_curves, _eval_selected_ks, args.max_phases
+                )
+
+                # Pass 2 — full pipeline
                 summaries: dict = {}
                 for rid, path in sorted(rank_id_to_path.items()):
                     with NsysProfile(path) as _prof:
                         summaries[rid] = compute_profile_summary(
                             _prof,
                             max_phases=args.max_phases,
+                            forced_k=_eval_consensus_k,
                             verbose=False,
                         )
 
                 primary_rank_id, _ = select_primary_rank(summaries)
                 primary_profile = str(rank_id_to_path[primary_rank_id])
-                alignment, _ = align_phases(summaries)
 
-                if alignment == "failed":
+                if _eval_consensus_abort is not None:
                     cross_rank_summary = None
                     summary = summaries[primary_rank_id]
                     console.print(
-                        "  [yellow]Warning:[/yellow] cross-rank phase alignment"
-                        " failed; using primary rank only."
+                        "  [yellow]Warning:[/yellow] cross-rank phase detection diverged;"
+                        " using primary rank only."
                     )
                 else:
-                    cross_rank_summary = compute_cross_rank_summary(
-                        summaries, primary_rank_id, alignment
-                    )
-                    summary = summaries[primary_rank_id]
+                    alignment, alignment_msg = align_phases(summaries)
+                    if alignment == "failed":
+                        cross_rank_summary = None
+                        summary = summaries[primary_rank_id]
+                        console.print(
+                            "  [yellow]Warning:[/yellow] cross-rank phase alignment"
+                            " failed; using primary rank only."
+                        )
+                    else:
+                        if alignment_msg:
+                            console.print(
+                                f"  [yellow]Warning: phase alignment — {alignment_msg}[/yellow]"
+                            )
+                        cross_rank_summary = compute_cross_rank_summary(
+                            summaries, primary_rank_id, alignment
+                        )
+                        summary = summaries[primary_rank_id]
             else:
                 primary_profile = str(run_cfg.sqlite_paths[0])
                 cross_rank_summary = None
@@ -1334,8 +1413,8 @@ def main() -> None:
     p_analyze.add_argument(
         "--max-phases",
         type=int,
-        default=6,
-        help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+        default=10,
+        help="Maximum number of execution phases to detect (default: 10; use 1 to disable)",
     )
     p_analyze.add_argument(
         "--primary-rank",
@@ -1435,10 +1514,10 @@ def main() -> None:
     p_compare.add_argument(
         "--max-phases",
         type=int,
-        default=6,
+        default=10,
         help=(
             "Maximum number of execution phases to detect per profile"
-            " (default: 6; use 1 to disable)"
+            " (default: 10; use 1 to disable)"
         ),
     )
     p_compare.add_argument(
@@ -1547,8 +1626,8 @@ def main() -> None:
     p_evaluate.add_argument(
         "--max-phases",
         type=int,
-        default=6,
-        help="Max execution phases to detect per profile (default: 6).",
+        default=10,
+        help="Max execution phases to detect per profile (default: 10).",
     )
     p_evaluate.add_argument(
         "--output",
@@ -1630,8 +1709,8 @@ def main() -> None:
     p_summary.add_argument(
         "--max-phases",
         type=int,
-        default=6,
-        help="Maximum number of execution phases to detect (default: 6; use 1 to disable)",
+        default=10,
+        help="Maximum number of execution phases to detect (default: 10; use 1 to disable)",
     )
 
     args = parser.parse_args()

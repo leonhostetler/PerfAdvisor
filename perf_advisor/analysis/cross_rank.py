@@ -21,6 +21,7 @@ from .models import (
     RankOverview,
     RankPhaseStats,
 )
+from .phases import _DP_ELBOW_THRESHOLD
 
 # A rank is considered an outlier if its GPU idle time exceeds the median by
 # more than this fraction.
@@ -134,47 +135,199 @@ def align_phases(
         msg = "Phase count differs across ranks — cross-rank analysis cannot proceed.\n" + detail
         return "failed", msg
 
-    # --- Check 2: phase names must match (or durations must agree) ---
+    # --- Check 2: phase names ---
     reference_names = phase_name_lists[rank_ids[0]]
     names_match = all(phase_name_lists[r] == reference_names for r in rank_ids[1:])
 
-    if names_match:
-        return "name_match", None
-
-    # Names differ — check if durations agree within tolerance.
+    # --- Check 3: duration divergence (always run) ---
     n_phases = phase_counts[rank_ids[0]]
+    duration_warn: str | None = None
     for phase_idx in range(n_phases):
         durations = [summaries[r].phases[phase_idx].duration_s for r in rank_ids]
         mean_dur = statistics.mean(durations)
         if mean_dur <= 0:
             continue
         if any(abs(d - mean_dur) / mean_dur > PHASE_DURATION_TOLERANCE for d in durations):
-            # Duration divergence — likely a phase detection artifact.
             worst_rank = max(
                 rank_ids,
                 key=lambda r: abs(summaries[r].phases[phase_idx].duration_s - mean_dur) / mean_dur,
             )
             worst_dur = summaries[worst_rank].phases[phase_idx].duration_s
-            msg = (
-                f"Phase names differ across ranks and phase {phase_idx} durations diverge "
-                f"beyond {int(PHASE_DURATION_TOLERANCE * 100)}% tolerance "
-                f"(rank {worst_rank}: {worst_dur:.2f}s vs. mean {mean_dur:.2f}s) — "
-                f"this likely indicates a phase detection artifact. "
-                f"Cross-rank analysis cannot proceed."
-            )
-            return "failed", msg
+            if names_match:
+                duration_warn = (
+                    f"Phase {phase_idx} durations diverge beyond "
+                    f"{int(PHASE_DURATION_TOLERANCE * 100)}% tolerance "
+                    f"(rank {worst_rank}: {worst_dur:.2f}s vs. mean {mean_dur:.2f}s) — "
+                    f"phase alignment may be unreliable despite matching names."
+                )
+                break
+            else:
+                msg = (
+                    f"Phase names differ across ranks and phase {phase_idx} durations diverge "
+                    f"beyond {int(PHASE_DURATION_TOLERANCE * 100)}% tolerance "
+                    f"(rank {worst_rank}: {worst_dur:.2f}s vs. mean {mean_dur:.2f}s) — "
+                    f"this likely indicates a phase detection artifact. "
+                    f"Cross-rank analysis cannot proceed."
+                )
+                return "failed", msg
+
+    if names_match:
+        return "name_match", duration_warn
 
     # Names differ but durations agree — use index-order alignment.
-    mismatched = []
-    for r in rank_ids[1:]:
-        if phase_name_lists[r] != reference_names:
-            mismatched.append(r)
+    mismatched = [r for r in rank_ids[1:] if phase_name_lists[r] != reference_names]
     msg = (
         f"Phase names differ across ranks (ranks {mismatched} disagree with rank {rank_ids[0]}) "
         f"but phase durations agree within {int(PHASE_DURATION_TOLERANCE * 100)}%. "
         f"Proceeding with index-order phase alignment."
     )
     return "index_order", msg
+
+
+# ---------------------------------------------------------------------------
+# Consensus k selection for multi-rank phase detection
+# ---------------------------------------------------------------------------
+
+# Maximum spread between per-rank elbow-selected k values before aborting.
+_K_SPREAD_THRESHOLD = 2
+
+# Maximum fractional cost excess at consensus k vs. a rank's optimal k before aborting.
+# Positive excess means consensus_k < rank's optimal k (forcing fewer phases than ideal).
+_COST_EXCESS_THRESHOLD = 0.15
+
+
+def select_consensus_k(
+    cost_curves: dict[int, dict[int, float]],
+    selected_ks: dict[int, int],
+    max_phases: int,
+    k_spread_threshold: int = _K_SPREAD_THRESHOLD,
+    cost_excess_threshold: float = _COST_EXCESS_THRESHOLD,
+    verbose: bool = False,
+) -> tuple[int | None, str | None]:
+    """Select a consensus k to use across all ranks for multi-rank phase detection.
+
+    Two sequential checks guard the consensus:
+
+    Check 1 (pre-consensus): if the spread of per-rank elbow-selected k values exceeds
+    k_spread_threshold, the ranks have structurally different workloads and cross-rank
+    analysis cannot proceed.
+
+    Check 2 (post-consensus): if forcing any rank to use consensus_k results in a cost
+    excess > cost_excess_threshold relative to that rank's own optimal cost, the rank's
+    data does not fit well into consensus_k phases.
+
+    Returns (consensus_k, None) on success, or (None, abort_message) on failure.
+    """
+    rank_ids = sorted(selected_ks)
+    k_vals = [selected_ks[r] for r in rank_ids]
+    k_min, k_max = min(k_vals), max(k_vals)
+    spread = k_max - k_min
+
+    if verbose:
+        ks_str = "   ".join(f"rank {r}: k={selected_ks[r]}" for r in rank_ids)
+        print(f"[phase consensus] Per-rank k selections: {ks_str}")
+
+    # Check 1: pre-consensus spread
+    if spread > k_spread_threshold:
+        detail = "\n".join(f"  rank {r}: k={selected_ks[r]}" for r in rank_ids)
+        msg = (
+            f"Per-rank phase-count selections span {spread} (threshold: {k_spread_threshold}).\n"
+            f"{detail}\n"
+            f"This likely indicates structurally different workloads across ranks."
+        )
+        if verbose:
+            print(
+                f"[phase consensus] Spread {spread} exceeds threshold {k_spread_threshold}"
+                " — aborting cross-rank analysis"
+            )
+        return None, msg
+
+    if verbose:
+        print(
+            f"[phase consensus] Spread {spread} ≤ threshold {k_spread_threshold}"
+            " — within tolerance, computing consensus"
+        )
+
+    # Fast path: all ranks agree
+    if len(set(k_vals)) == 1:
+        if verbose:
+            print(f"[phase consensus] All ranks agree on k={k_vals[0]} — no averaging needed")
+        return k_vals[0], None
+
+    # Compute averaged cost curve over the common k range
+    k_common_max = min(max(curve.keys()) for curve in cost_curves.values())
+    avg_costs = [
+        statistics.mean(cost_curves[r][k] for r in rank_ids if k in cost_curves[r])
+        for k in range(1, k_common_max + 1)
+    ]
+
+    if verbose:
+        cost_str = "   ".join(f"k={k}: {avg_costs[k - 1]:.3e}" for k in range(1, k_common_max + 1))
+        print(f"[phase consensus] Averaged cost curve: {cost_str}")
+
+    total_range = avg_costs[0] - avg_costs[-1]
+    consensus_k = 1
+    if total_range > 0:
+        for k in range(2, k_common_max + 1):
+            gain = (avg_costs[k - 2] - avg_costs[k - 1]) / total_range
+            if gain >= _DP_ELBOW_THRESHOLD:
+                consensus_k = k
+
+    if verbose:
+        if total_range > 0:
+            gain_str = "   ".join(
+                f"k={k}: {100 * (avg_costs[k - 2] - avg_costs[k - 1]) / total_range:.1f}%"
+                for k in range(2, k_common_max + 1)
+            )
+            print(
+                f"[phase consensus] Marginal gains: {gain_str}"
+                f"   (threshold: {100 * _DP_ELBOW_THRESHOLD:.0f}%)"
+            )
+        print(f"[phase consensus] Consensus k={consensus_k}")
+
+    # Check 2: post-consensus cost excess
+    # Only applies when consensus_k < a rank's optimal k (forcing fewer phases).
+    offenders: list[str] = []
+    for r in rank_ids:
+        opt_k = selected_ks[r]
+        if consensus_k >= opt_k:
+            if verbose:
+                print(
+                    f"[phase consensus]   rank {r}: optimal k={opt_k},"
+                    f" consensus k={consensus_k} ≥ optimal → 0.0% excess"
+                )
+            continue
+        curve = cost_curves[r]
+        if consensus_k not in curve or opt_k not in curve:
+            continue
+        cost_at_consensus = curve[consensus_k]
+        cost_at_optimal = curve[opt_k]
+        if cost_at_optimal <= 0:
+            continue
+        excess = (cost_at_consensus - cost_at_optimal) / cost_at_optimal
+        if verbose:
+            print(
+                f"[phase consensus]   rank {r}: optimal k={opt_k},"
+                f" consensus k={consensus_k}"
+                f" → {100 * excess:.1f}% cost excess"
+                f" (threshold: {100 * cost_excess_threshold:.0f}%)"
+            )
+        if excess > cost_excess_threshold:
+            offenders.append(
+                f"  rank {r}: cost at k={consensus_k} is {100 * excess:.1f}% above"
+                f" optimal k={opt_k} (threshold: {100 * cost_excess_threshold:.0f}%)"
+            )
+
+    if offenders:
+        detail = "\n".join(offenders)
+        msg = (
+            f"Consensus k={consensus_k} forces poor segmentation on"
+            f" {len(offenders)} rank(s):\n{detail}\n"
+            f"This indicates structurally different workloads across ranks."
+        )
+        return None, msg
+
+    return consensus_k, None
 
 
 # ---------------------------------------------------------------------------

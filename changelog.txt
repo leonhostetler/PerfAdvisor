@@ -1,8 +1,55 @@
 changelog — perf_advisor
 ========================
 
+2026-04-23
+----------
+- perf_advisor/analysis/phases.py, cross_rank.py, metrics.py, __main__.py: implement cross-rank consensus k selection (Option A) — instead of each rank independently choosing k via the elbow criterion (which can produce different counts and break cross-rank alignment), a lightweight first pass collects per-rank cost curves, select_consensus_k() checks spread (Check 1: abort if max−min > 2) and post-consensus cost excess (Check 2: abort if any rank's fit degrades >15%), then forces the agreed-upon k for all ranks in the full pipeline; compute_phase_cost_curve() runs steps 1–9 without labeling for the first pass; forced_k parameter threads through detect_phases() and compute_profile_summary(); cmd_evaluate updated with the same two-pass logic
+- perf_advisor/__main__.py: suppress phase-detection warning when --max-phases 1 is used (warning is irrelevant when segmentation is intentionally disabled)
+- perf_advisor/__main__.py: change default --max-phases from 6 to 10 for all subcommands (analyze, compare, evaluate, summary); updated help strings accordingly
+- README.md: note default of 10 in --max-phases comments and fix stale "Reducing from 6" text in token-cost section
+
+2026-04-22
+----------
+- docs/phase_detection.md: replace old algorithm section with the new distribution-based algorithm (Steps 1–10, hard-coded values table, limitations); heading levels adjusted to fit within the existing document structure
+- docs/phase_detection_algorithm_update.md: new file — combined old+new algorithm doc; old algorithm renamed and given a limitations subsection (two critical issues flagged); new algorithm appended in full
+- docs/phase_detection_new_algo.md: clarify Step 6 merge behavior — comparison is against the last accepted boundary (fixed-anchor), not a sliding window; explain that a chain where consecutive gaps are all below tolerance but total span exceeds it can produce multiple surviving boundaries
+- perf_advisor/analysis/cross_rank.py: run duration divergence check even when phase names match — previously a name match short-circuited before checking durations; now emits a yellow warning when names match but any phase's durations diverge beyond 20%; name mismatch + duration divergence still fails as before
+- perf_advisor/__main__.py: show phase alignment warning panel in cmd_analyze whenever alignment_msg is non-None (catches both index_order and new name_match duration divergence case); capture and print alignment_msg in cmd_evaluate for the same cases
+- perf_advisor/__main__.py: revert "Try adjusting --max-phases." from the cross-rank phase alignment failure messages in cmd_analyze and cmd_evaluate
+- perf_advisor/analysis/phases.py: print each raw boundary candidate (timestamp, priority, source) in Step 5 --verbose output; also add gpu count to the summary line
+- perf_advisor/analysis/phases.py: fix idle labeling — replace kernel_ns==0 check with gpu_util < _IDLE_LABEL_UTIL_THRESHOLD (1%); segments with negligible GPU activity during MPI waits or synchronization barriers are now correctly labeled "idle" instead of by their nominal dominant kernel
+- perf_advisor/analysis/phases.py: set _DP_ELBOW_THRESHOLD to 0.05 (was 0.10) — lower threshold accepts phases with smaller marginal cost reduction, making the algorithm less likely to collapse to fewer phases; update algorithm doc value and prose accordingly
+- perf_advisor/analysis/phases.py: replace greedy merge (Step 9) with optimal k-segmentation via dynamic programming — precomputes duration-weighted JS inertia cost matrix for all segment pairs, runs O(n²K) DP to find the globally optimal k-partition, selects k via elbow on cost curve (_DP_ELBOW_THRESHOLD=0.10); removes _GREEDY_STOP_THRESHOLD; verbose output now shows cost curve, marginal gains, selected k, and partition indices
+- docs/phase_detection_new_algo.md: rewrite Step 9 to describe DP algorithm, cost function, recurrence, and k-selection; update constants table (_GREEDY_STOP_THRESHOLD → _DP_ELBOW_THRESHOLD); update Limitation 5 (DP is globally optimal; pre-pass quality is now the binding constraint)
+- perf_advisor/__main__.py: print orange warning after every phase detection table reminding users to cross-reference results against application knowledge and Nsight Systems GUI, and to adjust --max-phases if needed
+- perf_advisor/analysis/phases.py: add _GREEDY_STOP_THRESHOLD=0.85 — after reaching the max_phases ceiling, continue merging while any adjacent pair exceeds this similarity; prevents forced destructive merges when all remaining boundaries are genuine phase transitions; update Step 9 verbose output to report stop reason and best remaining similarity
+- perf_advisor/analysis/phases.py: print JS similarity to next phase after each labeled phase in Step 10 --verbose output
+- docs/phase_detection_new_algo.md: update Steps 2, 4, 7, 8 and Limitation 6 to reflect the __idle__ token addition and duration_ns merge weighting
+- perf_advisor/analysis/phases.py: add __idle__ token to segment distributions — idle bins contribute bin_width_ns to __idle__ in _fingerprint so GPU utilization is implicitly encoded in the JS divergence; a low-utilization phase now has high JS divergence vs. a high-utilization phase even when both run the same kernels; also update _merge_segs to weight merged distributions by duration_ns (full wall time) instead of kernel_ns, which is more correct now that idle time is part of the distribution
+- perf_advisor/analysis/_utils.py: new file — _normalize_demangled() extracted from metrics.py to avoid circular import
+- perf_advisor/analysis/metrics.py: remove _normalize_demangled() and import re; import _normalize_demangled from ._utils
+- perf_advisor/analysis/phases.py: improve --verbose output — print remaining segments after Step 8 pre-pass; add one-sentence description at the start of each step; convert all timestamps from nanoseconds to seconds
+- perf_advisor/analysis/phases.py: replace gap-based phase detection with distribution-based algorithm — kernel vocabulary, fixed-width binning, JS divergence boundary detection, demangled kernel names in feature vectors, JS-based pre-pass and greedy merge; drop _gap_boundaries and _GAP_OUTLIER_MULTIPLIER
+- docs/phase_detection_impl_plan.md: new file — step-by-step implementation plan for the new phase detection algorithm, including prerequisite refactor, ordered edits, full pseudocode for all new/modified functions, and completion checklist
+- docs/phase_detection_new_algo.md: update bin width formula (replace max_phases-dependent _BIN_WIDTH_DIVISOR with fixed _N_BINS=500); add explanation of why max_phases controls candidate count but not bin width; expand limitation 1 to cover boundary position error and future fix options (snap-to-event, adaptive refinement)
+- docs/phase_detection_new_algo.md: new file — detailed step-by-step description of the proposed distribution-based phase detection algorithm, hard-coded values table, and limitations
+- todo_list.md: add item 7 — NVTX-primary phase detection fast path (renumber old 7 to 8); documents algorithm sketch, key challenges, and testing prerequisite
+- docs/phase_detection.md: new file — extracted phase detection section from pipeline.md; added sections on purpose/motivation, challenges, and real-world pathologies a robust algorithm must handle
+- docs/pipeline.md: replace phase detection algorithm detail with a cross-reference to the new phase_detection.md
+- docs/README.md: new file — architecture overview with ASCII pipeline diagram, module map, key design decisions, and links to detail pages
+- docs/pipeline.md: new file — Stage 1 internals (NsysProfile, compute_profile_summary, phase detection algorithm), Stage 2 agent loop (pre-seeding, tool dispatch, multi-turn loop, sliding cache, provider backends), multi-rank path, compare path
+
+2026-04-20
+----------
+- paper/presentation.md: reformat slide 10 ("Agent Loop: 10 Curated Tools") as two columns — explanatory text and pre-seeded tool list on the left, tool table on the right. Regenerated paper/presentation.pdf.
+- paper/presentation.md: collapse two prompt-caching slides into one; table compares OpenAI (automatic, ~50%), Gemini (explicit CachedContent, ~43%), and Anthropic (sliding window, ~80%) with implementation notes. Regenerated paper/presentation.pdf.
+- paper/presentation.md: replace slide 2 ("The Problem") with a README-sourced description of PerfAdvisor — what it is, its four feature bullets, and a two-row Stage 1/Stage 2 pipeline table. Regenerated paper/presentation.pdf.
+- paper/presentation.md: create 20-slide Marp presentation covering motivation, architecture, tool suite, prompt engineering, prompt caching (Anthropic sliding-window vs. Gemini fixed-prefix), benchmark suite, evaluation results, real-application A/B tests, and conclusions. Exported to paper/presentation.pdf.
+
 2026-04-17
 ----------
+- paper/perf_advisor.tex: add §4.5 "Real-application A/B tests" under Quality Evaluation, summarizing P2P/GDR on/off tests, CG vs. deflated-CG comparison, 1-RHS vs. 3-RHS comparison, and Blackwell gauge-field reconstruction A/B tests. Recompiled to paper/draft_6.pdf.
+- paper/perf_advisor.tex: reformat from SoftwareX style to general arXiv preprint style. Changed paper size from a4paper to letterpaper; renamed sections to standard academic headings (Introduction, Design and Implementation, Discussion, Conclusions); changed Keywords from bold to italic; removed SoftwareX-specific comments. Recompiled to paper/draft_5.pdf.
 - perf_advisor/agent/compare.py: add --allow-app-knowledge support to the compare subcommand. Replaced _COMPARE_SYSTEM_PROMPT constant with _COMPARE_SYSTEM_PROMPT_BASE + _COMPARE_GROUNDING_CONSTRAINT and a _build_compare_system_prompt(grounded) builder (mirrors _build_system_prompt in loop.py). Added grounded parameter to run_compare() and all _call_* backends; system prompt is built once and passed through.
 - perf_advisor/__main__.py: add --allow-app-knowledge argument to p_compare; thread grounded=not args.allow_app_knowledge into run_compare() and the preflight token estimate.
 

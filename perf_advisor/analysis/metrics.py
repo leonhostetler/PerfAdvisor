@@ -8,11 +8,11 @@ before querying, and optional tables (MPI, NVTX) degrade gracefully.
 from __future__ import annotations
 
 import math
-import re
 import time
 
 from perf_advisor.ingestion.profile import NsysProfile
 
+from ._utils import _normalize_demangled
 from .models import (
     DeviceInfo,
     GapBucket,
@@ -25,28 +25,6 @@ from .models import (
     StreamSummary,
 )
 from .phases import PhaseWindow, detect_phases
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _normalize_demangled(name: str) -> str:
-    """Strip CUDA/QUDA template boilerplate from a demangled kernel name.
-
-    Two passes:
-    1. Strip SFINAE return-type prefix:
-       "std::enable_if<..., void>::type " — common in QUDA and other CUDA
-       template libraries that use enable_if to gate kernel instantiation.
-    2. Strip trailing "(T2)" argument placeholder injected by nvcc mangling.
-
-    For non-QUDA or already-clean names neither pass fires, so this is a
-    no-op for generic CUDA kernels.
-    """
-    name = re.sub(r"^.*?void>::type\s+", "", name)
-    name = re.sub(r"\s*\(T2\)\s*$", "", name)
-    return name.strip()
-
 
 # ---------------------------------------------------------------------------
 # Individual metric functions
@@ -928,12 +906,15 @@ def compute_profile_summary(
     timings: dict[str, float] | None = None,
     verbose: bool = False,
     rank: int | None = None,
+    forced_k: int | None = None,
 ) -> ProfileSummary:
     """Compute all metrics for a profile and return a ProfileSummary.
 
     Set max_phases=1 to skip phase segmentation (returns a single phase).
     Pass a dict as ``timings`` to receive a breakdown:
     ``{"phase_detection_s": ..., "metrics_s": ...}``.
+    Set forced_k to override the automatic elbow-based k selection in the DP
+    segmentation step (used in multi-rank mode after cross-rank consensus).
     """
     t_start = time.perf_counter()
 
@@ -949,7 +930,9 @@ def compute_profile_summary(
     cpu_sync_s, cpu_sync_pct = compute_cpu_sync_time(profile, kernel_s)
 
     t_phase = time.perf_counter()
-    phases_windows = detect_phases(profile, max_phases=max_phases, verbose=verbose, rank=rank)
+    phases_windows = detect_phases(
+        profile, max_phases=max_phases, verbose=verbose, rank=rank, forced_k=forced_k
+    )
     t_phase_done = time.perf_counter()
 
     profile_start_ns = phases_windows[0].start_ns if phases_windows else 0

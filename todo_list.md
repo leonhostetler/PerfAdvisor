@@ -168,7 +168,32 @@ Work required to publish perf-advisor to PyPI.
 - Depends on the repo being public on GitHub first.
 - Add `--version` flag to the CLI at this point: `perf-advisor --version` via `argparse action="version"` wired to `importlib.metadata.version("perf-advisor")`. Deferred from todo 11 because versioning hadn't been decided yet.
 
-## 7. Threading for concurrent operations
+## 7. NVTX-primary phase detection fast path
+
+When a profile has good NVTX coverage at the level of granularity the user is requesting, phase detection should bypass the distribution-based algorithm and derive phases directly from the NVTX hierarchy. This is more accurate, produces human-readable labels without inference, and is simpler to reason about.
+
+### Algorithm sketch
+
+1. **Select effective depth**: traverse the NVTX range hierarchy and, for each candidate depth (or effective level, since depth is not uniform across the profile), compute both the phase count and the coverage fraction of GPU-active wall time at that level. Coverage is only meaningful at the level actually being used — a coarse level may appear fully covered while the finer level you actually want has significant gaps.
+
+2. **Coverage check**: if no level clears a coverage threshold (suggested default: 80% of GPU-active wall time) within a factor of `max_phases` of the target count, fall back to the distribution-based algorithm.
+
+3. **Gap handling**: uncovered windows between NVTX ranges that exceed a minimum duration threshold are emitted as `"untagged"` phases rather than being silently absorbed into neighbors.
+
+4. **Merge step**: if the selected level yields more phases than `max_phases`, apply the standard similarity-based merge. In this context the merge criterion is easier to apply because phases already have meaningful names and the hierarchy provides additional signal about which phases are conceptually related.
+
+### Key challenges
+
+- **Per-thread nesting**: NVTX push/pop is per-thread. True "top-level" is relative to a thread's own stack, not global timestamp containment. Multi-threaded applications may have overlapping top-level ranges across threads that require per-thread nesting analysis.
+- **Depth selection and coverage are coupled**: selecting depth and measuring coverage must be done together in a single pass, not sequentially.
+- **Non-uniform depth**: different parts of the profile may be annotated to different depths. The algorithm must handle this gracefully rather than assuming a uniform nesting level.
+- **Malformed annotations**: open ranges (no matching end event), null/empty text, and ranges that overlap in ways that violate expected nesting structure must not crash the fast path.
+
+### Testing prerequisite
+
+This should not be implemented until a sample profile with good NVTX coverage at multiple nesting levels is available for testing. The current test profile (MILC/QUDA lattice QCD) has NVTX annotations only at the internal QUDA library level, not at the physics-stage level, and is not suitable for validating this path.
+
+## 8. Threading for concurrent operations
 
 Add threading where operations are naturally parallel to reduce wall-clock time.
 
