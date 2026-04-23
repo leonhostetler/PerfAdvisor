@@ -35,7 +35,7 @@ The pipeline has two distinct stages:
 
 `compute_profile_summary()` queries the SQLite profile directly and builds a structured `ProfileSummary`:
 
-- **Phase detection** — segments the timeline into non-overlapping execution phases (initialization, main compute, teardown, etc.) using kernel density clustering on the GPU utilization timeline
+- **Phase detection** — segments the timeline into non-overlapping execution phases (initialization, main compute, teardown, etc.) by binning the timeline into fixed-width windows, fingerprinting each window as a probability distribution over the top-K kernels, detecting boundaries from Jensen-Shannon divergence peaks and GPU idle transitions, then selecting the optimal segmentation via dynamic-programming k-segmentation with elbow-based k selection; see [docs/phase_detection.md](docs/phase_detection.md) for details
 - **Per-kernel metrics** — grouped by full demangled template name (e.g. `quda::Kernel3D<quda::dslash_functor, ...>`) rather than the short display name (`Kernel3D`), so each distinct template instantiation is tracked separately; total/avg/min/max time, coefficient of variation, register usage, shared memory, estimated SM occupancy, CPU launch overhead
 - **Memory transfer summary** — by direction (H2D/D2H/D2D), with effective bandwidth vs. peak
 - **MPI breakdown** — per-operation total and call count (collectives, P2P, wait)
@@ -79,6 +79,7 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 | `nvtx_ranges`     | NVTX annotation ranges                                                  |
 | `stream_summary`  | Per-stream GPU utilization                                              |
 | `sql_query`       | Arbitrary read-only SQL for targeted follow-up                          |
+| `get_table_schema`| Column names for a named table                                          |
 
 The `profile_summary`, `phase_summary`, and (in multi-rank mode) `cross_rank_summary` results are pre-seeded from Stage 1 — the agent does not need to call those tools and will not spend tokens on them.
 
@@ -263,6 +264,9 @@ perf-advisor compare profile_a.sqlite profile_b.sqlite --exact-token-count
 # Limit phase detection (reduces context size and token cost; default: 10)
 perf-advisor compare profile_a.sqlite profile_b.sqlite --max-phases 3
 
+# Allow the model to draw on application-specific knowledge (same semantics as analyze)
+perf-advisor compare profile_a.sqlite profile_b.sqlite --allow-app-knowledge
+
 # Save LLM interaction log and terminal transcript
 perf-advisor compare profile_a.sqlite profile_b.sqlite --log --transcript
 
@@ -317,17 +321,7 @@ If no API key is set and `claude` is on your PATH, the agent falls back to a sin
 
 ### Prompt caching
 
-All three provider backends (Anthropic, OpenAI, Gemini) are stateless: every API call replays the full conversation history from turn 1. For a 20-turn analysis, the system prompt and pre-seeded profile summary are re-sent on every single turn — without caching, these account for the majority of total token cost.
-
-**Anthropic — sliding cache (implemented):** perf-advisor uses Anthropic's prompt caching API with a sliding cache cursor. Turn 1 writes the system prompt and pre-seeded profile summary to cache (billed at 1.25× normal). Each subsequent turn reads the previous turn's cache hit (billed at 0.10×) and writes the new tool-result exchange to cache. The cached prefix grows by one exchange per turn, so later turns read an increasingly large prefix at 0.10× while paying full price only for the new incremental content. On a typical 18-turn run this produces a ~75–80% reduction in billable input tokens.
-
-The pre-flight estimate for Anthropic runs shows the expected cache_write, cache_read, and cost-equivalent token counts instead of a raw input total.
-
-**OpenAI — automatic caching:** OpenAI automatically caches repeated input prefixes longer than 1,024 tokens at a ~50% discount. No developer action is required; perf-advisor does not do anything special for OpenAI and the savings happen transparently.
-
-**Google Gemini — explicit context cache (implemented):** Gemini's caching model differs fundamentally from Anthropic's. Rather than marking positions in the live conversation, perf-advisor pre-creates a named `CachedContent` object before the first turn containing the system instruction, tool declarations, and pre-computed profile summary. Every subsequent turn references this cache by name, so the fixed prefix is read at the cached-token rate (0.25× for Gemini 2.5 models) instead of being re-billed at full input cost. The cache is created with a 10-minute TTL and expires automatically after the run. If creation fails (e.g. token minimum not met, unsupported model variant), the backend falls back transparently to injecting the summary into the first user message.
-
-Unlike Anthropic's sliding window, the Gemini cache is a fixed snapshot — it covers only the static prefix and does not grow to include per-turn tool results. Those are re-sent in full each turn. For a 20-turn run on a typical profile, the explicit cache eliminates roughly 50–65% of billable input tokens.
+All three provider backends implement prompt caching to avoid re-billing the static prefix (system prompt + tool schemas + pre-seeded profile summary) on every turn of the multi-turn loop — on a typical 18-turn Anthropic run this reduces billable input tokens by ~75–80%. See [docs/prompt_caching.md](docs/prompt_caching.md) for per-provider implementation details.
 
 ---
 
