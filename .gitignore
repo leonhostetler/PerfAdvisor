@@ -6,6 +6,11 @@ CLAUDE.md
 done.md
 notes/
 paper/
+run_books/
+*_synthetic_bench/
+*_AB_tests/
+changelog.txt
+todo_list.md
 
 # Python
 __pycache__/
