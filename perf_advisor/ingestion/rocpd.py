@@ -11,6 +11,7 @@ All queries here go through the un-suffixed views so they are GUID-agnostic.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -32,6 +33,24 @@ _ROCPD_API_CATEGORIES: frozenset[str] = frozenset(
         "HIP_COMPILER_API_EXT",
     }
 )
+
+def _rocpd_short_name(display_name: str) -> str | None:
+    """Extract a short base function name from a rocpd display_name for terminal display.
+
+    E.g. "dslash_function<Dslash3D,int>" → "dslash_function"
+         "void QUDA::dslashKernel<float>(int)" → "dslashKernel"
+    Returns None when no shortening is possible (name is already bare).
+    """
+    name = display_name
+    # strip leading return type (e.g. "void ")
+    name = re.sub(r"^\s*\w+\s+", "", name)
+    # take last :: segment (strip namespace prefix)
+    if "::" in name:
+        name = name.split("::")[-1]
+    # strip template parameters and argument list
+    name = re.sub(r"[<(].*", "", name).strip()
+    return name if name and name != display_name else None
+
 
 # Map rocpd direction strings to the same vocabulary used by Nsight Systems.
 _MEMCPY_DIRECTION: dict[str, str] = {
@@ -258,6 +277,7 @@ class RocpdProfile:
         limit_clause = f"LIMIT {limit}" if limit is not None else ""
         rows = self.query(f"""
             SELECT K.start, K.end, S.display_name AS name,
+                   JSON_EXTRACT(S.extdata, '$.truncated_kernel_name') AS truncated_name,
                    K.agent_id AS device_id, K.stream_id
             FROM rocpd_kernel_dispatch K
             INNER JOIN rocpd_info_kernel_symbol S
@@ -265,18 +285,25 @@ class RocpdProfile:
             {where_clause}
             {limit_clause}
         """)
-        return [
-            KernelRow(
+        result = []
+        for r in rows:
+            full_name = r["name"] or ""
+            tn = r["truncated_name"]
+            if tn:
+                tn = tn.removesuffix(".kd")
+                short = tn if tn != full_name else None
+            else:
+                short = _rocpd_short_name(full_name)
+            result.append(KernelRow(
                 start_ns=r["start"],
                 end_ns=r["end"],
-                name=r["name"] or "",
-                short_name=None,
+                name=full_name,
+                short_name=short,
                 device_id=r["device_id"],
                 stream_id=r["stream_id"],
                 duration_ns=r["end"] - r["start"],
-            )
-            for r in rows
-        ]
+            ))
+        return result
 
     def memcpy_events(
         self, *, where: str | None = None, limit: int | None = None
