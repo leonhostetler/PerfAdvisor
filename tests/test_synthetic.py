@@ -30,9 +30,9 @@ from perf_advisor.analysis.metrics import (
     compute_gpu_kernel_time,
     compute_gpu_memcpy_time,
     compute_gpu_sync_time,
+    compute_marker_ranges,
     compute_memcpy_by_kind,
     compute_mpi_ops,
-    compute_nvtx_ranges,
     compute_profile_span,
     compute_profile_summary,
     compute_streams,
@@ -158,8 +158,8 @@ def test_synthetic_single_stream(synthetic_profile):
     assert streams[0].pct_of_gpu_time == pytest.approx(100.0, abs=0.1)
 
 
-def test_synthetic_nvtx_range(synthetic_profile):
-    ranges = compute_nvtx_ranges(synthetic_profile)
+def test_synthetic_marker_range(synthetic_profile):
+    ranges = compute_marker_ranges(synthetic_profile)
     assert len(ranges) == 1
     assert ranges[0].name == "computePhase"
 
@@ -230,7 +230,8 @@ def test_dispatch_profile_summary(synthetic_profile):
     result = json.loads(dispatch(synthetic_profile, "profile_summary", {}))
     assert "gpu_utilization_pct" in result
     assert result["mpi_present"] is True
-    assert result["nvtx_present"] is True
+    assert result["markers_present"] is True
+    assert result["format"] == "nsys"
 
 
 def test_dispatch_top_kernels(synthetic_profile):
@@ -259,10 +260,10 @@ def test_dispatch_memcpy_summary(synthetic_profile):
     assert result["transfers"][0]["kind"] == "Host-to-Device"
 
 
-def test_dispatch_nvtx_ranges(synthetic_profile):
+def test_dispatch_marker_ranges(synthetic_profile):
     from perf_advisor.agent.tools import dispatch
 
-    result = json.loads(dispatch(synthetic_profile, "nvtx_ranges", {}))
+    result = json.loads(dispatch(synthetic_profile, "marker_ranges", {}))
     assert "ranges" in result
     assert result["ranges"][0]["name"] == "computePhase"
 
@@ -295,3 +296,93 @@ def test_dispatch_sql_query(synthetic_profile):
     )
     assert "rows" in result
     assert result["rows"][0]["n"] == 12  # 10 Kernel3D + 2 Reduction2D
+
+
+# ---------------------------------------------------------------------------
+# NsysProfile vendor-neutral helpers (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_nsys_format(synthetic_profile):
+    from perf_advisor.ingestion.base import Format
+
+    assert synthetic_profile.format == Format.NSYS
+
+
+def test_nsys_capabilities_has_kernels(synthetic_profile):
+    assert synthetic_profile.capabilities.has_kernels is True
+
+
+def test_nsys_capabilities_has_memcpy(synthetic_profile):
+    assert synthetic_profile.capabilities.has_memcpy is True
+
+
+def test_nsys_capabilities_has_mpi(synthetic_profile):
+    assert synthetic_profile.capabilities.has_mpi is True
+
+
+def test_nsys_capabilities_has_markers(synthetic_profile):
+    assert synthetic_profile.capabilities.has_markers is True
+
+
+def test_nsys_capabilities_schema_version(synthetic_profile):
+    assert synthetic_profile.capabilities.schema_version == "nsys"
+
+
+def test_nsys_kernel_events_count(synthetic_profile):
+    from perf_advisor.ingestion.base import KernelRow
+
+    evts = synthetic_profile.kernel_events()
+    assert len(evts) == 12  # 10 Kernel3D + 2 Reduction2D
+    assert all(isinstance(e, KernelRow) for e in evts)
+
+
+def test_nsys_kernel_events_limit(synthetic_profile):
+    evts = synthetic_profile.kernel_events(limit=3)
+    assert len(evts) == 3
+
+
+def test_nsys_kernel_events_names(synthetic_profile):
+    evts = synthetic_profile.kernel_events()
+    names = {e.name for e in evts}
+    assert any("MyFunctor" in n for n in names)
+    assert any("Reduction2D" in n for n in names)
+
+
+def test_nsys_kernel_events_short_name(synthetic_profile):
+    evts = synthetic_profile.kernel_events()
+    # demangledName != shortName → short_name should be populated
+    k3d = [e for e in evts if e.short_name and "Kernel3D" in e.short_name]
+    assert len(k3d) == 10
+
+
+def test_nsys_memcpy_events(synthetic_profile):
+    from perf_advisor.ingestion.base import MemcpyRow
+
+    evts = synthetic_profile.memcpy_events()
+    assert len(evts) == 1
+    assert isinstance(evts[0], MemcpyRow)
+    assert evts[0].direction == "Host-to-Device"
+    assert evts[0].bytes == 1_048_576
+
+
+def test_nsys_marker_ranges(synthetic_profile):
+    from perf_advisor.ingestion.base import RangeRow
+
+    evts = synthetic_profile.marker_ranges()
+    assert len(evts) == 1
+    assert isinstance(evts[0], RangeRow)
+    assert evts[0].name == "computePhase"
+    assert evts[0].category == "NVTX"
+
+
+def test_nsys_mpi_ranges(synthetic_profile):
+    from perf_advisor.ingestion.base import RangeRow
+
+    evts = synthetic_profile.mpi_ranges()
+    assert len(evts) == 2
+    assert all(isinstance(e, RangeRow) for e in evts)
+    names = {e.name for e in evts}
+    assert "MPI_Barrier" in names
+    assert "MPI_Allreduce" in names
+    assert all(e.category == "MPI" for e in evts)

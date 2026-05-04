@@ -37,14 +37,15 @@ class KernelSummary(BaseModel):
     estimated_occupancy: float | None = Field(
         default=None,
         description=(
-            "Estimated wave occupancy (0–1): avg launch threads / (SM count × max threads per SM)"
+            "Estimated wave occupancy (0–1):"
+            " avg launch threads / (device units × max threads per unit)"
         ),
     )
     avg_launch_overhead_us: float | None = Field(
         default=None,
         description=(
             "Avg CPU-to-GPU enqueue latency in µs:"
-            " time from cudaLaunchKernel on CPU to kernel start on GPU"
+            " time from launch API call on CPU to kernel start on GPU"
         ),
     )
     max_launch_overhead_us: float | None = Field(
@@ -73,7 +74,7 @@ class MpiOpSummary(BaseModel):
     max_ms: float
 
 
-class NvtxRangeSummary(BaseModel):
+class MarkerRangeSummary(BaseModel):
     name: str
     calls: int
     total_s: float
@@ -94,22 +95,27 @@ class StreamSummary(BaseModel):
 
 
 class DeviceInfo(BaseModel):
-    """Hardware properties extracted from TARGET_INFO_GPU.
+    """Hardware properties extracted from the profile's device metadata table.
 
-    All fields are optional: they will be None if TARGET_INFO_GPU is absent
-    from the profile (e.g., older Nsight Systems exports).
+    All fields are optional: they will be None if the metadata table is absent
+    or the profile format does not expose a given property.
     """
 
+    vendor: str | None = Field(default=None, description="GPU vendor: 'nvidia' or 'amd'")
     name: str | None = Field(
-        default=None, description="GPU device name (e.g., 'NVIDIA A100-SXM4-40GB')"
+        default=None,
+        description="GPU device name (e.g., 'NVIDIA A100-SXM4-40GB' or 'AMD Instinct MI250X')",
     )
     compute_capability: str | None = Field(
-        default=None, description="CUDA compute capability, e.g. '8.0'"
+        default=None, description="CUDA compute capability (NVIDIA only), e.g. '8.0'"
     )
-    sm_count: int | None = Field(default=None, description="Number of streaming multiprocessors")
+    sm_count: int | None = Field(
+        default=None,
+        description="Number of SMs (NVIDIA) or compute units / CUs (AMD)",
+    )
     max_threads_per_sm: int | None = Field(
         default=None,
-        description="Max concurrent threads per SM (maxWarpsPerSm × threadsPerWarp)",
+        description="Max concurrent threads per SM or CU (maxWarpsPerSm × threadsPerWarp)",
     )
     peak_memory_bandwidth_GBs: float | None = Field(
         default=None, description="Peak HBM/DRAM bandwidth in GB/s"
@@ -142,7 +148,7 @@ class PhaseSummary(BaseModel):
     start_s: float  # seconds from profile start
     end_s: float
     duration_s: float
-    start_ns: int  # absolute CUPTI timestamp (nanoseconds); pass to windowed tools
+    start_ns: int  # absolute timestamp (nanoseconds); pass to windowed tools
     end_ns: int
     gpu_utilization_pct: float
     gpu_kernel_s: float
@@ -154,7 +160,7 @@ class PhaseSummary(BaseModel):
 
 
 class ProfileSummary(BaseModel):
-    """Top-level summary of a single Nsight Systems profile.
+    """Top-level summary of a single GPU profile.
 
     This is the primary input to the hypothesis-generation agent.
     """
@@ -166,7 +172,7 @@ class ProfileSummary(BaseModel):
     profile_span_s: float  # wall-clock duration captured in profile
     gpu_kernel_s: float  # total time all kernels were running on GPU
     gpu_memcpy_s: float  # total time spent in memory transfers
-    gpu_sync_s: float  # total time in CUDA sync operations
+    gpu_sync_s: float  # total time in GPU sync operations
     gpu_utilization_pct: float  # gpu_kernel_s / profile_span_s * 100
 
     # GPU idle
@@ -177,24 +183,24 @@ class ProfileSummary(BaseModel):
     top_kernels: list[KernelSummary]
     memcpy_by_kind: list[MemcpySummary]
     streams: list[StreamSummary]
-    nvtx_ranges: list[NvtxRangeSummary] = Field(default_factory=list)
+    marker_ranges: list[MarkerRangeSummary] = Field(default_factory=list)
 
-    # GPU hardware info (from TARGET_INFO_GPU, absent in older profiles)
+    # GPU hardware info (absent in older or format-limited profiles)
     device_info: DeviceInfo = Field(
         default_factory=DeviceInfo,
         description=(
-            "Hardware properties from TARGET_INFO_GPU; injected into the agent system prompt"
+            "Hardware properties from device metadata; injected into the agent system prompt"
         ),
     )
     peak_memory_bandwidth_GBs: float | None = Field(
         default=None,
-        description="Device peak memory bandwidth in GB/s (from TARGET_INFO_GPU.memoryBandwidth)",
+        description="Device peak memory bandwidth in GB/s",
     )
 
-    # CPU–GPU overlap (absent if CUPTI_ACTIVITY_KIND_RUNTIME is not captured)
+    # CPU–GPU overlap (absent if runtime API tracing was not captured)
     cpu_sync_blocked_s: float | None = Field(
         default=None,
-        description="Total CPU time spent in CUDA sync calls (*Synchronize) during the profile",
+        description="Total CPU time spent in GPU sync calls (*Synchronize) during the profile",
     )
     cpu_sync_blocked_pct: float | None = Field(
         default=None,

@@ -10,7 +10,7 @@ Algorithm (distribution-based):
 5. Collect candidate phase boundaries from:
    - Adjacent-bin JS divergence peaks (top _N_CANDIDATES_FACTOR × max_phases pairs)
    - Active/idle transition edges (guaranteed capture of GPU-idle stretches)
-   - Start/end of NVTX top-level ranges that appear <= max_phases times
+   - Start/end of marker top-level ranges that appear <= max_phases times
    - End-of-cluster timestamps from MPI_Barrier bursts
    - GPU kernel MIN(start) / MAX(end)
 6. Merge nearby boundary candidates (within 50ms or 0.5% of profile span);
@@ -18,7 +18,7 @@ Algorithm (distribution-based):
 7. Fingerprint each segment: dominant kernel, total kernel time, kernel distribution.
 8. Pre-pass: merge adjacent segments with JS divergence < _PREPASS_THRESHOLD.
 9. Optimal k-segmentation via DP: globally optimal partition; k selected by elbow on cost curve.
-10. Label each segment using NVTX coverage, then GPU activity patterns.
+10. Label each segment using marker coverage, then GPU activity patterns.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 
-from perf_advisor.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.base import Profile
 
 from ._utils import _normalize_demangled
 
@@ -49,7 +49,7 @@ _IDLE_LABEL_UTIL_THRESHOLD = 1.0  # gpu_util% below which a segment is labeled "
 # is discarded so the surviving boundary stays at an actual event timestamp.
 _PRI_DIST = 2  # distribution-detected and idle-transition boundaries
 _PRI_MPI = 2  # end of an MPI_Barrier cluster
-_PRI_NVTX = 3  # NVTX range start/end
+_PRI_MARKER = 3  # marker range start/end (NVTX or rocTX)
 _PRI_GPU_EDGE = 4  # first/last kernel timestamp
 
 # ---------------------------------------------------------------------------
@@ -84,40 +84,12 @@ class _Seg:
 
 
 # ---------------------------------------------------------------------------
-# Profile bounds
+# Profile bounds — delegate to Profile Protocol
 # ---------------------------------------------------------------------------
 
 
-def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
-    sources = []
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL")
-    if profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
-        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY")
-    if profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
-        sources.append(
-            "SELECT start, end FROM CUPTI_ACTIVITY_KIND_RUNTIME "
-            "WHERE start IS NOT NULL AND end IS NOT NULL"
-        )
-    if profile.has_nvtx():
-        sources.append(
-            "SELECT start, end FROM NVTX_EVENTS "
-            "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
-        )
-    if profile.has_table("OSRT_API"):
-        sources.append(
-            "SELECT start, end FROM OSRT_API WHERE start IS NOT NULL AND end IS NOT NULL"
-        )
-    for _mpi_tbl in ("MPI_OTHER_EVENTS", "MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS"):
-        if profile.has_table(_mpi_tbl):
-            sources.append(
-                f"SELECT start, end FROM {_mpi_tbl} WHERE start IS NOT NULL AND end IS NOT NULL"
-            )
-    if not sources:
-        return 0, 0
-    union_sql = " UNION ALL ".join(sources)
-    row = profile.query(f"SELECT MIN(start) AS t0, MAX(end) AS t1 FROM ({union_sql})")[0]
-    return int(row["t0"] or 0), int(row["t1"] or 0)
+def _profile_bounds(profile: Profile) -> tuple[int, int]:
+    return profile.profile_bounds_ns()
 
 
 # ---------------------------------------------------------------------------
@@ -125,29 +97,18 @@ def _profile_bounds(profile: NsysProfile) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def _kernel_vocab(profile: NsysProfile, top_k: int) -> list[str]:
+def _kernel_vocab(kernel_evts: list, top_k: int) -> list[str]:
     """Return the top_k kernel demangled names by total GPU time across the profile."""
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        return []
-    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-    has_demangled = "demangledName" in kernel_cols
-    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
-    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
-    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
-    rows = profile.query(f"""
-        SELECT {name_expr} AS name, SUM(k.end - k.start) AS total_ns
-        FROM CUPTI_ACTIVITY_KIND_KERNEL k
-        JOIN StringIds s ON k.shortName = s.id
-        {demangled_join}
-        GROUP BY {group_expr}
-        ORDER BY total_ns DESC
-        LIMIT {top_k}
-    """)
-    return [_normalize_demangled(r["name"]) for r in rows]
+    by_name: dict[str, int] = {}
+    for e in kernel_evts:
+        norm = _normalize_demangled(e.name)
+        by_name[norm] = by_name.get(norm, 0) + e.duration_ns
+    return [n for n, _ in sorted(by_name.items(), key=lambda x: x[1], reverse=True)[:top_k]]
 
 
 def _bin_profile(
-    profile: NsysProfile,
+    kernel_evts: list,
+    memcpy_evts: list,
     t0: int,
     t1: int,
     bin_width_ns: int,
@@ -162,47 +123,22 @@ def _bin_profile(
     n_bins = math.ceil((t1 - t0) / bin_width_ns)
     bins: list[dict[str, int]] = [{} for _ in range(n_bins)]
 
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-        has_demangled = "demangledName" in kernel_cols
-        demangled_join = (
-            "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
-        )
-        name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
-        group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
-        rows = profile.query(f"""
-            SELECT
-                CAST(((k.start + k.end) / 2 - {t0}) / {bin_width_ns} AS INTEGER) AS bin_idx,
-                {name_expr} AS kernel_name,
-                SUM(k.end - k.start) AS kernel_ns
-            FROM CUPTI_ACTIVITY_KIND_KERNEL k
-            JOIN StringIds s ON k.shortName = s.id
-            {demangled_join}
-            WHERE (k.start + k.end) / 2 >= {t0}
-              AND (k.start + k.end) / 2 <  {t1}
-            GROUP BY bin_idx, {group_expr}
-        """)
-        for r in rows:
-            idx = int(r["bin_idx"])
+    for e in kernel_evts:
+        mid = (e.start_ns + e.end_ns) // 2
+        if t0 <= mid < t1:
+            idx = (mid - t0) // bin_width_ns
             if 0 <= idx < n_bins:
-                name = _normalize_demangled(r["kernel_name"])
-                bins[idx][name] = bins[idx].get(name, 0) + int(r["kernel_ns"])
+                name = _normalize_demangled(e.name)
+                bins[idx][name] = bins[idx].get(name, 0) + e.duration_ns
 
-    if profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
-        rows = profile.query(f"""
-            SELECT
-                CAST(((m.start + m.end) / 2 - {t0}) / {bin_width_ns} AS INTEGER) AS bin_idx,
-                SUM(m.end - m.start) AS memcpy_ns
-            FROM CUPTI_ACTIVITY_KIND_MEMCPY m
-            WHERE m.start IS NOT NULL AND m.end IS NOT NULL
-              AND (m.start + m.end) / 2 >= {t0}
-              AND (m.start + m.end) / 2 <  {t1}
-            GROUP BY bin_idx
-        """)
-        for r in rows:
-            idx = int(r["bin_idx"])
+    for e in memcpy_evts:
+        if e.start_ns is None or e.end_ns is None:
+            continue
+        mid = (e.start_ns + e.end_ns) // 2
+        if t0 <= mid < t1:
+            idx = (mid - t0) // bin_width_ns
             if 0 <= idx < n_bins:
-                bins[idx]["__memcpy__"] = bins[idx].get("__memcpy__", 0) + int(r["memcpy_ns"])
+                bins[idx]["__memcpy__"] = bins[idx].get("__memcpy__", 0) + e.duration_ns
 
     return bins
 
@@ -294,67 +230,46 @@ def _distribution_boundaries(
     return tagged
 
 
-def _nvtx_phase_boundaries(
-    profile: NsysProfile,
+def _marker_phase_boundaries(
+    marker_evts: list,
     span_ns: int,
     max_phases: int,
 ) -> tuple[list[int], list[tuple[int, int, str]]]:
-    """Return (boundary_timestamps, all_long_nvtx_ranges_for_labeling).
+    """Return (boundary_timestamps, all_long_marker_ranges_for_labeling).
 
     Only ranges that appear <= max_phases times contribute boundaries;
     frequently-repeated ranges are iterations, not phase transitions.
     """
-    if not profile.has_nvtx():
+    if not marker_evts:
         return [], []
 
     min_dur_ns = max(int(span_ns * 0.02), 100_000_000)  # >= 2% of span or >= 100ms
-    rows = profile.query(f"""
-        SELECT start, end, text AS name
-        FROM NVTX_EVENTS
-        WHERE eventType = 59
-          AND end IS NOT NULL
-          AND end > start
-          AND text IS NOT NULL
-          AND (end - start) >= {min_dur_ns}
-        ORDER BY (end - start) DESC
-        LIMIT 200
-    """)
-    if not rows:
+    long_ranges = sorted(
+        [(e.start_ns, e.end_ns, e.name) for e in marker_evts if e.duration_ns >= min_dur_ns],
+        key=lambda x: x[1] - x[0],
+        reverse=True,
+    )[:200]
+    if not long_ranges:
         return [], []
 
-    all_long: list[tuple[int, int, str]] = [
-        (int(r["start"]), int(r["end"]), r["name"]) for r in rows
-    ]
-
-    # Filter to top-level: ranges not contained within any other range in this set
-    top_level: list[tuple[int, int, str]] = []
-    for i, (s, e, n) in enumerate(all_long):
-        contained = any(
+    all_long = long_ranges
+    top_level = [
+        (s, e, n)
+        for i, (s, e, n) in enumerate(all_long)
+        if not any(
             j != i and all_long[j][0] <= s and all_long[j][1] >= e for j in range(len(all_long))
         )
-        if not contained:
-            top_level.append((s, e, n))
-
-    # Only use boundaries from ranges that are rare (appear <= max_phases times)
+    ]
     name_counts: Counter[str] = Counter(n for _, _, n in top_level)
     boundaries = [ts for s, e, n in top_level if name_counts[n] <= max_phases for ts in (s, e)]
     return boundaries, all_long
 
 
-def _mpi_cluster_boundaries(profile: NsysProfile) -> list[int]:
+def _mpi_cluster_boundaries(mpi_evts: list) -> list[int]:
     """Return end-of-cluster timestamps for MPI_Barrier bursts."""
-    if not profile.has_mpi() or not profile.has_table("MPI_COLLECTIVES_EVENTS"):
+    ends = sorted(e.end_ns for e in mpi_evts if e.name == "MPI_Barrier" and e.end_ns is not None)
+    if not ends:
         return []
-    rows = profile.query("""
-        SELECT e.end
-        FROM MPI_COLLECTIVES_EVENTS e
-        JOIN StringIds s ON e.textId = s.id
-        WHERE s.value = 'MPI_Barrier' AND e.end IS NOT NULL
-        ORDER BY e.end
-    """)
-    if not rows:
-        return []
-    ends = [int(r["end"]) for r in rows]
     boundaries: list[int] = []
     cluster_end = ends[0]
     for t in ends[1:]:
@@ -391,7 +306,7 @@ def _merge_nearby(tagged: list[tuple[int, int]], tolerance_ns: int) -> list[int]
 
 
 def _fingerprint(
-    profile: NsysProfile,
+    kernel_evts: list,
     start_ns: int,
     end_ns: int,
     bins: list[dict[str, int]],
@@ -406,29 +321,20 @@ def _fingerprint(
     short name (for labeling readability, not analysis precision).
     """
     # Total GPU time: clamped overlap so boundary-straddling kernels contribute partially
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        total_rows = profile.query(f"""
-            SELECT SUM(MIN(k.end, {end_ns}) - MAX(k.start, {start_ns})) AS total_kernel_ns
-            FROM CUPTI_ACTIVITY_KIND_KERNEL k
-            WHERE k.start < {end_ns} AND k.end > {start_ns}
-        """)
-        kernel_ns = int(total_rows[0]["total_kernel_ns"] or 0) if total_rows else 0
+    overlapping = [e for e in kernel_evts if e.start_ns < end_ns and e.end_ns > start_ns]
+    kernel_ns = sum(min(e.end_ns, end_ns) - max(e.start_ns, start_ns) for e in overlapping)
 
-        # Dominant kernel: short name whose center falls inside the segment
-        dom_rows = profile.query(f"""
-            SELECT s.value AS name, SUM(k.end - k.start) AS kns
-            FROM CUPTI_ACTIVITY_KIND_KERNEL k
-            JOIN StringIds s ON k.shortName = s.id
-            WHERE (k.start + k.end) / 2 >= {start_ns}
-              AND (k.start + k.end) / 2 <  {end_ns}
-            GROUP BY k.shortName
-            ORDER BY kns DESC
-            LIMIT 1
-        """)
-        dominant_kernel = dom_rows[0]["name"] if dom_rows else None
-    else:
-        kernel_ns = 0
-        dominant_kernel = None
+    # Dominant kernel: short name whose center falls inside the segment
+    in_center = [
+        e
+        for e in kernel_evts
+        if (e.start_ns + e.end_ns) // 2 >= start_ns and (e.start_ns + e.end_ns) // 2 < end_ns
+    ]
+    by_short: dict[str, int] = {}
+    for e in in_center:
+        n = e.short_name or e.name
+        by_short[n] = by_short.get(n, 0) + e.duration_ns
+    dominant_kernel = max(by_short, key=by_short.__getitem__) if by_short else None
 
     # Distribution: aggregate bins whose center falls inside the segment.
     # Idle bins contribute __idle__ time so utilization is encoded implicitly.
@@ -486,8 +392,8 @@ def _merge_segs(a: _Seg, b: _Seg) -> _Seg:
 # ---------------------------------------------------------------------------
 
 
-def _label(seg: _Seg, nvtx_ranges: list[tuple[int, int, str]]) -> str:
-    """Choose a human-readable label: NVTX coverage first, then activity pattern.
+def _label(seg: _Seg, marker_ranges: list[tuple[int, int, str]]) -> str:
+    """Choose a human-readable label: marker coverage first, then activity pattern.
 
     Aggregates overlap across all ranges sharing the same name, so that a phase
     covered by many repeated short ranges (e.g., 24 solver iterations) is still
@@ -495,7 +401,7 @@ def _label(seg: _Seg, nvtx_ranges: list[tuple[int, int, str]]) -> str:
     """
     window = seg.end_ns - seg.start_ns
     coverage: dict[str, int] = {}
-    for rs, re, rn in nvtx_ranges:
+    for rs, re, rn in marker_ranges:
         overlap = max(0, min(re, seg.end_ns) - max(rs, seg.start_ns))
         coverage[rn] = coverage.get(rn, 0) + overlap
     if coverage:
@@ -528,7 +434,7 @@ def _deduplicate_names(phases: list[PhaseWindow]) -> list[PhaseWindow]:
 
 
 def detect_phases(
-    profile: NsysProfile,
+    profile: Profile,
     max_phases: int = 6,
     verbose: bool = False,
     rank: int | None = None,
@@ -544,8 +450,14 @@ def detect_phases(
     def _s(ns: int) -> str:
         return f"{ns / 1e9:.3f}s"
 
+    # Pre-load all events once; caching in the profile avoids repeated SQLite scans.
+    kernel_evts = profile.kernel_events()
+    memcpy_evts = profile.memcpy_events()
+    marker_evts = profile.marker_ranges()
+    mpi_evts = profile.mpi_ranges()
+
     # Step 1 — Profile bounds
-    t0, t1 = _profile_bounds(profile)
+    t0, t1 = profile.profile_bounds_ns()
     if verbose:
         print(
             f"{tag} Step 1 — Find the earliest and latest event timestamps across all "
@@ -561,7 +473,7 @@ def detect_phases(
     tolerance_ns = max(5_000_000, int(span_ns * 0.005))
 
     # Step 2 — Kernel vocabulary
-    vocab = _kernel_vocab(profile, _TOP_K)
+    vocab = _kernel_vocab(kernel_evts, _TOP_K)
     if verbose:
         preview = vocab[:3]
         suffix = f" ... ({len(vocab) - 3} more)" if len(vocab) > 3 else ""
@@ -573,7 +485,7 @@ def detect_phases(
 
     # Step 3 — Bin the timeline
     bin_width_ns = max(_BIN_WIDTH_FLOOR_NS, min(_BIN_WIDTH_CEIL_NS, span_ns // _N_BINS))
-    bins = _bin_profile(profile, t0, t1, bin_width_ns)
+    bins = _bin_profile(kernel_evts, memcpy_evts, t0, t1, bin_width_ns)
     if verbose:
         n_active = sum(1 for b in bins if b)
         print(
@@ -600,39 +512,36 @@ def detect_phases(
     dist_candidates = _distribution_boundaries(dists, t0, bin_width_ns, n_candidates)
     tagged.extend(dist_candidates)
 
-    # 5c: NVTX range boundaries
-    nvtx_boundaries, all_nvtx = _nvtx_phase_boundaries(profile, span_ns, max_phases)
-    tagged.extend((t, _PRI_NVTX) for t in nvtx_boundaries)
+    # 5c: marker range boundaries (NVTX or rocTX)
+    marker_boundaries, all_markers = _marker_phase_boundaries(marker_evts, span_ns, max_phases)
+    tagged.extend((t, _PRI_MARKER) for t in marker_boundaries)
 
     # 5d: MPI Barrier cluster ends
-    mpi_bounds = _mpi_cluster_boundaries(profile)
+    mpi_bounds = _mpi_cluster_boundaries(mpi_evts)
     tagged.extend((t, _PRI_MPI) for t in mpi_bounds)
 
     # 5e: GPU activity edges
     gpu_tagged: list[tuple[int, int]] = []
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        gpu_row = profile.query(
-            "SELECT MIN(start) AS gpu_start, MAX(end) AS gpu_end FROM CUPTI_ACTIVITY_KIND_KERNEL"
-        )[0]
-        if gpu_row["gpu_start"]:
-            gpu_tagged.append((int(gpu_row["gpu_start"]), _PRI_GPU_EDGE))
-        if gpu_row["gpu_end"]:
-            gpu_tagged.append((int(gpu_row["gpu_end"]), _PRI_GPU_EDGE))
+    if kernel_evts:
+        gpu_start = min(e.start_ns for e in kernel_evts)
+        gpu_end = max(e.end_ns for e in kernel_evts)
+        gpu_tagged.append((gpu_start, _PRI_GPU_EDGE))
+        gpu_tagged.append((gpu_end, _PRI_GPU_EDGE))
     tagged.extend(gpu_tagged)
 
     if verbose:
         display: list[tuple[int, int, str]] = (
             [(ts, pri, "dist") for ts, pri in dist_candidates]
-            + [(t, _PRI_NVTX, "nvtx") for t in nvtx_boundaries]
+            + [(t, _PRI_MARKER, "markers") for t in marker_boundaries]
             + [(t, _PRI_MPI, "mpi") for t in mpi_bounds]
             + [(ts, pri, "gpu") for ts, pri in gpu_tagged]
         )
         display.sort(key=lambda x: x[0])
         print(
             f"{tag} Step 5 — Collect candidate phase boundaries from JS divergence peaks, "
-            f"active/idle transitions, NVTX ranges, MPI barriers, and GPU activity edges.\n"
+            f"active/idle transitions, marker ranges, MPI barriers, and GPU activity edges.\n"
             f"         {len(tagged)} raw candidates "
-            f"(dist={len(dist_candidates)}, nvtx={len(nvtx_boundaries)}, "
+            f"(dist={len(dist_candidates)}, markers={len(marker_boundaries)}, "
             f"mpi={len(mpi_bounds)}, gpu={len(gpu_tagged)}):"
         )
         for ts, pri, src in display:
@@ -653,7 +562,7 @@ def detect_phases(
 
     # Step 7 — Fingerprint segments
     segs = [
-        _fingerprint(profile, boundaries[i], boundaries[i + 1], bins, t0, bin_width_ns, vocab)
+        _fingerprint(kernel_evts, boundaries[i], boundaries[i + 1], bins, t0, bin_width_ns, vocab)
         for i in range(len(boundaries) - 1)
         if boundaries[i + 1] > boundaries[i]
     ]
@@ -794,12 +703,12 @@ def detect_phases(
         print(f"         {n_segs} segment(s) — no merging required")
 
     # Step 10 — Label and deduplicate
-    phases = [PhaseWindow(_label(s, all_nvtx), s.start_ns, s.end_ns) for s in segs]
+    phases = [PhaseWindow(_label(s, all_markers), s.start_ns, s.end_ns) for s in segs]
     result = _deduplicate_names(phases)
 
     if verbose:
         print(
-            f"{tag} Step 10 — Assign a human-readable label to each segment using NVTX "
+            f"{tag} Step 10 — Assign a human-readable label to each segment using marker "
             f"coverage, dominant kernel, or idle/unknown fallbacks.\n"
             f"         {len(result)} labeled phases:"
         )
@@ -814,7 +723,7 @@ def detect_phases(
 
 
 def compute_phase_cost_curve(
-    profile: NsysProfile,
+    profile: Profile,
     max_phases: int = 10,
     rank: int | None = None,
 ) -> tuple[int, dict[int, float]]:
@@ -826,7 +735,13 @@ def compute_phase_cost_curve(
     """
     _empty: tuple[int, dict[int, float]] = (1, {1: 0.0})
 
-    t0, t1 = _profile_bounds(profile)
+    # Pre-load all events once; caching in the profile avoids repeated SQLite scans.
+    kernel_evts = profile.kernel_events()
+    memcpy_evts = profile.memcpy_events()
+    marker_evts = profile.marker_ranges()
+    mpi_evts = profile.mpi_ranges()
+
+    t0, t1 = profile.profile_bounds_ns()
     if t0 == 0 and t1 == 0:
         return _empty
     if max_phases <= 1:
@@ -834,25 +749,22 @@ def compute_phase_cost_curve(
 
     span_ns = t1 - t0
     tolerance_ns = max(5_000_000, int(span_ns * 0.005))
-    vocab = _kernel_vocab(profile, _TOP_K)
+    vocab = _kernel_vocab(kernel_evts, _TOP_K)
     bin_width_ns = max(_BIN_WIDTH_FLOOR_NS, min(_BIN_WIDTH_CEIL_NS, span_ns // _N_BINS))
-    bins = _bin_profile(profile, t0, t1, bin_width_ns)
+    bins = _bin_profile(kernel_evts, memcpy_evts, t0, t1, bin_width_ns)
     dists = [_make_distribution(b, vocab) for b in bins]
 
     tagged: list[tuple[int, int]] = []
     n_candidates = _N_CANDIDATES_FACTOR * max_phases
     tagged.extend(_distribution_boundaries(dists, t0, bin_width_ns, n_candidates))
-    nvtx_boundaries, _ = _nvtx_phase_boundaries(profile, span_ns, max_phases)
-    tagged.extend((t, _PRI_NVTX) for t in nvtx_boundaries)
-    tagged.extend((t, _PRI_MPI) for t in _mpi_cluster_boundaries(profile))
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        gpu_row = profile.query(
-            "SELECT MIN(start) AS gpu_start, MAX(end) AS gpu_end FROM CUPTI_ACTIVITY_KIND_KERNEL"
-        )[0]
-        if gpu_row["gpu_start"]:
-            tagged.append((int(gpu_row["gpu_start"]), _PRI_GPU_EDGE))
-        if gpu_row["gpu_end"]:
-            tagged.append((int(gpu_row["gpu_end"]), _PRI_GPU_EDGE))
+    marker_boundaries, _ = _marker_phase_boundaries(marker_evts, span_ns, max_phases)
+    tagged.extend((t, _PRI_MARKER) for t in marker_boundaries)
+    tagged.extend((t, _PRI_MPI) for t in _mpi_cluster_boundaries(mpi_evts))
+    if kernel_evts:
+        gpu_start = min(e.start_ns for e in kernel_evts)
+        gpu_end = max(e.end_ns for e in kernel_evts)
+        tagged.append((gpu_start, _PRI_GPU_EDGE))
+        tagged.append((gpu_end, _PRI_GPU_EDGE))
 
     tagged = [
         (c, p) for c, p in tagged if t0 < c < t1 and c - t0 > tolerance_ns and t1 - c > tolerance_ns
@@ -860,7 +772,7 @@ def compute_phase_cost_curve(
     boundaries = sorted(set([t0] + _merge_nearby(tagged, tolerance_ns) + [t1]))
 
     segs = [
-        _fingerprint(profile, boundaries[i], boundaries[i + 1], bins, t0, bin_width_ns, vocab)
+        _fingerprint(kernel_evts, boundaries[i], boundaries[i + 1], bins, t0, bin_width_ns, vocab)
         for i in range(len(boundaries) - 1)
         if boundaries[i + 1] > boundaries[i]
     ]

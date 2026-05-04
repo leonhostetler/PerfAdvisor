@@ -4,16 +4,17 @@
 
 Stage 1 runs entirely locally. No LLM is contacted. The output is a `ProfileSummary` Pydantic model that serves as the input to Stage 2.
 
-### NsysProfile (`ingestion/profile.py`)
+### Profile ingestion (`ingestion/`)
 
-`NsysProfile` is a thin wrapper around an Nsight Systems SQLite export. It:
+`open_profile(path)` auto-detects the format (Nsight Systems or rocpd) by sniffing the SQLite schema and returns a `Profile`-protocol object (`NsysProfile` or `RocpdProfile`). Both implementations share the same interface:
 
-- Opens the file read-only via the SQLite URI (`mode=ro`)
-- Configures the page cache (up to 25% of file size, capped at 512 MB) and mmap (full file, capped at 16 GB) for fast repeated queries on large profiles
-- Caches `StringIds` lookups in a dict — all name columns in CUPTI and NVTX tables are integer foreign keys into `StringIds`; `resolve_string(id)` converts them to human-readable text
-- Detects which optional tables are present (`has_mpi()`, `has_nvtx()`, `has_table()`) so that metric functions can degrade gracefully when a table is absent
+- Open the file read-only via the SQLite URI (`mode=ro`)
+- Configure page cache and mmap for fast repeated queries on large profiles
+- Cache string-table lookups (`StringIds` for NSYS, `rocpd_string` for rocpd) so `resolve_string(id)` returns human-readable text on both formats
+- Expose `ProfileCapabilities` flags (`has_kernels`, `has_memcpy`, `has_mpi`, `has_markers`, …) so metric functions degrade gracefully when a capability is absent
+- Provide vendor-neutral query helpers (`kernel_events()`, `memcpy_events()`, `marker_ranges()`, `mpi_ranges()`, `device_info()`) that hide per-format SQL differences from the analysis layer
 
-Two query methods are exposed to callers:
+Two raw query methods are exposed for internal and LLM use:
 
 | Method | Used by | Behaviour |
 | ------ | ------- | --------- |
@@ -24,16 +25,16 @@ Two query methods are exposed to callers:
 
 `compute_profile_summary()` orchestrates Stage 1. It calls individual metric functions in sequence and assembles the results into a `ProfileSummary`:
 
-1. **Profile span** — `MAX(end) - MIN(start)` across all event tables (kernels, memcpy, runtime, NVTX, MPI), so the span matches the Nsight Systems GUI timeline
-2. **Device info** — SM count, peak memory bandwidth, total HBM, L2 cache, clock rate, and thread/register/shared-memory limits from `TARGET_INFO_GPU`
+1. **Profile span** — `MAX(end) - MIN(start)` across all event tables (kernels, memcpy, runtime, markers, MPI), so the span matches the profiler's timeline view
+2. **Device info** — SM/CU count, peak memory bandwidth, total HBM, L2 cache, clock rate, and thread/register/shared-memory limits from device metadata tables
 3. **Phase detection** — described below; produces a list of `PhaseWindow` objects
 4. **Per-kernel metrics** — grouped by full demangled name (not the short display name), so each distinct template instantiation is tracked separately; computes total/avg/min/max time, coefficient of variation, register usage, shared memory, estimated SM occupancy, and CPU launch overhead
 5. **Memory transfer summary** — bytes and bandwidth by direction (H2D, D2H, D2D)
 6. **MPI breakdown** — per-operation total time and call count (collectives, P2P, barrier, wait)
 7. **GPU idle histogram** — gap distribution bucketed into `<10µs`, `10–100µs`, `100µs–1ms`, `1–10ms`, `10–100ms`, `>100ms`
 8. **CPU–GPU overlap** — total time the CPU spent blocked in `*Synchronize` calls
-9. **Stream utilization** — GPU time and percentage per CUDA stream
-10. **NVTX ranges** — if NVTX annotations are present
+9. **Stream utilization** — GPU time and percentage per GPU stream
+10. **Marker ranges** — NVTX annotations (NVIDIA) or rocTX ranges (AMD), if present
 
 Per-phase variants of steps 4–9 are computed for each `PhaseWindow` using windowed SQL queries (`start < phase_end AND end > phase_start`).
 
@@ -49,7 +50,7 @@ See [Phase Detection](phase_detection.md) for a full description of the algorith
 
 Before the first API call, two things are prepared:
 
-1. **System prompt** — instructs the model to act as a GPU performance engineer, defines the hypothesis JSON schema, includes a SQLite schema reference (column names, FK conventions, which aggregate functions are safe vs. unavailable in SQLite), and optionally includes a hardware context block (GPU name, SM count, peak bandwidth, etc.) derived from `device_info`.
+1. **System prompt** — instructs the model to act as a GPU performance engineer, defines the hypothesis JSON schema, includes a format-specific SQLite schema reference (NSYS or rocpd column names, FK conventions, which aggregate functions are safe vs. unavailable in SQLite), a capability section listing what this profile does and does not contain, and optionally includes a hardware context block (GPU name, SM/CU count, peak bandwidth, etc.) derived from `device_info`.
 
 2. **Pre-seeding** — the `profile_summary` and `phase_summary` tool results (already computed in Stage 1) are injected into the conversation history as a fake assistant-turn / user-turn exchange before the first real API call. This means the model starts with the full profile overview already in context and never needs to call those two tools, saving 2–3 turns of latency and cost.
 
@@ -57,7 +58,7 @@ For multi-rank runs, `cross_rank_summary` is pre-seeded alongside the primary ra
 
 ### Tool dispatch (`agent/tools.py`)
 
-`dispatch(profile, tool_name, args)` maps a tool name to its implementation function and returns the result as a JSON string. All tool implementations take a `NsysProfile` and an `args` dict; they call the same metric functions as Stage 1 but can accept `start_ns` / `end_ns` window parameters for per-phase queries.
+`dispatch(profile, tool_name, args)` maps a tool name to its implementation function and returns the result as a JSON string. All tool implementations take a `Profile` (either `NsysProfile` or `RocpdProfile`) and an `args` dict; they call the same metric functions as Stage 1 but can accept `start_ns` / `end_ns` window parameters for per-phase queries.
 
 The nine tools the agent can call:
 
@@ -69,7 +70,7 @@ The nine tools the agent can call:
 | `gap_histogram` | GPU idle gap distribution; accepts optional time window |
 | `memcpy_summary` | Memory transfer breakdown by direction |
 | `mpi_summary` | MPI operation breakdown; accepts optional time window |
-| `nvtx_ranges` | NVTX annotation ranges |
+| `marker_ranges` | Marker annotation ranges (NVTX or rocTX) |
 | `stream_summary` | Per-CUDA-stream GPU time and percentage |
 | `sql_query` | Arbitrary read-only SQL via `query_safe()` |
 | `get_table_schema` | Column names for a named table |

@@ -9,6 +9,7 @@ paper/
 run_books/
 *_synthetic_bench/
 *_AB_tests/
+*_ABcarveout_tests/
 changelog.txt
 todo_list.md
 

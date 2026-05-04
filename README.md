@@ -1,21 +1,21 @@
 # PerfAdvisor
 
-An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Currently supports NVIDIA Nsight Systems (`.sqlite`); AMD ROCProfiler support is planned.
+An agentic performance analyzer for GPU/accelerator profiles in HPC applications. Supports NVIDIA Nsight Systems (`.sqlite`) and AMD rocpd (rocprofv3 or rocprof-sys).
 
 - Extracts structured metrics from a profile and uses an LLM to produce a ranked list of actionable performance hypotheses, each with a bottleneck type, evidence, suggested fix, expected impact, and effort category.
 - **Multi-rank MPI analysis** — pass profiles from all ranks to detect load imbalance, identify the straggler rank, and get cross-rank per-phase imbalance scores alongside the standard hypothesis output.
 - **Profile comparison** — compare two profiles (e.g. before/after an optimization) and get a structured narrative and key-differences table.
 - **Multi-provider** — works with Anthropic (default), OpenAI, and Google Gemini; provider is auto-detected from available API keys.
 
-This tool was built with heavy AI coding assistance ("vibe coded"). The SQL queries, metric calculations, and analysis logic have not been exhaustively validated — they look plausible but may contain subtle errors in unit conversions, aggregations, or edge-case handling. Treat the numbers as starting points for investigation rather than ground truth, and verify anything surprising directly against the SQLite database or the Nsight Systems GUI.
+This tool was built with heavy AI coding assistance ("vibe coded"). The SQL queries, metric calculations, and analysis logic have not been exhaustively validated — they look plausible but may contain subtle errors in unit conversions, aggregations, or edge-case handling. Treat the numbers as starting points for investigation rather than ground truth, and verify anything surprising directly against the SQLite database or the profiler GUI.
 
 ---
 
 ## Data Privacy
 
-**Profile data is sent to a third-party LLM API when you run `analyze` or `compare`.** This includes kernel names (including full demangled template names such as `quda::Kernel3D<dslash_functor<...>>`), NVTX annotation text, timing metrics, grid and block dimensions, memory transfer statistics, and MPI operation names. The raw `.sqlite` file is never transmitted — only the structured summary extracted from it and any follow-up tool call results.
+**Profile data is sent to a third-party LLM API when you run `analyze` or `compare`.** This includes kernel names (including full demangled template names such as `quda::Kernel3D<dslash_functor<...>>`), marker annotation text (NVTX strings on NVIDIA, rocTX strings on AMD), timing metrics, grid and block dimensions, memory transfer statistics, and MPI operation names. The raw `.sqlite` file is never transmitted — only the structured summary extracted from it and any follow-up tool call results.
 
-**Why this matters for HPC users:** Demangled kernel names can reveal algorithmic structure. NVTX annotation strings are arbitrary user-defined text and may contain project names, application identifiers, or other sensitive labels. Users at institutions with data governance, export control, or confidentiality policies should verify compliance before analyzing production profiles.
+**Why this matters for HPC users:** Demangled kernel names can reveal algorithmic structure. Marker annotation strings (NVTX or rocTX) are arbitrary user-defined text and may contain project names, application identifiers, or other sensitive labels. Users at institutions with data governance, export control, or confidentiality policies should verify compliance before analyzing production profiles.
 
 **Data goes to the configured provider** (Anthropic, OpenAI, or Google). Each provider's data retention and usage policies apply independently of this tool.
 
@@ -42,8 +42,8 @@ The pipeline has two distinct stages:
 - **GPU idle histogram** — bucketed gap distribution (`<10µs` through `>100ms`)
 - **CPU–GPU overlap** — time the CPU spent blocked in `*Synchronize` calls
 - **Stream utilization** — per-CUDA-stream GPU time and percentage
-- **NVTX ranges** — if the application uses NVTX annotations
-- **Hardware properties** — SM count, peak memory bandwidth, total HBM, L2 cache size, thread/register/shared-memory limits, and clock rate from `TARGET_INFO_GPU`; injected into the agent's system prompt so the model can reason about hardware constraints (e.g. whether a kernel is approaching the memory bandwidth ceiling for this specific GPU)
+- **Marker ranges** — NVTX annotations (NVIDIA) or rocTX ranges (AMD), if present
+- **Hardware properties** — SM/CU count, peak memory bandwidth, total HBM, L2 cache size, thread/register/shared-memory limits, and clock rate from device metadata tables; injected into the agent's system prompt so the model can reason about hardware constraints (e.g. whether a kernel is approaching the memory bandwidth ceiling for this specific GPU)
 
 This stage runs entirely locally. No LLM is contacted. You can inspect the output with the `summary` subcommand.
 
@@ -76,7 +76,7 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 | `gap_histogram`   | Idle-gap distribution                                                   |
 | `memcpy_summary`  | Memory transfer breakdown by kind                                       |
 | `mpi_summary`     | MPI operation breakdown                                                 |
-| `nvtx_ranges`     | NVTX annotation ranges                                                  |
+| `marker_ranges`   | Marker annotation ranges (NVTX or rocTX)                                |
 | `stream_summary`  | Per-stream GPU utilization                                              |
 | `sql_query`       | Arbitrary read-only SQL for targeted follow-up                          |
 | `get_table_schema`| Column names for a named table                                          |
@@ -108,17 +108,33 @@ pip install -e ".[dev]"       # Tests and linting
 
 ### Profiles
 
-**NVIDIA Nsight Systems** ( `.sqlite`) is the only supported profile format. The profiler must be configured to capture GPU activity (`-t cuda` at minimum); NVTX annotations (`nvtx`) and MPI tracing (`mpi`) are supported when present.
+Two profile formats are supported. See [docs/profile_formats.md](docs/profile_formats.md) for a full capability matrix and recommended capture flags.
+
+**NVIDIA Nsight Systems** (`.sqlite`) — profiles must be exported to SQLite before use:
+
+```bash
+nsys export --type sqlite --output profile.sqlite profile.nsys-rep
+```
+
+The profiler must be configured to capture GPU activity (`-t cuda` at minimum); NVTX annotations (`nvtx`) and MPI tracing (`mpi`) are supported when present.
 
 Versions tested:
 
 - 2025.5 (NVIDIA HPC SDK 25.5)
 - 2025.5.2
 
-Nsight Systems profiles must be exported to SQLite before use:
+**AMD rocpd** (`.db` or `.rocpd`) — written by `rocprofv3 --output-format rocpd` (ROCm 6.x / rocprofiler-sdk 7.0+). The recommended capture command for full analysis:
 
 ```bash
-nsys export --type sqlite --output profile.sqlite profile.nsys-rep
+rocprofv3 --sys-trace --output-format rocpd -d <outdir> -o rank_%pid% <app> <args>
+```
+
+`--sys-trace` bundles `--kernel-trace --memory-copy-trace --hip-trace --hsa-trace --marker-trace --rccl-trace --scratch-memory-trace`, enabling all metrics PerfAdvisor uses. For MPI cross-rank imbalance analysis, rocprof-sys with `ROCPROFSYS_USE_MPI=true` is required (rocprofv3 alone does not intercept MPI).
+
+**Important:** on SLURM systems, add `--signal=SIGTERM@300` (or a larger grace period) so the rocpd writer can finalize before the job is killed:
+
+```bash
+#SBATCH --signal=SIGTERM@300
 ```
 
 ### Print metrics without running the LLM
@@ -458,6 +474,6 @@ perf-advisor analyze profile.sqlite --quiet --json > hypotheses.json
 
 **Cost runaway.** If a profile is extremely large (many phases, dense MPI tables), the pre-seeded context can be very large, and if the agent makes many `sql_query` calls, costs can accumulate. Use `--max-phases 1` or a cheaper model for initial exploration.
 
-**Prompt injection from untrusted profiles.** Profile data — including NVTX annotation text, kernel names, and MPI operation names — is inserted verbatim into the LLM prompt. A maliciously crafted profile could embed instruction-like text designed to manipulate the model's analysis output. Only analyze profiles from sources you trust.
+**Prompt injection from untrusted profiles.** Profile data — including marker annotation text (NVTX or rocTX), kernel names, and MPI operation names — is inserted verbatim into the LLM prompt. A maliciously crafted profile could embed instruction-like text designed to manipulate the model's analysis output. Only analyze profiles from sources you trust.
 
 **Saved files.** When `--log` is used, two files are written: `{stem}_{timestamp}_log.txt` (full API request/response log) and `{stem}_{timestamp}_hypotheses.json` (structured hypothesis output). When `--transcript` is used, `{stem}_{timestamp}_transcript.txt` is written. All files land next to the profile by default, or next to the path given by `--log-file`. These files contain the full profile metrics. If the profile directory is shared or version-controlled, ensure these files are in `.gitignore`.

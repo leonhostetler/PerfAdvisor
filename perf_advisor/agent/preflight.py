@@ -1,6 +1,8 @@
-"""Pre-flight token estimation helpers for analyze and compare."""
+"""Pre-flight checks and token estimation helpers for analyze and compare."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 # Empirically calibrated chars-per-token ratios.
 # English prose (system prompts, descriptions): ~4 chars/token across all providers.
@@ -154,3 +156,83 @@ def estimate_cache_breakdown(
         "input": 0,
         "cost_equivalent": cost_equivalent,
     }
+
+
+# ---------------------------------------------------------------------------
+# Profile readiness checks
+# ---------------------------------------------------------------------------
+
+# Remediation messages keyed by symptom; printed by run_preflight and
+# re-used by the tool_sql_query OperationalError path for consistency.
+
+_ROCPD_MSG_WRITER_TRUNCATED = (
+    "GPU activity tables are empty and a SQLite journal sidecar is present — the rocpd writer "
+    "was likely killed before flushing. Re-run with longer walltime and a SIGTERM grace period "
+    "(e.g. `--signal=SIGTERM@300`) so the writer can finalize. The HIP/HSA API regions on disk "
+    "are still usable but kernel/memcpy analysis will be sparse."
+)
+_ROCPD_MSG_NARROW_FLAG_SET = (
+    "GPU activity tables are empty. To enable kernel timing and memcpy analysis, re-capture with "
+    "`rocprofv3 --sys-trace --output-format rocpd` (the bundle includes "
+    "`--kernel-trace --memory-copy-trace --hip-trace --hsa-trace --marker-trace "
+    "--rccl-trace --scratch-memory-trace`). Falling back to API-only metrics for this run."
+)
+_ROCPD_MSG_NO_MARKERS = (
+    "No marker ranges (rocTX) found — phase detection will not run. "
+    "To enable phase detection, instrument the app with `roctxRangePush/Pop` (or `roctxMark`) "
+    "around the iterations / regions you want labeled, and re-capture with `--sys-trace` "
+    "(or at least `--marker-trace`). PerfAdvisor will still produce kernel-level analysis "
+    "without phases."
+)
+_ROCPD_MSG_NO_MPI = (
+    "No MPI ranges found — rocprofv3 doesn't trace MPI. For cross-rank collective-imbalance "
+    "analysis, capture with `rocprof-sys` (`ROCPROFSYS_USE_MPI=true`) or run a parallel "
+    "CrayPat capture. PerfAdvisor will skip MPI-overlap hypotheses for this profile."
+)
+
+
+def run_preflight(profile: object, *, log: Callable[[str], None] = print) -> None:
+    """Print readiness hints for the given profile.
+
+    For NSYS profiles: notes on missing MPI or marker data.
+    For ROCPD profiles: reads emptiness diagnostics and emits actionable
+    remediation messages for each detected symptom.
+    """
+    from perf_advisor.ingestion.base import Format
+
+    fmt = getattr(profile, "format", None)
+    caps = getattr(profile, "capabilities", None)
+
+    if fmt == Format.NSYS:
+        if caps is not None and not caps.has_mpi:
+            log(
+                "[preflight] No MPI data in this Nsight Systems profile. "
+                "Cross-rank MPI imbalance analysis will be skipped."
+            )
+        if caps is not None and not caps.has_markers:
+            log(
+                "[preflight] No NVTX marker ranges found. "
+                "Phase detection requires NVTX annotations — analysis will use the whole "
+                "profile as a single phase."
+            )
+
+    elif fmt == Format.ROCPD:
+        emptiness = getattr(profile, "emptiness", None)
+        if emptiness is None:
+            return
+
+        _key_tables = frozenset(
+            {"rocpd_kernel_dispatch", "rocpd_memory_copy", "rocpd_memory_allocate"}
+        )
+        all_key_empty = _key_tables.issubset(emptiness.empty_tables)
+
+        if all_key_empty and emptiness.writer_truncation_suspected:
+            log(f"[preflight] WARNING: {_ROCPD_MSG_WRITER_TRUNCATED}")
+        elif all_key_empty:
+            log(f"[preflight] WARNING: {_ROCPD_MSG_NARROW_FLAG_SET}")
+
+        if caps is not None and not caps.has_markers:
+            log(f"[preflight] NOTE: {_ROCPD_MSG_NO_MARKERS}")
+
+        if caps is not None and not caps.has_mpi:
+            log(f"[preflight] NOTE: {_ROCPD_MSG_NO_MPI}")

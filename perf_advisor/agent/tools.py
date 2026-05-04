@@ -1,6 +1,6 @@
 """Tool definitions exposed to the Claude agent.
 
-Each tool function takes a NsysProfile and structured arguments, and returns
+Each tool function takes a Profile and structured arguments, and returns
 a JSON-serializable dict. The tool schemas follow the Anthropic tool-use format.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import signal
+import sqlite3
 import threading
 from typing import Any
 
@@ -16,43 +17,69 @@ from perf_advisor.analysis.metrics import (
     _compute_launch_overhead,
     _window_idle_time,
     _window_kernel_time,
+    _window_marker_ranges,
     _window_memcpy_by_kind,
     _window_mpi_ops,
-    _window_nvtx_ranges,
     _window_streams,
     _window_top_kernels,
     compute_device_info,
     compute_gap_histogram,
     compute_gpu_kernel_time,
+    compute_marker_ranges,
     compute_memcpy_by_kind,
     compute_mpi_ops,
-    compute_nvtx_ranges,
     compute_profile_span,
     compute_streams,
     compute_top_kernels,
 )
-from perf_advisor.ingestion.profile import NsysProfile
+from perf_advisor.ingestion import Format
+from perf_advisor.ingestion.base import Profile
+
+# ---------------------------------------------------------------------------
+# Cross-vendor table redirect hints for the sql_query OperationalError handler
+# ---------------------------------------------------------------------------
+
+_NSYS_TO_ROCPD_TABLE: dict[str, str] = {
+    "CUPTI_ACTIVITY_KIND_KERNEL": "rocpd_kernel_dispatch (join rocpd_info_kernel_symbol for names)",
+    "CUPTI_ACTIVITY_KIND_MEMCPY": "rocpd_memory_copy",
+    "CUPTI_ACTIVITY_KIND_RUNTIME": "rocpd_region (categories: HIP_RUNTIME_API_EXT, HSA_CORE_API)",
+    "NVTX_EVENTS": "rocpd_region (filter out API categories to get user markers)",
+    "MPI_COLLECTIVES_EVENTS": "rocpd_region WHERE category='MPI' (rocprof-sys only)",
+    "MPI_P2P_EVENTS": "rocpd_region WHERE category='MPI' (rocprof-sys only)",
+    "MPI_START_WAIT_EVENTS": "rocpd_region WHERE category='MPI' (rocprof-sys only)",
+    "StringIds": "rocpd_string (columns: id, guid, string)",
+}
+_ROCPD_TO_NSYS_TABLE: dict[str, str] = {
+    "rocpd_kernel_dispatch": "CUPTI_ACTIVITY_KIND_KERNEL",
+    "rocpd_memory_copy": "CUPTI_ACTIVITY_KIND_MEMCPY",
+    "rocpd_region": "NVTX_EVENTS (markers) or MPI_COLLECTIVES_EVENTS/MPI_P2P_EVENTS (MPI)",
+    "rocpd_string": "StringIds (columns: id, value)",
+    "rocpd_event": "(no direct equivalent; category info is in ENUM_* tables)",
+    "rocpd_info_agent": "TARGET_INFO_GPU",
+    "rocpd_info_kernel_symbol": "(kernel name info embedded in CUPTI_ACTIVITY_KIND_KERNEL)",
+}
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
 
-def tool_profile_summary(profile: NsysProfile, _args: dict[str, Any]) -> dict:
+def tool_profile_summary(profile: Profile, _args: dict[str, Any]) -> dict:
     """Return the top-level time budget for the profile."""
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
     return {
+        "format": profile.format.value,
         "profile_span_s": round(span_s, 3),
         "gpu_kernel_s": round(kernel_s, 3),
         "gpu_utilization_pct": round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
-        "mpi_present": profile.has_mpi(),
-        "nvtx_present": profile.has_nvtx(),
+        "mpi_present": profile.capabilities.has_mpi,
+        "markers_present": profile.capabilities.has_markers,
         "tables": sorted(profile.tables),
     }
 
 
-def tool_top_kernels(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_top_kernels(profile: Profile, args: dict[str, Any]) -> dict:
     """Return the top GPU kernels by total execution time."""
     limit = int(args.get("limit", 15))
     start_ns = args.get("start_ns")
@@ -78,7 +105,7 @@ def tool_top_kernels(profile: NsysProfile, args: dict[str, Any]) -> dict:
     return {"kernels": [k.model_dump() for k in kernels]}
 
 
-def tool_gap_histogram(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_gap_histogram(profile: Profile, args: dict[str, Any]) -> dict:
     """Return a histogram of GPU idle gaps between kernel launches."""
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
@@ -92,7 +119,7 @@ def tool_gap_histogram(profile: NsysProfile, args: dict[str, Any]) -> dict:
     }
 
 
-def tool_memcpy_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_memcpy_summary(profile: Profile, args: dict[str, Any]) -> dict:
     """Return memory transfer summary broken down by direction/kind."""
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
@@ -103,7 +130,7 @@ def tool_memcpy_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     return {"transfers": [t.model_dump() for t in transfers]}
 
 
-def tool_mpi_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_mpi_summary(profile: Profile, args: dict[str, Any]) -> dict:
     """Return MPI operation summary. Returns empty list if no MPI data."""
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
@@ -111,22 +138,25 @@ def tool_mpi_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
         ops = _window_mpi_ops(profile, int(start_ns), int(end_ns))
     else:
         ops = compute_mpi_ops(profile)
-    return {"mpi_present": profile.has_mpi(), "ops": [o.model_dump() for o in ops]}
+    return {"mpi_present": profile.capabilities.has_mpi, "ops": [o.model_dump() for o in ops]}
 
 
-def tool_nvtx_ranges(profile: NsysProfile, args: dict[str, Any]) -> dict:
-    """Return top NVTX annotation ranges by total time."""
+def tool_marker_ranges(profile: Profile, args: dict[str, Any]) -> dict:
+    """Return top marker annotation ranges (NVTX or rocTX) by total time."""
     limit = int(args.get("limit", 20))
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ranges = _window_nvtx_ranges(profile, int(start_ns), int(end_ns), limit=limit)
+        ranges = _window_marker_ranges(profile, int(start_ns), int(end_ns), limit=limit)
     else:
-        ranges = compute_nvtx_ranges(profile, limit=limit)
-    return {"nvtx_present": profile.has_nvtx(), "ranges": [r.model_dump() for r in ranges]}
+        ranges = compute_marker_ranges(profile, limit=limit)
+    return {
+        "markers_present": profile.capabilities.has_markers,
+        "ranges": [r.model_dump() for r in ranges],
+    }
 
 
-def tool_stream_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_stream_summary(profile: Profile, args: dict[str, Any]) -> dict:
     """Return per-stream GPU utilization."""
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
@@ -137,7 +167,7 @@ def tool_stream_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
     return {"streams": [s.model_dump() for s in streams]}
 
 
-def tool_phase_summary(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_phase_summary(profile: Profile, args: dict[str, Any]) -> dict:
     """Return the profile segmented into sequential execution phases."""
     from perf_advisor.analysis.metrics import compute_phase_summary
     from perf_advisor.analysis.phases import detect_phases
@@ -167,7 +197,7 @@ _SQL_RESULT_BYTE_LIMIT = 100_000  # 100 KB
 _SQL_TIMEOUT_S = 30  # seconds before a query is automatically interrupted
 
 
-def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_sql_query(profile: Profile, args: dict[str, Any]) -> dict:
     """Execute an arbitrary read-only SQL query against the profile SQLite database.
 
     Use this for targeted follow-up questions not covered by other tools.
@@ -223,7 +253,7 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     timer.start()
     try:
         rows = profile.query_safe(sql, stop_event=stop, row_limit=200)
-    except Exception as e:
+    except sqlite3.OperationalError as e:
         if timed_out.is_set():
             return {
                 "error": (
@@ -232,6 +262,34 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
                     "Simplify it: avoid self-joins and correlated subqueries on large tables, "
                     "scope with a WHERE clause on start/end timestamps, "
                     "or use a structured tool (top_kernels, mpi_summary, etc.) instead."
+                )
+            }
+        err_msg = str(e)
+        if "no such table" in err_msg:
+            wrong_table = err_msg.split("no such table:")[-1].strip()
+            if profile.format == Format.ROCPD and wrong_table in _NSYS_TO_ROCPD_TABLE:
+                equiv = _NSYS_TO_ROCPD_TABLE[wrong_table]
+                return {
+                    "error": (
+                        f"Table '{wrong_table}' does not exist in this rocpd profile. "
+                        f"The rocpd equivalent is: {equiv}"
+                    )
+                }
+            if profile.format == Format.NSYS and wrong_table in _ROCPD_TO_NSYS_TABLE:
+                equiv = _ROCPD_TO_NSYS_TABLE[wrong_table]
+                return {
+                    "error": (
+                        f"Table '{wrong_table}' does not exist in this Nsight Systems profile. "
+                        f"The NSYS equivalent is: {equiv}"
+                    )
+                }
+        return {"error": err_msg}
+    except Exception as e:
+        if timed_out.is_set():
+            return {
+                "error": (
+                    f"Query timed out after {_SQL_TIMEOUT_S}s. "
+                    "Simplify it or use a structured tool instead."
                 )
             }
         return {"error": str(e)}
@@ -254,7 +312,7 @@ def tool_sql_query(profile: NsysProfile, args: dict[str, Any]) -> dict:
     return result
 
 
-def tool_get_table_schema(profile: NsysProfile, args: dict[str, Any]) -> dict:
+def tool_get_table_schema(profile: Profile, args: dict[str, Any]) -> dict:
     """Return the column names for a table in the profile SQLite database."""
     table = args.get("table", "").strip()
     if not table:
@@ -276,7 +334,7 @@ _WINDOW_SCHEMA_PROPS: dict[str, Any] = {
     "start_ns": {
         "type": "integer",
         "description": (
-            "Start of time window as an absolute CUPTI timestamp in nanoseconds. "
+            "Start of time window as an absolute nanosecond timestamp. "
             "Each phase in the pre-seeded phase summary includes start_ns and end_ns "
             "fields — pass them directly to scope this tool to that phase."
         ),
@@ -284,7 +342,7 @@ _WINDOW_SCHEMA_PROPS: dict[str, Any] = {
     "end_ns": {
         "type": "integer",
         "description": (
-            "End of time window as an absolute CUPTI timestamp in nanoseconds. "
+            "End of time window as an absolute nanosecond timestamp. "
             "Must be provided together with start_ns."
         ),
     },
@@ -296,9 +354,9 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
         {
             "name": "profile_summary",
             "description": (
-                "Return the top-level time budget for the profile: wall-clock span, "
-                "GPU kernel time, GPU utilization, and which optional tables are present "
-                "(MPI, NVTX)."
+                "Return the top-level time budget for the profile: format, wall-clock span, "
+                "GPU kernel time, GPU utilization, and which optional data sources are present "
+                "(MPI, markers)."
             ),
             "input_schema": {"type": "object", "properties": {}, "required": []},
         },
@@ -371,12 +429,12 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             },
         },
     ),
-    "nvtx_ranges": (
-        tool_nvtx_ranges,
+    "marker_ranges": (
+        tool_marker_ranges,
         {
-            "name": "nvtx_ranges",
+            "name": "marker_ranges",
             "description": (
-                "Return top NVTX annotation ranges by total wall-clock time. "
+                "Return top marker annotation ranges (NVTX or rocTX) by total wall-clock time. "
                 "These are application-defined labels and give semantic context "
                 "to what the GPU and CPU were doing. "
                 "Pass start_ns/end_ns to scope the results to a specific phase."
@@ -401,7 +459,8 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
             "description": (
                 "Return per-CUDA-stream GPU utilization. "
                 "A single dominant stream indicates no concurrent kernel execution. "
-                "Pass start_ns/end_ns to scope the results to a specific phase."
+                "Pass start_ns/end_ns to scope the results to a specific phase. "
+                "Note: stream IDs may not be present in all profile formats."
             ),
             "input_schema": {
                 "type": "object",
@@ -437,15 +496,15 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
         {
             "name": "sql_query",
             "description": (
-                "Execute a read-only SQL query directly against the Nsight Systems SQLite "
-                "database. Use this for targeted follow-up analysis not covered by other tools. "
-                "Tables include: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_MEMCPY, "
-                "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION, NVTX_EVENTS, MPI_COLLECTIVES_EVENTS, "
-                "MPI_P2P_EVENTS, MPI_START_WAIT_EVENTS, StringIds (resolves integer name IDs), "
-                "ENUM_* (resolve integer kind/type codes). "
+                "Execute a read-only SQL query against the profile SQLite database. "
+                "Use this for targeted follow-up analysis not covered by other tools. "
+                "Table names and column layouts are in the SQL schema reference in the system "
+                "prompt — use get_table_schema to verify column names before writing SQL. "
                 "Constraints: only SELECT/WITH queries are accepted; LIMIT 200 is injected "
                 "automatically if absent; results over 100 KB are blocked with an error. "
-                "SQLite only — PERCENTILE_CONT, MEDIAN, and STDDEV are not supported."
+                "SQLite only — PERCENTILE_CONT, MEDIAN, and STDDEV are not supported. "
+                "When a table is not found, a redirect hint is returned naming the correct "
+                "table for this profile format."
             ),
             "input_schema": {
                 "type": "object",
@@ -474,8 +533,10 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
                     "table": {
                         "type": "string",
                         "description": (
-                            "The table name to inspect "
-                            "(e.g. CUPTI_ACTIVITY_KIND_KERNEL, MPI_COLLECTIVES_EVENTS)."
+                            "The table or view name to inspect. "
+                            "Call this before writing sql_query to avoid column name errors. "
+                            "Table names depend on the profile format — see the SQL schema "
+                            "reference in the system prompt."
                         ),
                     }
                 },
@@ -486,7 +547,7 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
 }
 
 
-def dispatch(profile: NsysProfile, tool_name: str, tool_input: dict) -> str:
+def dispatch(profile: Profile, tool_name: str, tool_input: dict) -> str:
     """Dispatch a tool call from the agent loop and return a JSON string result."""
     if tool_name not in TOOL_REGISTRY:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})

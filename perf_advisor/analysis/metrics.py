@@ -1,25 +1,26 @@
-"""Compute structured metrics from a NsysProfile.
+"""Compute structured metrics from a Profile.
 
-Each function is a focused query that returns data for one section of ProfileSummary.
-All SQL is written to be portable across profiles — tables are checked for existence
-before querying, and optional tables (MPI, NVTX) degrade gracefully.
+Each function is a focused computation that returns data for one section of ProfileSummary.
+All vendor-specific SQL is contained in the Profile implementations (NsysProfile, RocpdProfile).
+Analysis functions are vendor-neutral: they call only Profile Protocol methods.
 """
 
 from __future__ import annotations
 
 import math
 import time
+from collections import defaultdict
 
-from perf_advisor.ingestion.profile import NsysProfile
+from perf_advisor.ingestion.base import KernelRow, MemcpyRow, Profile
 
 from ._utils import _normalize_demangled
 from .models import (
     DeviceInfo,
     GapBucket,
     KernelSummary,
+    MarkerRangeSummary,
     MemcpySummary,
     MpiOpSummary,
-    NvtxRangeSummary,
     PhaseSummary,
     ProfileSummary,
     StreamSummary,
@@ -31,604 +32,340 @@ from .phases import PhaseWindow, detect_phases
 # ---------------------------------------------------------------------------
 
 
-def compute_profile_span(profile: NsysProfile) -> float:
-    """True wall-clock duration from first to last captured event across all sources.
+def compute_profile_span(profile: Profile) -> float:
+    """True wall-clock duration from first to last captured event."""
+    t0, t1 = profile.profile_bounds_ns()
+    return (t1 - t0) / 1e9 if t1 > t0 else 0.0
 
-    Includes CPU-side CUDA API calls (RUNTIME) and NVTX annotations so that the
-    reported span matches the timeline shown in the Nsight Systems GUI.
-    """
-    sources = []
-    if profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL")
-    if profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
-        sources.append("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMCPY")
-    if profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
-        sources.append(
-            "SELECT start, end FROM CUPTI_ACTIVITY_KIND_RUNTIME "
-            "WHERE start IS NOT NULL AND end IS NOT NULL"
-        )
-    if profile.has_nvtx():
-        sources.append(
-            "SELECT start, end FROM NVTX_EVENTS "
-            "WHERE start IS NOT NULL AND end IS NOT NULL AND end > start"
-        )
-    if not sources:
+
+def compute_gpu_kernel_time(profile: Profile) -> float:
+    if not profile.capabilities.has_kernels:
         return 0.0
-    union_sql = " UNION ALL ".join(sources)
-    row = profile.query(f"SELECT (MAX(end) - MIN(start)) / 1e9 AS span_s FROM ({union_sql})")[0]
-    return float(row["span_s"] or 0.0)
+    return sum(e.duration_ns for e in profile.kernel_events()) / 1e9
 
 
-def compute_gpu_kernel_time(profile: NsysProfile) -> float:
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
+def compute_gpu_memcpy_time(profile: Profile) -> float:
+    if not profile.capabilities.has_memcpy:
         return 0.0
-    row = profile.query(
-        "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_KERNEL"
-    )[0]
-    return float(row["t"])
+    return sum(e.duration_ns for e in profile.memcpy_events()) / 1e9
 
 
-def compute_gpu_memcpy_time(profile: NsysProfile) -> float:
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"):
-        return 0.0
-    row = profile.query(
-        "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_MEMCPY"
-    )[0]
-    return float(row["t"])
+def compute_gpu_sync_time(profile: Profile) -> float:
+    return profile.gpu_sync_time_s()
 
 
-def compute_gpu_sync_time(profile: NsysProfile) -> float:
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"):
-        return 0.0
-    row = profile.query(
-        "SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"
-    )[0]
-    return float(row["t"])
+def compute_cpu_sync_time(profile: Profile, kernel_s: float) -> tuple[float, float]:
+    return profile.cpu_sync_blocked_s(kernel_s)
+
+
+def _compute_launch_overhead(profile: Profile) -> dict[str, tuple[float, float]]:
+    return profile.launch_overhead()
 
 
 def compute_top_kernels(
-    profile: NsysProfile,
+    profile: Profile,
     limit: int = 15,
     device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
+    if not profile.capabilities.has_kernels:
+        return []
     total_gpu_s = compute_gpu_kernel_time(profile)
-    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-    has_demangled = "demangledName" in kernel_cols
-    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
-    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
-    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
-    rows = profile.query(f"""
-        SELECT
-            {name_expr}                                                     AS name,
-            s.value                                                         AS short_name,
-            COUNT(*)                                                        AS calls,
-            SUM(k.end - k.start) / 1e9                                     AS total_s,
-            AVG(k.end - k.start) / 1e6                                     AS avg_ms,
-            MIN(k.end - k.start) / 1e6                                     AS min_ms,
-            MAX(k.end - k.start) / 1e6                                     AS max_ms,
-            SUM(CAST(k.end - k.start AS REAL) * (k.end - k.start))        AS sum_sq_ns,
-            SUM(k.end - k.start)                                            AS sum_ns,
-            AVG(COALESCE(k.registersPerThread, 0))                         AS avg_registers,
-            AVG(COALESCE(k.sharedMemoryExecuted,
-                         k.staticSharedMemory + k.dynamicSharedMemory, 0)) AS avg_shared_mem,
-            AVG(CAST(k.gridX * k.gridY * k.gridZ *
-                     k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
-        FROM CUPTI_ACTIVITY_KIND_KERNEL k
-        JOIN StringIds s ON k.shortName = s.id
-        {demangled_join}
-        GROUP BY {group_expr}
-        ORDER BY total_s DESC
-        LIMIT {limit}
-    """)
+    evts = profile.kernel_events()
+    return _aggregate_kernel_summaries(evts, total_gpu_s, limit, device_info, launch_overhead)
+
+
+def _aggregate_kernel_summaries(
+    evts: list[KernelRow],
+    total_gpu_s: float,
+    limit: int,
+    device_info: DeviceInfo | None,
+    launch_overhead: dict[str, tuple[float, float]] | None,
+) -> list[KernelSummary]:
+    groups: dict[str, list[KernelRow]] = defaultdict(list)
+    for e in evts:
+        groups[_normalize_demangled(e.name)].append(e)
+
     sm_count = device_info.sm_count if device_info else None
     max_threads_per_sm = device_info.max_threads_per_sm if device_info else None
-    result = []
-    for r in rows:
-        n = r["calls"]
-        sum_ns = r["sum_ns"] or 0
-        sum_sq_ns = r["sum_sq_ns"] or 0.0
-        mean_ns = sum_ns / n if n else 0.0
-        variance = (sum_sq_ns / n - mean_ns**2) if n > 1 else 0.0
+
+    result: list[KernelSummary] = []
+    for norm_name, grp in groups.items():
+        n = len(grp)
+        durations = [e.duration_ns for e in grp]
+        total_ns = sum(durations)
+        avg_ns = total_ns / n
+        sum_sq = sum(d * d for d in durations)
+        variance = (sum_sq / n - avg_ns**2) if n > 1 else 0.0
         std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
-        avg_ms = r["avg_ms"] or 0.0
+        avg_ms = avg_ns / 1e6
         cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
 
-        occupancy = None
-        if sm_count and max_threads_per_sm:
-            avg_threads = r["avg_total_threads"] or 0.0
-            if avg_threads > 0:
-                occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
+        avg_registers = sum(e.registers_per_thread or 0 for e in grp) / n
+        avg_shared = sum(e.shared_mem_bytes or 0 for e in grp) / n
+        threads_vals = [e.total_threads for e in grp if e.total_threads is not None]
+        avg_total_threads = sum(threads_vals) / len(threads_vals) if threads_vals else 0.0
 
-        norm_name = _normalize_demangled(r["name"])
+        occupancy = None
+        if sm_count and max_threads_per_sm and avg_total_threads > 0:
+            occupancy = round(min(1.0, avg_total_threads / (sm_count * max_threads_per_sm)), 3)
+
+        short_name = grp[0].short_name
+        short = short_name if short_name and short_name != norm_name else None
         oh = (launch_overhead or {}).get(norm_name)
-        short = r["short_name"] if r["short_name"] != norm_name else None
+
         result.append(
             KernelSummary(
                 name=norm_name,
                 short_name=short,
                 calls=n,
-                total_s=round(r["total_s"], 4),
+                total_s=round(total_ns / 1e9, 4),
                 avg_ms=round(avg_ms, 4),
-                min_ms=round(r["min_ms"], 4),
-                max_ms=round(r["max_ms"], 4),
-                pct_of_gpu_time=round(100.0 * r["total_s"] / total_gpu_s, 1)
+                min_ms=round(min(durations) / 1e6, 4),
+                max_ms=round(max(durations) / 1e6, 4),
+                pct_of_gpu_time=round(100.0 * total_ns / 1e9 / total_gpu_s, 1)
                 if total_gpu_s
                 else 0.0,
                 std_dev_ms=round(std_dev_ms, 4),
                 cv=cv,
-                avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
-                avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
+                avg_registers_per_thread=int(round(avg_registers)),
+                avg_shared_mem_bytes=int(round(avg_shared)),
                 estimated_occupancy=occupancy,
                 avg_launch_overhead_us=oh[0] if oh else None,
                 max_launch_overhead_us=oh[1] if oh else None,
             )
         )
-    return result
+
+    result.sort(key=lambda k: k.total_s, reverse=True)
+    return result[:limit]
 
 
 def compute_memcpy_by_kind(
-    profile: NsysProfile,
+    profile: Profile,
     peak_bandwidth_GBs: float | None = None,
 ) -> list[MemcpySummary]:
-    rows = profile.query("""
-        SELECT
-            e.label                              AS kind,
-            COUNT(*)                             AS transfers,
-            SUM(m.bytes)                         AS total_bytes,
-            SUM(m.end - m.start) / 1e9          AS total_s,
-            CAST(SUM(m.bytes) AS REAL) / NULLIF(SUM(m.end - m.start), 0)
-                                                 AS effective_GBs
-        FROM CUPTI_ACTIVITY_KIND_MEMCPY m
-        JOIN ENUM_CUDA_MEMCPY_OPER e ON m.copyKind = e.id
-        GROUP BY m.copyKind
-        ORDER BY total_s DESC
-    """)
-    return [
-        MemcpySummary(
-            kind=r["kind"],
-            transfers=r["transfers"],
-            total_bytes=r["total_bytes"] or 0,
-            total_s=round(r["total_s"], 4),
-            effective_GBs=round(r["effective_GBs"] or 0.0, 2),
-            pct_of_peak_bandwidth=(
-                round(100.0 * (r["effective_GBs"] or 0.0) / peak_bandwidth_GBs, 1)
-                if peak_bandwidth_GBs and (r["effective_GBs"] or 0.0) > 0
-                else None
-            ),
+    if not profile.capabilities.has_memcpy:
+        return []
+    evts = profile.memcpy_events()
+    by_dir: dict[str, dict] = {}
+    for e in evts:
+        d = e.direction
+        if d not in by_dir:
+            by_dir[d] = {"count": 0, "total_ns": 0, "total_bytes": 0}
+        by_dir[d]["count"] += 1
+        by_dir[d]["total_ns"] += e.duration_ns
+        by_dir[d]["total_bytes"] += e.bytes
+    result = []
+    for direction, s in by_dir.items():
+        total_s = s["total_ns"] / 1e9
+        eff_GBs = s["total_bytes"] / s["total_ns"] if s["total_ns"] > 0 else 0.0
+        result.append(
+            MemcpySummary(
+                kind=direction,
+                transfers=s["count"],
+                total_bytes=s["total_bytes"],
+                total_s=round(total_s, 4),
+                effective_GBs=round(eff_GBs, 2),
+                pct_of_peak_bandwidth=(
+                    round(100.0 * eff_GBs / peak_bandwidth_GBs, 1)
+                    if peak_bandwidth_GBs and eff_GBs > 0
+                    else None
+                ),
+            )
         )
-        for r in rows
-    ]
+    result.sort(key=lambda m: m.total_s, reverse=True)
+    return result
 
 
-def compute_gap_histogram(profile: NsysProfile) -> tuple[float, list[GapBucket]]:
+def compute_gap_histogram(profile: Profile) -> tuple[float, list[GapBucket]]:
     """Return (total_idle_s, gap_histogram) for inter-kernel idle time."""
-    rows = profile.query("""
-        WITH ordered AS (
-            SELECT start, end, ROW_NUMBER() OVER (ORDER BY start) AS rn
-            FROM CUPTI_ACTIVITY_KIND_KERNEL
-        ),
-        gaps AS (
-            SELECT o2.start - o1.end AS gap_ns
-            FROM ordered o1
-            JOIN ordered o2 ON o2.rn = o1.rn + 1
-            WHERE o2.start > o1.end
-        )
-        SELECT
-            CASE
-                WHEN gap_ns < 10000      THEN '<10us'
-                WHEN gap_ns < 100000     THEN '10-100us'
-                WHEN gap_ns < 1000000    THEN '100us-1ms'
-                WHEN gap_ns < 10000000   THEN '1-10ms'
-                WHEN gap_ns < 100000000  THEN '10-100ms'
-                ELSE '>100ms'
-            END                          AS label,
-            COUNT(*)                     AS count,
-            SUM(gap_ns) / 1e9           AS total_s
-        FROM gaps
-        GROUP BY label
-        ORDER BY MIN(gap_ns)
-    """)
+    if not profile.capabilities.has_kernels:
+        return 0.0, []
+    evts = sorted(profile.kernel_events(), key=lambda e: e.start_ns)
+    gaps = [
+        evts[i].start_ns - evts[i - 1].end_ns
+        for i in range(1, len(evts))
+        if evts[i].start_ns > evts[i - 1].end_ns
+    ]
+    label_order = ["<10us", "10-100us", "100us-1ms", "1-10ms", "10-100ms", ">100ms"]
+    buckets_raw: dict[str, list[int]] = {lb: [] for lb in label_order}
+    for g in gaps:
+        if g < 10_000:
+            buckets_raw["<10us"].append(g)
+        elif g < 100_000:
+            buckets_raw["10-100us"].append(g)
+        elif g < 1_000_000:
+            buckets_raw["100us-1ms"].append(g)
+        elif g < 10_000_000:
+            buckets_raw["1-10ms"].append(g)
+        elif g < 100_000_000:
+            buckets_raw["10-100ms"].append(g)
+        else:
+            buckets_raw[">100ms"].append(g)
     buckets = [
-        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3)) for r in rows
+        GapBucket(label=lb, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
+        for lb in label_order
+        for vs in [buckets_raw[lb]]
+        if vs
     ]
     total_idle_s = sum(b.total_s for b in buckets)
     return total_idle_s, buckets
 
 
-def compute_streams(profile: NsysProfile) -> list[StreamSummary]:
+def compute_streams(profile: Profile) -> list[StreamSummary]:
+    if not profile.capabilities.has_kernels:
+        return []
     total_gpu_s = compute_gpu_kernel_time(profile)
-    rows = profile.query("""
-        SELECT
-            streamId                        AS stream_id,
-            COUNT(*)                        AS kernel_calls,
-            SUM(end - start) / 1e9         AS total_gpu_s
-        FROM CUPTI_ACTIVITY_KIND_KERNEL
-        GROUP BY streamId
-        ORDER BY total_gpu_s DESC
-    """)
-    return [
+    by_stream: dict[int, dict] = {}
+    for e in profile.kernel_events():
+        sid = e.stream_id if e.stream_id is not None else -1
+        if sid not in by_stream:
+            by_stream[sid] = {"count": 0, "total_ns": 0}
+        by_stream[sid]["count"] += 1
+        by_stream[sid]["total_ns"] += e.duration_ns
+    result = [
         StreamSummary(
-            stream_id=r["stream_id"],
-            kernel_calls=r["kernel_calls"],
-            total_gpu_s=round(r["total_gpu_s"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1)
+            stream_id=sid,
+            kernel_calls=s["count"],
+            total_gpu_s=round(s["total_ns"] / 1e9, 4),
+            pct_of_gpu_time=round(100.0 * s["total_ns"] / 1e9 / total_gpu_s, 1)
             if total_gpu_s
             else 0.0,
         )
-        for r in rows
+        for sid, s in by_stream.items()
     ]
+    result.sort(key=lambda x: x.total_gpu_s, reverse=True)
+    return result
 
 
-def compute_nvtx_ranges(profile: NsysProfile, limit: int = 20) -> list[NvtxRangeSummary]:
-    if not profile.has_nvtx():
+def compute_marker_ranges(profile: Profile, limit: int = 20) -> list[MarkerRangeSummary]:
+    """Return aggregated marker ranges (NVTX or rocTX), sorted by total time."""
+    if not profile.capabilities.has_markers:
         return []
-    rows = profile.query(f"""
-        SELECT
-            text                            AS name,
-            COUNT(*)                        AS calls,
-            SUM(end - start) / 1e9         AS total_s,
-            AVG(end - start) / 1e6         AS avg_ms
-        FROM NVTX_EVENTS
-        WHERE eventType = 59
-          AND end IS NOT NULL
-          AND end > start
-          AND text IS NOT NULL
-        GROUP BY text
-        ORDER BY total_s DESC
-        LIMIT {limit}
-    """)
-    return [
-        NvtxRangeSummary(
-            name=r["name"],
-            calls=r["calls"],
-            total_s=round(r["total_s"], 3),
-            avg_ms=round(r["avg_ms"], 3),
+    evts = profile.marker_ranges()
+    by_name: dict[str, dict] = {}
+    for e in evts:
+        n = e.name
+        if n not in by_name:
+            by_name[n] = {"count": 0, "total_ns": 0}
+        by_name[n]["count"] += 1
+        by_name[n]["total_ns"] += e.duration_ns
+    result = [
+        MarkerRangeSummary(
+            name=n,
+            calls=s["count"],
+            total_s=round(s["total_ns"] / 1e9, 3),
+            avg_ms=round(s["total_ns"] / s["count"] / 1e6, 3),
         )
-        for r in rows
+        for n, s in by_name.items()
     ]
+    result.sort(key=lambda x: x.total_s, reverse=True)
+    return result[:limit]
 
 
-def compute_device_info(profile: NsysProfile) -> DeviceInfo:
-    """Query TARGET_INFO_GPU for hardware properties.
-
-    Returns a ``DeviceInfo`` instance.  All fields will be ``None`` if
-    ``TARGET_INFO_GPU`` is absent from the profile (e.g. older Nsight Systems
-    exports).  The return value is always a valid ``DeviceInfo`` object so
-    callers never need to null-check it.
-    """
-    if not profile.has_table("TARGET_INFO_GPU"):
-        return DeviceInfo()
-
-    cols = set(profile.columns("TARGET_INFO_GPU"))
-    rows = profile.query("SELECT * FROM TARGET_INFO_GPU LIMIT 1")
-    if not rows:
-        return DeviceInfo()
-    r = rows[0]
-
-    def _int(col: str) -> int | None:
-        return int(r[col]) if col in cols and r[col] is not None else None
-
-    def _float(col: str) -> float | None:
-        return float(r[col]) if col in cols and r[col] is not None else None
-
-    sm_count = _int("smCount")
-
-    max_threads_per_sm = None
-    if "maxWarpsPerSm" in cols and "threadsPerWarp" in cols:
-        warps = r["maxWarpsPerSm"]
-        warp_size = r["threadsPerWarp"]
-        if warps is not None and warp_size is not None:
-            max_threads_per_sm = int(warps) * int(warp_size)
-
-    # memoryBandwidth is stored in bytes/s; convert to GB/s
-    peak_bw_GBs = None
-    if "memoryBandwidth" in cols and r["memoryBandwidth"]:
-        peak_bw_GBs = round(float(r["memoryBandwidth"]) / 1e9, 1)
-
-    compute_cap = None
-    major = _int("computeMajor")
-    minor = _int("computeMinor")
-    if major is not None and minor is not None:
-        compute_cap = f"{major}.{minor}"
-
-    total_mem_GiB = None
-    if "totalMemory" in cols and r["totalMemory"]:
-        total_mem_GiB = round(float(r["totalMemory"]) / (1024**3), 1)
-
-    l2_MiB = None
-    if "l2CacheSize" in cols and r["l2CacheSize"]:
-        l2_MiB = round(float(r["l2CacheSize"]) / (1024**2), 1)
-
-    clock_MHz = None
-    if "clockRate" in cols and r["clockRate"]:
-        clock_MHz = round(float(r["clockRate"]) / 1e6, 0)
-
-    shmem_KiB = None
-    if "maxShmemPerBlock" in cols and r["maxShmemPerBlock"]:
-        shmem_KiB = round(float(r["maxShmemPerBlock"]) / 1024, 1)
-
-    shmem_optin_KiB = None
-    if "maxShmemPerBlockOptin" in cols and r["maxShmemPerBlockOptin"]:
-        shmem_optin_KiB = round(float(r["maxShmemPerBlockOptin"]) / 1024, 1)
-
-    return DeviceInfo(
-        name=r["name"] if "name" in cols and r["name"] else None,
-        compute_capability=compute_cap,
-        sm_count=sm_count,
-        max_threads_per_sm=max_threads_per_sm,
-        peak_memory_bandwidth_GBs=peak_bw_GBs,
-        total_memory_GiB=total_mem_GiB,
-        l2_cache_MiB=l2_MiB,
-        max_threads_per_block=_int("maxThreadsPerBlock"),
-        max_registers_per_block=_int("maxRegistersPerBlock"),
-        max_shared_mem_per_block_KiB=shmem_KiB,
-        max_shared_mem_per_block_optin_KiB=shmem_optin_KiB,
-        clock_rate_MHz=clock_MHz,
-    )
+def compute_device_info(profile: Profile) -> DeviceInfo:
+    return profile.device_info()
 
 
-def _compute_launch_overhead(profile: NsysProfile) -> dict[str, tuple[float, float]]:
-    """Return {kernel_name: (avg_launch_us, max_launch_us)} via correlationId join.
-
-    Measures CPU-to-GPU enqueue latency: the time from when the CPU issued
-    cudaLaunchKernel to when the kernel actually started executing on the GPU.
-    Returns an empty dict if RUNTIME is absent or lacks correlationId.
-    """
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
-        return {}
-    runtime_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_RUNTIME"))
-    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-    if "correlationId" not in runtime_cols or "correlationId" not in kernel_cols:
-        return {}
-
-    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-    has_demangled = "demangledName" in kernel_cols
-    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
-    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
-    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
-    rows = profile.query(f"""
-        SELECT
-            {name_expr}                                              AS name,
-            AVG(CAST(k.start - rt.start AS REAL)) / 1000.0         AS avg_launch_us,
-            MAX(k.start - rt.start) / 1000.0                        AS max_launch_us
-        FROM CUPTI_ACTIVITY_KIND_KERNEL k
-        JOIN CUPTI_ACTIVITY_KIND_RUNTIME rt ON k.correlationId = rt.correlationId
-        JOIN StringIds s ON k.shortName = s.id
-        {demangled_join}
-        WHERE k.start >= rt.start
-        GROUP BY {group_expr}
-    """)
-    return {
-        _normalize_demangled(r["name"]): (
-            round(float(r["avg_launch_us"]), 2),
-            round(float(r["max_launch_us"]), 2),
-        )
-        for r in rows
-        if r["avg_launch_us"] is not None and float(r["avg_launch_us"]) >= 0
-    }
-
-
-def compute_cpu_sync_time(
-    profile: NsysProfile, gpu_kernel_s: float
-) -> tuple[float | None, float | None]:
-    """Return (total_sync_s, pct_of_gpu_kernel_time) for CUDA synchronization API calls.
-
-    Sums the CPU wall time spent in *Synchronize calls (cuEventSynchronize,
-    cuStreamSynchronize, cuCtxSynchronize, etc.).  The percentage is relative to
-    total GPU kernel time — a high value means GPU execution is being serialized
-    by CPU-side sync barriers.
-
-    Returns (None, None) if CUPTI_ACTIVITY_KIND_RUNTIME is not present or lacks nameId.
-    """
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
-        return None, None
-    if "nameId" not in set(profile.columns("CUPTI_ACTIVITY_KIND_RUNTIME")):
-        return None, None
-
-    rows = profile.query("""
-        SELECT COALESCE(SUM(rt.end - rt.start), 0) / 1e9 AS sync_s
-        FROM CUPTI_ACTIVITY_KIND_RUNTIME rt
-        JOIN StringIds s ON rt.nameId = s.id
-        WHERE s.value LIKE '%Synchronize%'
-          AND rt.end IS NOT NULL
-    """)
-    if not rows or rows[0]["sync_s"] is None:
-        return None, None
-
-    sync_s = round(float(rows[0]["sync_s"]), 3)
-    pct = round(100.0 * sync_s / gpu_kernel_s, 1) if gpu_kernel_s > 0 else None
-    return sync_s, pct
-
-
-def compute_mpi_ops(profile: NsysProfile, limit: int = 10) -> list[MpiOpSummary]:
-    if not profile.has_mpi():
+def compute_mpi_ops(profile: Profile, limit: int = 10) -> list[MpiOpSummary]:
+    if not profile.capabilities.has_mpi:
         return []
+    return _aggregate_mpi_ops(profile.mpi_ranges(), limit)
 
-    ops: list[MpiOpSummary] = []
 
-    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
-        if not profile.has_table(table):
-            continue
-        rows = profile.query(f"""
-            SELECT
-                s.value                         AS op,
-                COUNT(*)                        AS calls,
-                SUM(end - start) / 1e9         AS total_s,
-                AVG(end - start) / 1e6         AS avg_ms,
-                MAX(end - start) / 1e6         AS max_ms
-            FROM {table} e
-            JOIN StringIds s ON e.textId = s.id
-            WHERE end IS NOT NULL
-            GROUP BY e.textId
-            ORDER BY total_s DESC
-            LIMIT {limit}
-        """)
-        ops.extend(
-            MpiOpSummary(
-                op=r["op"],
-                calls=r["calls"],
-                total_s=round(r["total_s"], 3),
-                avg_ms=round(r["avg_ms"], 3),
-                max_ms=round(r["max_ms"], 3),
-            )
-            for r in rows
+def _aggregate_mpi_ops(evts: list, limit: int = 10) -> list[MpiOpSummary]:
+    by_op: dict[str, dict] = {}
+    for e in evts:
+        op = e.name
+        if op not in by_op:
+            by_op[op] = {"calls": 0, "total_ns": 0, "max_ns": 0}
+        by_op[op]["calls"] += 1
+        by_op[op]["total_ns"] += e.duration_ns
+        by_op[op]["max_ns"] = max(by_op[op]["max_ns"], e.duration_ns)
+    result = [
+        MpiOpSummary(
+            op=op,
+            calls=s["calls"],
+            total_s=round(s["total_ns"] / 1e9, 3),
+            avg_ms=round(s["total_ns"] / s["calls"] / 1e6, 3),
+            max_ms=round(s["max_ns"] / 1e6, 3),
         )
-
-    # Deduplicate by op name, keeping highest total_s entry
-    seen: dict[str, MpiOpSummary] = {}
-    for op in sorted(ops, key=lambda x: x.total_s, reverse=True):
-        seen.setdefault(op.op, op)
-    return sorted(seen.values(), key=lambda x: x.total_s, reverse=True)[:limit]
+        for op, s in by_op.items()
+    ]
+    result.sort(key=lambda x: x.total_s, reverse=True)
+    return result[:limit]
 
 
 def _compute_all_mpi_stats(
-    profile: NsysProfile,
+    profile: Profile,
     phases: list[PhaseWindow],
     global_limit: int = 10,
     phase_limit: int = 5,
 ) -> tuple[list[MpiOpSummary], list[list[MpiOpSummary]]]:
-    """Compute global and per-phase MPI stats in a single scan per table.
-
-    Compute global and per-phase MPI stats in a single scan per table using
-    conditional aggregation (CASE WHEN per phase).
-    Saves ~50% of MPI scan time when computing both global and phase-level stats.
-
-    Returns ``(global_ops, per_phase_ops)`` where ``per_phase_ops[i]`` is the list
-    for ``phases[i]``.
-    """
-    if not profile.has_mpi():
+    """Compute global and per-phase MPI stats from cached mpi_ranges()."""
+    if not profile.capabilities.has_mpi:
         return [], [[] for _ in phases]
-
-    # Build conditional-aggregation columns for each phase.
-    # We need COUNT, total_ns (for avg computation), and MAX per phase.
-    phase_cols = []
-    for i, p in enumerate(phases):
-        pred = f"e.start >= {p.start_ns} AND e.end <= {p.end_ns}"
-        phase_cols.append(f"""
-            COUNT(CASE WHEN {pred} THEN 1 END)                    AS p{i}_calls,
-            SUM(CASE WHEN {pred} THEN e.end - e.start ELSE 0 END) AS p{i}_sum_ns,
-            MAX(CASE WHEN {pred} THEN e.end - e.start ELSE 0 END) AS p{i}_max_ns
-        """)
-    extra_cols = ",\n".join(phase_cols)
-
-    global_seen: dict[str, MpiOpSummary] = {}
-    phase_ops: list[dict[str, MpiOpSummary]] = [{} for _ in phases]
-
-    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
-        if not profile.has_table(table):
-            continue
-        rows = profile.query(f"""
-            SELECT
-                s.value                         AS op,
-                COUNT(*)                        AS total_calls,
-                SUM(e.end - e.start) / 1e9     AS total_s,
-                AVG(e.end - e.start) / 1e6     AS avg_ms,
-                MAX(e.end - e.start) / 1e6     AS max_ms,
-                {extra_cols}
-            FROM {table} e
-            JOIN StringIds s ON e.textId = s.id
-            WHERE e.end IS NOT NULL
-            GROUP BY e.textId
-        """)
-        for r in rows:
-            op_name = r["op"]
-            # Global (deduplicate by highest total_s across tables)
-            if op_name not in global_seen or r["total_s"] > global_seen[op_name].total_s:
-                global_seen[op_name] = MpiOpSummary(
-                    op=op_name,
-                    calls=r["total_calls"],
-                    total_s=round(r["total_s"], 3),
-                    avg_ms=round(r["avg_ms"], 3),
-                    max_ms=round(r["max_ms"], 3),
-                )
-            # Per-phase
-            for i in range(len(phases)):
-                p_calls = r[f"p{i}_calls"] or 0
-                p_sum_ns = r[f"p{i}_sum_ns"] or 0
-                p_max_ns = r[f"p{i}_max_ns"] or 0
-                if p_calls == 0:
-                    continue
-                if op_name not in phase_ops[i] or p_sum_ns > (phase_ops[i][op_name].total_s * 1e9):
-                    phase_ops[i][op_name] = MpiOpSummary(
-                        op=op_name,
-                        calls=p_calls,
-                        total_s=round(p_sum_ns / 1e9, 3),
-                        avg_ms=round(p_sum_ns / p_calls / 1e6, 3),
-                        max_ms=round(p_max_ns / 1e6, 3),
-                    )
-
-    global_ops = sorted(global_seen.values(), key=lambda x: x.total_s, reverse=True)[:global_limit]
-    per_phase = [
-        sorted(d.values(), key=lambda x: x.total_s, reverse=True)[:phase_limit] for d in phase_ops
-    ]
+    all_mpi = profile.mpi_ranges()
+    global_ops = _aggregate_mpi_ops(all_mpi, global_limit)
+    per_phase = []
+    for phase in phases:
+        window = [e for e in all_mpi if e.start_ns >= phase.start_ns and e.end_ns <= phase.end_ns]
+        per_phase.append(_aggregate_mpi_ops(window, phase_limit))
     return global_ops, per_phase
 
 
 # ---------------------------------------------------------------------------
-# Per-phase metric helpers
+# Per-phase metric helpers (operate on pre-cached event lists)
 # ---------------------------------------------------------------------------
 
 
-def _window_kernel_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
-    if not profile.has_table("CUPTI_ACTIVITY_KIND_KERNEL"):
-        return 0.0
-    row = profile.query(f"""
-        SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t
-        FROM CUPTI_ACTIVITY_KIND_KERNEL
-        WHERE start >= {start_ns} AND end <= {end_ns}
-    """)[0]
-    return float(row["t"])
+def _window_kernel_time(evts: list[KernelRow], start_ns: int, end_ns: int) -> float:
+    return sum(e.duration_ns for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns) / 1e9
 
 
-def _window_memcpy_time(profile: NsysProfile, start_ns: int, end_ns: int) -> float:
-    row = profile.query(f"""
-        SELECT COALESCE(SUM(end - start), 0) / 1e9 AS t
-        FROM CUPTI_ACTIVITY_KIND_MEMCPY
-        WHERE start >= {start_ns} AND end <= {end_ns}
-    """)[0]
-    return float(row["t"])
+def _window_memcpy_time(evts: list[MemcpyRow], start_ns: int, end_ns: int) -> float:
+    return sum(e.duration_ns for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns) / 1e9
 
 
 def _window_idle_time(
-    profile: NsysProfile, start_ns: int, end_ns: int
+    evts: list[KernelRow], start_ns: int, end_ns: int
 ) -> tuple[float, list[GapBucket]]:
     """Return (total_idle_s, gap_histogram) for inter-kernel gaps within a time window."""
-    rows = profile.query(f"""
-        WITH ordered AS (
-            SELECT start, end, ROW_NUMBER() OVER (ORDER BY start) AS rn
-            FROM CUPTI_ACTIVITY_KIND_KERNEL
-            WHERE start >= {start_ns} AND end <= {end_ns}
-        ),
-        gaps AS (
-            SELECT o2.start - o1.end AS gap_ns
-            FROM ordered o1
-            JOIN ordered o2 ON o2.rn = o1.rn + 1
-            WHERE o2.start > o1.end
-        )
-        SELECT
-            CASE
-                WHEN gap_ns < 10000      THEN '<10us'
-                WHEN gap_ns < 100000     THEN '10-100us'
-                WHEN gap_ns < 1000000    THEN '100us-1ms'
-                WHEN gap_ns < 10000000   THEN '1-10ms'
-                WHEN gap_ns < 100000000  THEN '10-100ms'
-                ELSE '>100ms'
-            END                          AS label,
-            COUNT(*)                     AS count,
-            SUM(gap_ns) / 1e9           AS total_s
-        FROM gaps
-        GROUP BY label
-        ORDER BY MIN(gap_ns)
-    """)
+    window = sorted(
+        (e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns),
+        key=lambda e: e.start_ns,
+    )
+    gaps = [
+        window[i].start_ns - window[i - 1].end_ns
+        for i in range(1, len(window))
+        if window[i].start_ns > window[i - 1].end_ns
+    ]
+    label_order = ["<10us", "10-100us", "100us-1ms", "1-10ms", "10-100ms", ">100ms"]
+    buckets_raw: dict[str, list[int]] = {lb: [] for lb in label_order}
+    for g in gaps:
+        if g < 10_000:
+            buckets_raw["<10us"].append(g)
+        elif g < 100_000:
+            buckets_raw["10-100us"].append(g)
+        elif g < 1_000_000:
+            buckets_raw["100us-1ms"].append(g)
+        elif g < 10_000_000:
+            buckets_raw["1-10ms"].append(g)
+        elif g < 100_000_000:
+            buckets_raw["10-100ms"].append(g)
+        else:
+            buckets_raw[">100ms"].append(g)
     buckets = [
-        GapBucket(label=r["label"], count=r["count"], total_s=round(r["total_s"], 3)) for r in rows
+        GapBucket(label=lb, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
+        for lb in label_order
+        for vs in [buckets_raw[lb]]
+        if vs
     ]
     return sum(b.total_s for b in buckets), buckets
 
 
 def _window_top_kernels(
-    profile: NsysProfile,
+    evts: list[KernelRow],
     start_ns: int,
     end_ns: int,
     total_kernel_s: float,
@@ -636,217 +373,101 @@ def _window_top_kernels(
     device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
-    kernel_cols = set(profile.columns("CUPTI_ACTIVITY_KIND_KERNEL"))
-    has_demangled = "demangledName" in kernel_cols
-    demangled_join = "LEFT JOIN StringIds sd ON k.demangledName = sd.id" if has_demangled else ""
-    name_expr = "COALESCE(sd.value, s.value)" if has_demangled else "s.value"
-    group_expr = "COALESCE(k.demangledName, k.shortName)" if has_demangled else "k.shortName"
-    rows = profile.query(f"""
-        SELECT
-            {name_expr}                                                     AS name,
-            s.value                                                         AS short_name,
-            COUNT(*)                                                        AS calls,
-            SUM(k.end - k.start) / 1e9                                     AS total_s,
-            AVG(k.end - k.start) / 1e6                                     AS avg_ms,
-            MIN(k.end - k.start) / 1e6                                     AS min_ms,
-            MAX(k.end - k.start) / 1e6                                     AS max_ms,
-            SUM(CAST(k.end - k.start AS REAL) * (k.end - k.start))        AS sum_sq_ns,
-            SUM(k.end - k.start)                                            AS sum_ns,
-            AVG(COALESCE(k.registersPerThread, 0))                         AS avg_registers,
-            AVG(COALESCE(k.sharedMemoryExecuted,
-                         k.staticSharedMemory + k.dynamicSharedMemory, 0)) AS avg_shared_mem,
-            AVG(CAST(k.gridX * k.gridY * k.gridZ *
-                     k.blockX * k.blockY * k.blockZ AS REAL))              AS avg_total_threads
-        FROM CUPTI_ACTIVITY_KIND_KERNEL k
-        JOIN StringIds s ON k.shortName = s.id
-        {demangled_join}
-        WHERE k.start >= {start_ns} AND k.end <= {end_ns}
-        GROUP BY {group_expr}
-        ORDER BY total_s DESC
-        LIMIT {limit}
-    """)
-    sm_count = device_info.sm_count if device_info else None
-    max_threads_per_sm = device_info.max_threads_per_sm if device_info else None
-    result = []
-    for r in rows:
-        n = r["calls"]
-        sum_ns = r["sum_ns"] or 0
-        sum_sq_ns = r["sum_sq_ns"] or 0.0
-        mean_ns = sum_ns / n if n else 0.0
-        variance = (sum_sq_ns / n - mean_ns**2) if n > 1 else 0.0
-        std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
-        avg_ms = r["avg_ms"] or 0.0
-        cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
-
-        occupancy = None
-        if sm_count and max_threads_per_sm:
-            avg_threads = r["avg_total_threads"] or 0.0
-            if avg_threads > 0:
-                occupancy = round(min(1.0, avg_threads / (sm_count * max_threads_per_sm)), 3)
-
-        norm_name = _normalize_demangled(r["name"])
-        oh = (launch_overhead or {}).get(norm_name)
-        short = r["short_name"] if r["short_name"] != norm_name else None
-        result.append(
-            KernelSummary(
-                name=norm_name,
-                short_name=short,
-                calls=n,
-                total_s=round(r["total_s"], 4),
-                avg_ms=round(avg_ms, 4),
-                min_ms=round(r["min_ms"], 4),
-                max_ms=round(r["max_ms"], 4),
-                pct_of_gpu_time=round(100.0 * r["total_s"] / total_kernel_s, 1)
-                if total_kernel_s
-                else 0.0,
-                std_dev_ms=round(std_dev_ms, 4),
-                cv=cv,
-                avg_registers_per_thread=int(round(r["avg_registers"] or 0)),
-                avg_shared_mem_bytes=int(round(r["avg_shared_mem"] or 0)),
-                estimated_occupancy=occupancy,
-                avg_launch_overhead_us=oh[0] if oh else None,
-                max_launch_overhead_us=oh[1] if oh else None,
-            )
-        )
-    return result
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    return _aggregate_kernel_summaries(window, total_kernel_s, limit, device_info, launch_overhead)
 
 
-def _window_mpi_ops(
-    profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 5
-) -> list[MpiOpSummary]:
-    if not profile.has_mpi():
-        return []
-    ops: list[MpiOpSummary] = []
-    for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
-        if not profile.has_table(table):
-            continue
-        rows = profile.query(f"""
-            SELECT
-                s.value                         AS op,
-                COUNT(*)                        AS calls,
-                SUM(end - start) / 1e9         AS total_s,
-                AVG(end - start) / 1e6         AS avg_ms,
-                MAX(end - start) / 1e6         AS max_ms
-            FROM {table} e
-            JOIN StringIds s ON e.textId = s.id
-            WHERE e.start >= {start_ns} AND e.end <= {end_ns}
-              AND e.end IS NOT NULL
-            GROUP BY e.textId
-            ORDER BY total_s DESC
-            LIMIT {limit}
-        """)
-        ops.extend(
-            MpiOpSummary(
-                op=r["op"],
-                calls=r["calls"],
-                total_s=round(r["total_s"], 3),
-                avg_ms=round(r["avg_ms"], 3),
-                max_ms=round(r["max_ms"], 3),
-            )
-            for r in rows
-        )
-    seen: dict[str, MpiOpSummary] = {}
-    for op in sorted(ops, key=lambda x: x.total_s, reverse=True):
-        seen.setdefault(op.op, op)
-    return sorted(seen.values(), key=lambda x: x.total_s, reverse=True)[:limit]
+def _window_mpi_ops(evts: list, start_ns: int, end_ns: int, limit: int = 5) -> list[MpiOpSummary]:
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    return _aggregate_mpi_ops(window, limit)
 
 
 def _window_memcpy_by_kind(
-    profile: NsysProfile,
+    evts: list[MemcpyRow],
     start_ns: int,
     end_ns: int,
     peak_bandwidth_GBs: float | None = None,
 ) -> list[MemcpySummary]:
-    rows = profile.query(f"""
-        SELECT
-            e.label                              AS kind,
-            COUNT(*)                             AS transfers,
-            SUM(m.bytes)                         AS total_bytes,
-            SUM(m.end - m.start) / 1e9          AS total_s,
-            CAST(SUM(m.bytes) AS REAL) / NULLIF(SUM(m.end - m.start), 0)
-                                                 AS effective_GBs
-        FROM CUPTI_ACTIVITY_KIND_MEMCPY m
-        JOIN ENUM_CUDA_MEMCPY_OPER e ON m.copyKind = e.id
-        WHERE m.start >= {start_ns} AND m.end <= {end_ns}
-        GROUP BY m.copyKind
-        ORDER BY total_s DESC
-    """)
-    return [
-        MemcpySummary(
-            kind=r["kind"],
-            transfers=r["transfers"],
-            total_bytes=r["total_bytes"] or 0,
-            total_s=round(r["total_s"], 4),
-            effective_GBs=round(r["effective_GBs"] or 0.0, 2),
-            pct_of_peak_bandwidth=(
-                round(100.0 * (r["effective_GBs"] or 0.0) / peak_bandwidth_GBs, 1)
-                if peak_bandwidth_GBs and (r["effective_GBs"] or 0.0) > 0
-                else None
-            ),
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    by_dir: dict[str, dict] = {}
+    for e in window:
+        d = e.direction
+        if d not in by_dir:
+            by_dir[d] = {"count": 0, "total_ns": 0, "total_bytes": 0}
+        by_dir[d]["count"] += 1
+        by_dir[d]["total_ns"] += e.duration_ns
+        by_dir[d]["total_bytes"] += e.bytes
+    result = []
+    for direction, s in by_dir.items():
+        total_s = s["total_ns"] / 1e9
+        eff_GBs = s["total_bytes"] / s["total_ns"] if s["total_ns"] > 0 else 0.0
+        result.append(
+            MemcpySummary(
+                kind=direction,
+                transfers=s["count"],
+                total_bytes=s["total_bytes"],
+                total_s=round(total_s, 4),
+                effective_GBs=round(eff_GBs, 2),
+                pct_of_peak_bandwidth=(
+                    round(100.0 * eff_GBs / peak_bandwidth_GBs, 1)
+                    if peak_bandwidth_GBs and eff_GBs > 0
+                    else None
+                ),
+            )
         )
-        for r in rows
-    ]
+    result.sort(key=lambda m: m.total_s, reverse=True)
+    return result
 
 
-def _window_streams(profile: NsysProfile, start_ns: int, end_ns: int) -> list[StreamSummary]:
-    total_gpu_s = _window_kernel_time(profile, start_ns, end_ns)
-    rows = profile.query(f"""
-        SELECT
-            streamId                        AS stream_id,
-            COUNT(*)                        AS kernel_calls,
-            SUM(end - start) / 1e9         AS total_gpu_s
-        FROM CUPTI_ACTIVITY_KIND_KERNEL
-        WHERE start >= {start_ns} AND end <= {end_ns}
-        GROUP BY streamId
-        ORDER BY total_gpu_s DESC
-    """)
-    return [
+def _window_streams(evts: list[KernelRow], start_ns: int, end_ns: int) -> list[StreamSummary]:
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    total_ns = sum(e.duration_ns for e in window)
+    by_stream: dict[int, dict] = {}
+    for e in window:
+        sid = e.stream_id if e.stream_id is not None else -1
+        if sid not in by_stream:
+            by_stream[sid] = {"count": 0, "total_ns": 0}
+        by_stream[sid]["count"] += 1
+        by_stream[sid]["total_ns"] += e.duration_ns
+    result = [
         StreamSummary(
-            stream_id=r["stream_id"],
-            kernel_calls=r["kernel_calls"],
-            total_gpu_s=round(r["total_gpu_s"], 4),
-            pct_of_gpu_time=round(100.0 * r["total_gpu_s"] / total_gpu_s, 1)
-            if total_gpu_s
-            else 0.0,
+            stream_id=sid,
+            kernel_calls=s["count"],
+            total_gpu_s=round(s["total_ns"] / 1e9, 4),
+            pct_of_gpu_time=round(100.0 * s["total_ns"] / total_ns, 1) if total_ns else 0.0,
         )
-        for r in rows
+        for sid, s in by_stream.items()
     ]
+    result.sort(key=lambda x: x.total_gpu_s, reverse=True)
+    return result
 
 
-def _window_nvtx_ranges(
-    profile: NsysProfile, start_ns: int, end_ns: int, limit: int = 20
-) -> list[NvtxRangeSummary]:
-    if not profile.has_nvtx():
-        return []
-    rows = profile.query(f"""
-        SELECT
-            text                            AS name,
-            COUNT(*)                        AS calls,
-            SUM(end - start) / 1e9         AS total_s,
-            AVG(end - start) / 1e6         AS avg_ms
-        FROM NVTX_EVENTS
-        WHERE eventType = 59
-          AND end IS NOT NULL
-          AND end > start
-          AND text IS NOT NULL
-          AND start >= {start_ns} AND end <= {end_ns}
-        GROUP BY text
-        ORDER BY total_s DESC
-        LIMIT {limit}
-    """)
-    return [
-        NvtxRangeSummary(
-            name=r["name"],
-            calls=r["calls"],
-            total_s=round(r["total_s"], 3),
-            avg_ms=round(r["avg_ms"], 3),
+def _window_marker_ranges(
+    evts: list, start_ns: int, end_ns: int, limit: int = 20
+) -> list[MarkerRangeSummary]:
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    by_name: dict[str, dict] = {}
+    for e in window:
+        n = e.name
+        if n not in by_name:
+            by_name[n] = {"count": 0, "total_ns": 0}
+        by_name[n]["count"] += 1
+        by_name[n]["total_ns"] += e.duration_ns
+    result = [
+        MarkerRangeSummary(
+            name=n,
+            calls=s["count"],
+            total_s=round(s["total_ns"] / 1e9, 3),
+            avg_ms=round(s["total_ns"] / s["count"] / 1e6, 3),
         )
-        for r in rows
+        for n, s in by_name.items()
     ]
+    result.sort(key=lambda x: x.total_s, reverse=True)
+    return result[:limit]
 
 
 def compute_phase_summary(
-    profile: NsysProfile,
+    profile: Profile,
     phase: PhaseWindow,
     profile_start_ns: int,
     *,
@@ -856,20 +477,22 @@ def compute_phase_summary(
 ) -> PhaseSummary:
     """Compute full metrics for a single PhaseWindow.
 
-    Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra query when
-    all phases are processed together).
+    Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra scan).
     Pass ``device_info`` (from compute_device_info) to enable occupancy metrics.
-    Pass ``launch_overhead`` (from _compute_launch_overhead) to annotate kernels with
-    CPU-to-GPU enqueue latency.
+    Pass ``launch_overhead`` (from profile.launch_overhead()) to annotate kernels.
     """
-    kernel_s = _window_kernel_time(profile, phase.start_ns, phase.end_ns)
-    memcpy_s = _window_memcpy_time(profile, phase.start_ns, phase.end_ns)
-    idle_s, gap_histogram = _window_idle_time(profile, phase.start_ns, phase.end_ns)
+    all_kernel = profile.kernel_events()
+    all_memcpy = profile.memcpy_events()
+    all_mpi = profile.mpi_ranges()
+
+    kernel_s = _window_kernel_time(all_kernel, phase.start_ns, phase.end_ns)
+    memcpy_s = _window_memcpy_time(all_memcpy, phase.start_ns, phase.end_ns)
+    idle_s, gap_histogram = _window_idle_time(all_kernel, phase.start_ns, phase.end_ns)
     duration_s = (phase.end_ns - phase.start_ns) / 1e9
     start_s = (phase.start_ns - profile_start_ns) / 1e9
 
     if mpi_ops is None:
-        mpi_ops = _window_mpi_ops(profile, phase.start_ns, phase.end_ns)
+        mpi_ops = _window_mpi_ops(all_mpi, phase.start_ns, phase.end_ns)
 
     return PhaseSummary(
         name=phase.name,
@@ -884,7 +507,7 @@ def compute_phase_summary(
         total_gpu_idle_s=round(idle_s, 3),
         gap_histogram=gap_histogram,
         top_kernels=_window_top_kernels(
-            profile,
+            all_kernel,
             phase.start_ns,
             phase.end_ns,
             kernel_s,
@@ -901,7 +524,7 @@ def compute_phase_summary(
 
 
 def compute_profile_summary(
-    profile: NsysProfile,
+    profile: Profile,
     max_phases: int = 6,
     timings: dict[str, float] | None = None,
     verbose: bool = False,
@@ -926,8 +549,8 @@ def compute_profile_summary(
     memcpy_s = compute_gpu_memcpy_time(profile)
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
-    launch_overhead = _compute_launch_overhead(profile)
-    cpu_sync_s, cpu_sync_pct = compute_cpu_sync_time(profile, kernel_s)
+    loh = profile.launch_overhead()
+    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(kernel_s)
 
     t_phase = time.perf_counter()
     phases_windows = detect_phases(
@@ -944,7 +567,7 @@ def compute_profile_summary(
             profile_start_ns,
             mpi_ops=all_phase_mpi[i],
             device_info=device_info,
-            launch_overhead=launch_overhead,
+            launch_overhead=loh,
         )
         for i, pw in enumerate(phases_windows)
     ]
@@ -964,14 +587,12 @@ def compute_profile_summary(
         gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
         total_gpu_idle_s=round(total_idle_s, 3),
         gap_histogram=gap_histogram,
-        top_kernels=compute_top_kernels(
-            profile, device_info=device_info, launch_overhead=launch_overhead
-        ),
+        top_kernels=compute_top_kernels(profile, device_info=device_info, launch_overhead=loh),
         memcpy_by_kind=compute_memcpy_by_kind(profile, peak_bandwidth_GBs=peak_bw),
         streams=compute_streams(profile),
-        nvtx_ranges=compute_nvtx_ranges(profile),
+        marker_ranges=compute_marker_ranges(profile),
         mpi_ops=global_mpi_ops,
-        mpi_present=profile.has_mpi(),
+        mpi_present=profile.capabilities.has_mpi,
         phases=phase_summaries,
         peak_memory_bandwidth_GBs=peak_bw,
         cpu_sync_blocked_s=cpu_sync_s,
