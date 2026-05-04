@@ -127,10 +127,10 @@ def test_rocpd_top_kernel_time(synthetic_rocpd_profile):
     assert abs(dslash.total_s - 0.008) < 1e-4
 
 
-def test_rocpd_kernel_short_name_none(synthetic_rocpd_profile):
-    # RocpdProfile does not populate short_name (no separate display/mangled column)
+def test_rocpd_kernel_short_name_type(synthetic_rocpd_profile):
+    # short_name is optional for rocpd; when present it must be a string
     kernels = compute_top_kernels(synthetic_rocpd_profile)
-    assert all(k.short_name is None for k in kernels)
+    assert all(k.short_name is None or isinstance(k.short_name, str) for k in kernels)
 
 
 def test_rocpd_kernel_occupancy_none(synthetic_rocpd_profile):

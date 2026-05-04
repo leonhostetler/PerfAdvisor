@@ -88,9 +88,10 @@ def tool_top_kernels(profile: Profile, args: dict[str, Any]) -> dict:
     launch_overhead = _compute_launch_overhead(profile)
     if start_ns is not None and end_ns is not None:
         start_ns, end_ns = int(start_ns), int(end_ns)
-        total_kernel_s = _window_kernel_time(profile, start_ns, end_ns)
+        kernel_evts = profile.kernel_events()
+        total_kernel_s = _window_kernel_time(kernel_evts, start_ns, end_ns)
         kernels = _window_top_kernels(
-            profile,
+            kernel_evts,
             start_ns,
             end_ns,
             total_kernel_s,
@@ -110,7 +111,7 @@ def tool_gap_histogram(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        total_idle_s, buckets = _window_idle_time(profile, int(start_ns), int(end_ns))
+        total_idle_s, buckets = _window_idle_time(profile.kernel_events(), int(start_ns), int(end_ns))
     else:
         total_idle_s, buckets = compute_gap_histogram(profile)
     return {
@@ -124,7 +125,7 @@ def tool_memcpy_summary(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        transfers = _window_memcpy_by_kind(profile, int(start_ns), int(end_ns))
+        transfers = _window_memcpy_by_kind(profile.memcpy_events(), int(start_ns), int(end_ns))
     else:
         transfers = compute_memcpy_by_kind(profile)
     return {"transfers": [t.model_dump() for t in transfers]}
@@ -135,7 +136,7 @@ def tool_mpi_summary(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ops = _window_mpi_ops(profile, int(start_ns), int(end_ns))
+        ops = _window_mpi_ops(profile.mpi_ranges(), int(start_ns), int(end_ns))
     else:
         ops = compute_mpi_ops(profile)
     return {"mpi_present": profile.capabilities.has_mpi, "ops": [o.model_dump() for o in ops]}
@@ -147,7 +148,7 @@ def tool_marker_ranges(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ranges = _window_marker_ranges(profile, int(start_ns), int(end_ns), limit=limit)
+        ranges = _window_marker_ranges(profile.marker_ranges(), int(start_ns), int(end_ns), limit=limit)
     else:
         ranges = compute_marker_ranges(profile, limit=limit)
     return {
@@ -161,7 +162,7 @@ def tool_stream_summary(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        streams = _window_streams(profile, int(start_ns), int(end_ns))
+        streams = _window_streams(profile.kernel_events(), int(start_ns), int(end_ns))
     else:
         streams = compute_streams(profile)
     return {"streams": [s.model_dump() for s in streams]}

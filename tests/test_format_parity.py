@@ -15,7 +15,7 @@ Known format-specific None fields (by design, not defects):
     - total_memory_GiB: None for rocpd
     - l2_cache_MiB: None for rocpd
   KernelSummary level:
-    - short_name: None for rocpd (no StringIds table)
+    - short_name: optional for rocpd (populated from extdata truncated_kernel_name or fallback parsing)
     - estimated_occupancy: None for rocpd (no thread-count fields on KernelRow)
     - avg_launch_overhead_us / max_launch_overhead_us: None for rocpd (no CPU-GPU timing correlation)
 """
@@ -321,9 +321,10 @@ def test_rocpd_device_total_memory_is_none(rocpd_summary):
     assert rocpd_summary.device_info.total_memory_GiB is None
 
 
-def test_rocpd_kernel_short_name_is_none(rocpd_summary):
+def test_rocpd_kernel_short_name_type(rocpd_summary):
     for k in rocpd_summary.top_kernels:
-        assert k.short_name is None
+        if k.short_name is not None:
+            assert isinstance(k.short_name, str)
 
 
 def test_rocpd_kernel_estimated_occupancy_is_none(rocpd_summary):
