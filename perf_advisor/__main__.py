@@ -28,6 +28,31 @@ def _print_capability_notes(fmt, caps) -> None:
         console.print(f"[cyan]ℹ[/cyan] {note.message}", highlight=False)
 
 
+def _warn_wal_truncation(profile, path: str) -> None:
+    """Warn if a rocpd profile has a stale WAL or journal file (interrupted writer)."""
+    emp = getattr(profile, "emptiness", None)
+    if emp is None or not emp.writer_truncation_suspected:
+        return
+    console.print(
+        f"[yellow]Warning:[/yellow] A WAL or journal file exists alongside "
+        f"{Path(path).name!r} — the rocpd writer may have been interrupted. "
+        "Profile data may be incomplete.",
+        highlight=False,
+    )
+
+
+def _abort_if_empty(profile, path: str) -> None:
+    """Exit with an error if the profile contains no kernel events."""
+    if not profile.capabilities.has_kernels:
+        console.print(
+            f"[red]Error:[/red] No kernel events found in {Path(path).name!r}. "
+            "The profile appears empty or was truncated before kernel data was written. "
+            "Re-capture with kernel tracing enabled and ensure the application ran GPU kernels.",
+            highlight=False,
+        )
+        sys.exit(1)
+
+
 _PHASE_WARNING = (
     "[orange1]Warning: automated phase detection has no semantic understanding of the "
     "application and can produce logically incorrect segmentations. Cross-reference results "
@@ -252,6 +277,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 _rank_formats[_rid] = _p.format
                 if _first_caps is None:
                     _first_caps = _p.capabilities
+                _warn_wal_truncation(_p, str(_path))
+                _abort_if_empty(_p, str(_path))
         _unique_formats = set(_rank_formats.values())
         if len(_unique_formats) > 1:
             _fmt_strs = ", ".join(
@@ -422,6 +449,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         primary_profile = args.profile[0]
         timings = {}
         with open_profile(primary_profile) as profile:
+            _warn_wal_truncation(profile, primary_profile)
+            _abort_if_empty(profile, primary_profile)
             if not args.quiet:
                 _print_capability_notes(profile.format, profile.capabilities)
             summary = compute_profile_summary(
@@ -843,11 +872,15 @@ def cmd_compare(args: argparse.Namespace) -> None:
             )
 
     with open_profile(args.profile_a) as pa:
+        _warn_wal_truncation(pa, args.profile_a)
+        _abort_if_empty(pa, args.profile_a)
         if not args.quiet:
             _print_capability_notes(pa.format, pa.capabilities)
         _fmt_a = pa.format
         summary_a = compute_profile_summary(pa, max_phases=args.max_phases)
     with open_profile(args.profile_b) as pb:
+        _warn_wal_truncation(pb, args.profile_b)
+        _abort_if_empty(pb, args.profile_b)
         if not args.quiet:
             _print_capability_notes(pb.format, pb.capabilities)
         _fmt_b = pb.format
@@ -1060,6 +1093,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
     from perf_advisor.ingestion import open_profile
 
     with open_profile(args.profile) as profile:
+        _warn_wal_truncation(profile, args.profile)
+        _abort_if_empty(profile, args.profile)
         if not args.json:
             _print_capability_notes(profile.format, profile.capabilities)
         summary = compute_profile_summary(profile, max_phases=args.max_phases, verbose=args.verbose)

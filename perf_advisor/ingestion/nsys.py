@@ -64,6 +64,12 @@ class NsysProfile:
     def has_table(self, name: str) -> bool:
         return name in self.tables
 
+    def _table_has_data(self, table: str) -> bool:
+        """Return True only if the table exists AND contains at least one row."""
+        return self.has_table(table) and bool(
+            self._conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        )
+
     def has_mpi(self) -> bool:
         return self.has_table("MPI_P2P_EVENTS") or self.has_table("MPI_COLLECTIVES_EVENTS")
 
@@ -85,13 +91,16 @@ class NsysProfile:
     def capabilities(self) -> ProfileCapabilities:
         if self._capabilities is None:
             self._capabilities = ProfileCapabilities(
-                has_kernels=self.has_table("CUPTI_ACTIVITY_KIND_KERNEL"),
-                has_memcpy=self.has_table("CUPTI_ACTIVITY_KIND_MEMCPY"),
-                has_runtime_api=self.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"),
-                has_markers=self.has_nvtx(),
-                has_mpi=self.has_mpi(),
+                has_kernels=self._table_has_data("CUPTI_ACTIVITY_KIND_KERNEL"),
+                has_memcpy=self._table_has_data("CUPTI_ACTIVITY_KIND_MEMCPY"),
+                has_runtime_api=self._table_has_data("CUPTI_ACTIVITY_KIND_RUNTIME"),
+                has_markers=self._table_has_data("NVTX_EVENTS"),
+                has_mpi=(
+                    self._table_has_data("MPI_P2P_EVENTS")
+                    or self._table_has_data("MPI_COLLECTIVES_EVENTS")
+                ),
                 has_cpu_samples=False,
-                has_pmc_counters=self.has_table("CUPTI_ACTIVITY_KIND_METRIC"),
+                has_pmc_counters=self._table_has_data("CUPTI_ACTIVITY_KIND_METRIC"),
                 has_sysmetrics=False,
                 schema_version="nsys",
             )

@@ -171,8 +171,8 @@ class RocpdProfile:
         if self._capabilities is None:
             cats = self._get_observed_categories()
             self._capabilities = ProfileCapabilities(
-                has_kernels=self.has_table("rocpd_kernel_dispatch"),
-                has_memcpy=self.has_table("rocpd_memory_copy"),
+                has_kernels=self._table_has_data("rocpd_kernel_dispatch"),
+                has_memcpy=self._table_has_data("rocpd_memory_copy"),
                 has_runtime_api=bool(cats & _ROCPD_API_CATEGORIES),
                 has_markers=bool(cats - _ROCPD_API_CATEGORIES - {"MPI"}),
                 has_mpi="MPI" in cats,
