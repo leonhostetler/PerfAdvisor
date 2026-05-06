@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -134,6 +135,31 @@ def _print_cross_rank_tables(cross_rank_summary) -> None:
         )
 
 
+def _process_rank(args_tuple: tuple) -> tuple:
+    """Worker function for parallel per-rank phase detection (ProcessPoolExecutor).
+
+    Must be module-level so pickle can find it. Opens its own SQLite connection
+    because connections cannot cross process boundaries.
+
+    Args: (rid, path, max_phases, verbose, rank)
+    Returns: (rid, summary, phase_state, selected_k, cost_curve, rank_timings)
+    """
+    rid, path, max_phases, verbose, rank = args_tuple
+    from perf_advisor.analysis.metrics import compute_profile_summary_and_state
+    from perf_advisor.ingestion import open_profile
+
+    rank_timings: dict[str, float] = {}
+    with open_profile(path) as _prof:
+        summary, phase_state, selected_k, cost_curve = compute_profile_summary_and_state(
+            _prof,
+            max_phases=max_phases,
+            timings=rank_timings,
+            verbose=verbose,
+            rank=rank,
+        )
+    return rid, summary, phase_state, selected_k, cost_curve, rank_timings
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     from perf_advisor.agent.loop import (
         _build_system_prompt,
@@ -247,20 +273,45 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         _selected_ks: dict[int, int] = {}
         timings: dict[str, float] = {}
         summaries: dict = {}
-        for rid, path in sorted(rank_id_to_path.items()):
-            _rank_timings: dict[str, float] = {}
-            with open_profile(path) as _prof:
-                summaries[rid], _phase_states[rid], _selected_ks[rid], _cost_curves[rid] = (
-                    compute_profile_summary_and_state(
-                        _prof,
-                        max_phases=args.max_phases,
-                        timings=_rank_timings,
-                        verbose=args.verbose,
-                        rank=rid,
-                    )
+
+        _n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+        _n_workers = min(_n_workers, len(rank_id_to_path))
+
+        if _n_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor
+
+            if args.verbose:
+                console.print(
+                    f"[dim]  (--workers {_n_workers}: parallel phase detection;"
+                    " per-rank verbose output suppressed)[/dim]"
                 )
-            for k, v in _rank_timings.items():
-                timings[k] = timings.get(k, 0.0) + v
+            _worker_args = [
+                (rid, path, args.max_phases, False, rid)
+                for rid, path in sorted(rank_id_to_path.items())
+            ]
+            with ProcessPoolExecutor(max_workers=_n_workers) as _pool:
+                for _rid, _sm, _ps, _sk, _cc, _rt in _pool.map(_process_rank, _worker_args):
+                    summaries[_rid] = _sm
+                    _phase_states[_rid] = _ps
+                    _selected_ks[_rid] = _sk
+                    _cost_curves[_rid] = _cc
+                    for k, v in _rt.items():
+                        timings[k] = timings.get(k, 0.0) + v
+        else:
+            for rid, path in sorted(rank_id_to_path.items()):
+                _rank_timings: dict[str, float] = {}
+                with open_profile(path) as _prof:
+                    summaries[rid], _phase_states[rid], _selected_ks[rid], _cost_curves[rid] = (
+                        compute_profile_summary_and_state(
+                            _prof,
+                            max_phases=args.max_phases,
+                            timings=_rank_timings,
+                            verbose=args.verbose,
+                            rank=rid,
+                        )
+                    )
+                for k, v in _rank_timings.items():
+                    timings[k] = timings.get(k, 0.0) + v
 
         _consensus_k, _consensus_abort = select_consensus_k(
             _cost_curves, _selected_ks, args.max_phases, verbose=args.verbose
@@ -1281,16 +1332,36 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                 _eval_cost_curves: dict[int, dict[int, float]] = {}
                 _eval_selected_ks: dict[int, int] = {}
                 summaries: dict = {}
-                for rid, path in sorted(rank_id_to_path.items()):
-                    with open_profile(path) as _prof:
-                        (
-                            summaries[rid],
-                            _eval_phase_states[rid],
-                            _eval_selected_ks[rid],
-                            _eval_cost_curves[rid],
-                        ) = compute_profile_summary_and_state(
-                            _prof, max_phases=args.max_phases, verbose=False,
-                        )
+
+                _eval_n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+                _eval_n_workers = min(_eval_n_workers, len(rank_id_to_path))
+
+                if _eval_n_workers > 1:
+                    from concurrent.futures import ProcessPoolExecutor as _ProcPool
+
+                    _eval_worker_args = [
+                        (rid, path, args.max_phases, False, rid)
+                        for rid, path in sorted(rank_id_to_path.items())
+                    ]
+                    with _ProcPool(max_workers=_eval_n_workers) as _pool:
+                        for _rid, _sm, _ps, _sk, _cc, _ in _pool.map(
+                            _process_rank, _eval_worker_args
+                        ):
+                            summaries[_rid] = _sm
+                            _eval_phase_states[_rid] = _ps
+                            _eval_selected_ks[_rid] = _sk
+                            _eval_cost_curves[_rid] = _cc
+                else:
+                    for rid, path in sorted(rank_id_to_path.items()):
+                        with open_profile(path) as _prof:
+                            (
+                                summaries[rid],
+                                _eval_phase_states[rid],
+                                _eval_selected_ks[rid],
+                                _eval_cost_curves[rid],
+                            ) = compute_profile_summary_and_state(
+                                _prof, max_phases=args.max_phases, verbose=False,
+                            )
 
                 _eval_consensus_k, _eval_consensus_abort = select_consensus_k(
                     _eval_cost_curves, _eval_selected_ks, args.max_phases
@@ -1502,6 +1573,18 @@ def main() -> None:
         ),
     )
     p_analyze.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel worker processes for Stage 1 (phase detection + metrics) "
+            "in multi-rank mode (default: 1 — serial). Set to 0 to use all available CPU "
+            "cores. Has no effect when analyzing a single profile. "
+            "Verbose phase output (--verbose) is suppressed inside workers."
+        ),
+    )
+    p_analyze.add_argument(
         "--max-turns",
         type=int,
         default=MAX_TURNS,
@@ -1702,6 +1785,16 @@ def main() -> None:
         type=int,
         default=10,
         help="Max execution phases to detect per profile (default: 10).",
+    )
+    p_evaluate.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel worker processes for per-rank Stage 1 in multi-rank runs "
+            "(default: 1 — serial). Set to 0 to use all available CPU cores."
+        ),
     )
     p_evaluate.add_argument(
         "--output",

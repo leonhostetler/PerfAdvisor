@@ -231,7 +231,25 @@ than 20%, then the primary rank is used (primary rank defaults to 0 unless `--pr
 ```bash
 # Override automatic outlier selection
 perf-advisor analyze report.*.sqlite --primary-rank 3
+
+# Run Stage 1 on 4 ranks in parallel (4 worker processes)
+perf-advisor analyze report.*.sqlite --workers 4
+
+# Use all available CPU cores (0 = auto)
+perf-advisor analyze report.*.sqlite --workers 0
 ```
+
+`--workers` parallelizes Stage 1 (phase detection and metrics computation) across ranks using
+`ProcessPoolExecutor`. Each worker opens its own profile connection, so ranks are fully
+independent. The consensus-k selection and re-run steps remain serial (they are fast and depend
+on all ranks completing first). `--workers` has no effect when analyzing a single profile.
+
+**Performance:** phase detection is CPU-bound and the per-rank work is embarrassingly parallel.
+On rocprofv3 profiles (which are large and have no MPI data to skip), 4 workers on 8 ranks
+runs two batches of 4 in parallel rather than 8 serially — expect roughly 2.5–3.5× wall-clock
+reduction for the Stage 1 step. Actual speedup depends on available CPU cores and disk
+throughput. `--verbose` phase output is suppressed inside worker processes to avoid interleaved
+terminal output.
 
 Before the agent runs, two tables are printed:
 
