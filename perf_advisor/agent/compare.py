@@ -69,9 +69,6 @@ demonstrates the relevant behavior. \
 If you are uncertain whether a specific option exists or applies, omit it or phrase the \
 observation in generic terms that any engineer could verify."""
 
-# Legacy alias kept for callers that imported the constant directly (e.g. preflight estimates).
-_COMPARE_SYSTEM_PROMPT = _COMPARE_SYSTEM_PROMPT_BASE + "\n" + _COMPARE_GROUNDING_CONSTRAINT
-
 
 def _build_compare_system_prompt(grounded: bool = True) -> str:
     if grounded:

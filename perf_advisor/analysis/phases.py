@@ -107,10 +107,6 @@ class _PhaseState:
 # ---------------------------------------------------------------------------
 
 
-def _profile_bounds(profile: Profile) -> tuple[int, int]:
-    return profile.profile_bounds_ns()
-
-
 # ---------------------------------------------------------------------------
 # Vocabulary and binning
 # ---------------------------------------------------------------------------
@@ -810,24 +806,6 @@ def detect_phases(
             return [PhaseWindow("unknown", 0, 0)]
         return [PhaseWindow("profile", t0, t1)]
     return _finalize_from_state(state, max_phases, forced_k=forced_k, verbose=verbose, rank=rank)
-
-
-def compute_phase_cost_curve(
-    profile: Profile,
-    max_phases: int = 10,
-    rank: int | None = None,
-) -> tuple[int, dict[int, float]]:
-    """Run the phase-detection pipeline through k-selection and return (selected_k, cost_curve).
-
-    cost_curve maps k → total DP cost for k from 1 to the effective K used.
-    Used as a lightweight first pass in multi-rank mode so callers can compute a
-    consensus k before running the full pipeline with forced_k.
-    """
-    _empty: tuple[int, dict[int, float]] = (1, {1: 0.0})
-    state = _compute_phase_state(profile, max_phases, verbose=False, rank=rank)
-    if state is None or not state.costs:
-        return _empty
-    return state.best_k, {k: state.costs[k - 1] for k in range(1, state.K + 1)}
 
 
 def compute_phase_state_and_cost_curve(
