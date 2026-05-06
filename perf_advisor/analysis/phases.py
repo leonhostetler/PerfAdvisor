@@ -83,6 +83,25 @@ class _Seg:
         return 100.0 * self.kernel_ns / self.duration_ns if self.duration_ns > 0 else 0.0
 
 
+@dataclass
+class _PhaseState:
+    """Compact intermediate state cached between analysis passes in multi-rank mode.
+
+    Stores the pre-pass-merged segment list and DP tables so that
+    ``_finalize_from_state`` can produce labeled PhaseWindows for any k without
+    re-loading the profile or re-running the O(n²) fingerprinting step.
+    Peak size is O(n_segs × K) — a few KB per rank at most.
+    """
+
+    segs: list[_Seg]                         # pre-pass-merged segments (typically 10–100)
+    all_markers: list[tuple[int, int, str]]  # long marker ranges for labeling
+    dp: list[list[float]]                    # DP cost table (K+1 × n_segs); [] if trivial
+    split: list[list[int]]                   # DP split table (K+1 × n_segs); [] if trivial
+    K: int                                   # effective max k used in DP
+    costs: list[float]                       # dp[k][n_segs-1] for k=1..K
+    best_k: int                              # elbow-selected k (per-rank)
+
+
 # ---------------------------------------------------------------------------
 # Profile bounds — delegate to Profile Protocol
 # ---------------------------------------------------------------------------
@@ -429,21 +448,22 @@ def _deduplicate_names(phases: list[PhaseWindow]) -> list[PhaseWindow]:
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Core pipeline: expensive half (steps 1–9) and fast half (traceback + labeling)
 # ---------------------------------------------------------------------------
 
 
-def detect_phases(
+def _compute_phase_state(
     profile: Profile,
-    max_phases: int = 6,
+    max_phases: int,
     verbose: bool = False,
     rank: int | None = None,
-    forced_k: int | None = None,
-) -> list[PhaseWindow]:
-    """Detect a flat, ordered, non-overlapping sequence of phases.
+) -> _PhaseState | None:
+    """Run steps 1–9 and return compact state for deferred finalization.
 
-    Returns at most `max_phases` PhaseWindow objects covering the full profile span.
-    Set max_phases=1 to skip segmentation and return a single phase.
+    Returns None for empty profiles or when max_phases <= 1 (caller falls back
+    to a single PhaseWindow).  All expensive work — event loading, binning,
+    O(n_kernels × n_segments) fingerprinting, and O(n_segs² × K) DP — lives here.
+    The returned _PhaseState is a few KB; it does NOT hold the raw event lists.
     """
     tag = f"[phase rank={rank}]" if rank is not None else "[phase]"
 
@@ -465,9 +485,9 @@ def detect_phases(
             f"         t0={_s(t0)}, t1={_s(t1)}, span={_s(t1 - t0)}"
         )
     if t0 == 0 and t1 == 0:
-        return [PhaseWindow("unknown", 0, 0)]
+        return None
     if max_phases <= 1:
-        return [PhaseWindow("profile", t0, t1)]
+        return None
 
     span_ns = t1 - t0
     tolerance_ns = max(5_000_000, int(span_ns * 0.005))
@@ -506,21 +526,13 @@ def detect_phases(
 
     # Step 5 — Collect candidate boundaries
     tagged: list[tuple[int, int]] = []
-
-    # 5a + 5b: distribution peaks and idle transitions
     n_candidates = _N_CANDIDATES_FACTOR * max_phases
     dist_candidates = _distribution_boundaries(dists, t0, bin_width_ns, n_candidates)
     tagged.extend(dist_candidates)
-
-    # 5c: marker range boundaries (NVTX or rocTX)
     marker_boundaries, all_markers = _marker_phase_boundaries(marker_evts, span_ns, max_phases)
     tagged.extend((t, _PRI_MARKER) for t in marker_boundaries)
-
-    # 5d: MPI Barrier cluster ends
     mpi_bounds = _mpi_cluster_boundaries(mpi_evts)
     tagged.extend((t, _PRI_MPI) for t in mpi_bounds)
-
-    # 5e: GPU activity edges
     gpu_tagged: list[tuple[int, int]] = []
     if kernel_evts:
         gpu_start = min(e.start_ns for e in kernel_evts)
@@ -528,7 +540,6 @@ def detect_phases(
         gpu_tagged.append((gpu_start, _PRI_GPU_EDGE))
         gpu_tagged.append((gpu_end, _PRI_GPU_EDGE))
     tagged.extend(gpu_tagged)
-
     if verbose:
         display: list[tuple[int, int, str]] = (
             [(ts, pri, "dist") for ts, pri in dist_candidates]
@@ -567,8 +578,7 @@ def detect_phases(
         if boundaries[i + 1] > boundaries[i]
     ]
     if not segs:
-        return [PhaseWindow("profile", t0, t1)]
-
+        return None
     if verbose:
         print(
             f"{tag} Step 7 — Compute each segment's total kernel time, dominant kernel, "
@@ -603,7 +613,6 @@ def detect_phases(
                 changed = True
             else:
                 i += 1
-
     if verbose:
         print(f"         {len(segs)} segments after pre-pass:")
         for i, s in enumerate(segs):
@@ -620,90 +629,145 @@ def detect_phases(
             f"{tag} Step 9 — Optimal k-segmentation: globally optimal partition of "
             f"{n_segs} segments into at most {max_phases} phases via dynamic programming."
         )
-    if n_segs > 1 and K >= 2:
-        # Precompute cost matrix: C[a][b] = duration-weighted JS inertia of segs[a..b]
-        C: list[list[float]] = [[0.0] * n_segs for _ in range(n_segs)]
-        for a in range(n_segs):
-            merged_ab = segs[a]
-            for b in range(a + 1, n_segs):
-                merged_ab = _merge_segs(merged_ab, segs[b])
-                C[a][b] = sum(
-                    segs[i].duration_ns
-                    * _js_divergence(segs[i].distribution, merged_ab.distribution)
-                    for i in range(a, b + 1)
-                )
-        # DP: dp[k][i] = min cost of partitioning segs[0..i] into k contiguous groups
-        INF = float("inf")
-        dp = [[INF] * n_segs for _ in range(K + 1)]
-        split = [[-1] * n_segs for _ in range(K + 1)]
-        for i in range(n_segs):
-            dp[1][i] = C[0][i]
-            split[1][i] = 0
+
+    if n_segs <= 1 or K < 2:
+        if verbose:
+            print(f"         {n_segs} segment(s) — no merging required")
+        return _PhaseState(
+            segs=segs,
+            all_markers=all_markers,
+            dp=[],
+            split=[],
+            K=n_segs,
+            costs=[],
+            best_k=n_segs,
+        )
+
+    # Precompute cost matrix: C[a][b] = duration-weighted JS inertia of segs[a..b]
+    C: list[list[float]] = [[0.0] * n_segs for _ in range(n_segs)]
+    for a in range(n_segs):
+        merged_ab = segs[a]
+        for b in range(a + 1, n_segs):
+            merged_ab = _merge_segs(merged_ab, segs[b])
+            C[a][b] = sum(
+                segs[i].duration_ns
+                * _js_divergence(segs[i].distribution, merged_ab.distribution)
+                for i in range(a, b + 1)
+            )
+
+    # DP: dp[k][i] = min cost of partitioning segs[0..i] into k contiguous groups
+    INF = float("inf")
+    dp = [[INF] * n_segs for _ in range(K + 1)]
+    split = [[-1] * n_segs for _ in range(K + 1)]
+    for i in range(n_segs):
+        dp[1][i] = C[0][i]
+        split[1][i] = 0
+    for k in range(2, K + 1):
+        for i in range(k - 1, n_segs):
+            for m in range(k - 1, i + 1):
+                prev = dp[k - 1][m - 1] if m > 0 else 0.0
+                c = prev + C[m][i]
+                if c < dp[k][i]:
+                    dp[k][i] = c
+                    split[k][i] = m
+
+    # Select k via elbow: add a phase only if its marginal gain >= _DP_ELBOW_THRESHOLD
+    costs = [dp[k][n_segs - 1] for k in range(1, K + 1)]
+    total_range = costs[0] - costs[-1]
+    best_k = 1
+    if total_range > 0:
         for k in range(2, K + 1):
-            for i in range(k - 1, n_segs):
-                for m in range(k - 1, i + 1):
-                    prev = dp[k - 1][m - 1] if m > 0 else 0.0
-                    c = prev + C[m][i]
-                    if c < dp[k][i]:
-                        dp[k][i] = c
-                        split[k][i] = m
-        # Select k via elbow: add a phase only if its marginal gain >= _DP_ELBOW_THRESHOLD
-        costs = [dp[k][n_segs - 1] for k in range(1, K + 1)]
-        total_range = costs[0] - costs[-1]
-        best_k = 1
+            gain = (costs[k - 2] - costs[k - 1]) / total_range
+            if gain >= _DP_ELBOW_THRESHOLD:
+                best_k = k
+
+    if verbose:
+        cost_str = "   ".join(f"k={k}: {costs[k - 1]:.3e}" for k in range(1, K + 1))
+        print(f"         Cost curve: {cost_str}")
         if total_range > 0:
-            for k in range(2, K + 1):
-                gain = (costs[k - 2] - costs[k - 1]) / total_range
-                if gain >= _DP_ELBOW_THRESHOLD:
-                    best_k = k
-        if verbose:
-            cost_str = "   ".join(f"k={k}: {costs[k - 1]:.3e}" for k in range(1, K + 1))
-            print(f"         Cost curve: {cost_str}")
-            if total_range > 0:
-                gain_str = "   ".join(
-                    f"k={k}: {100 * (costs[k - 2] - costs[k - 1]) / total_range:.1f}%"
-                    for k in range(2, K + 1)
-                )
-                print(
-                    f"         Marginal gains: {gain_str}"
-                    f"   (threshold: {100 * _DP_ELBOW_THRESHOLD:.0f}%)"
-                )
-            print(f"         Selected k={best_k}")
-        if forced_k is not None:
-            _forced_clamped = max(1, min(forced_k, K))
-            if verbose and _forced_clamped != best_k:
-                print(
-                    f"{tag}         forced_k={forced_k} overrides"
-                    f" elbow k={best_k} → using k={_forced_clamped}"
-                )
-            best_k = _forced_clamped
-        # Traceback: recover the optimal partition boundaries
-        groups: list[tuple[int, int]] = []
-        idx = n_segs - 1
-        k = best_k
-        while k > 0:
-            m = split[k][idx]
-            groups.append((m, idx))
-            idx = m - 1
-            k -= 1
-        groups.reverse()
-        if verbose:
-            for a, b in groups:
-                seg_range = f"segs[{a}]" if a == b else f"segs[{a}..{b}]"
-                print(f"           {seg_range}  {_s(segs[a].start_ns)}–{_s(segs[b].end_ns)}")
-        # Merge each group into a single _Seg
-        merged_segs: list[_Seg] = []
+            gain_str = "   ".join(
+                f"k={k}: {100 * (costs[k - 2] - costs[k - 1]) / total_range:.1f}%"
+                for k in range(2, K + 1)
+            )
+            print(
+                f"         Marginal gains: {gain_str}"
+                f"   (threshold: {100 * _DP_ELBOW_THRESHOLD:.0f}%)"
+            )
+        print(f"         Selected k={best_k}")
+
+    return _PhaseState(
+        segs=segs,
+        all_markers=all_markers,
+        dp=dp,
+        split=split,
+        K=K,
+        costs=costs,
+        best_k=best_k,
+    )
+
+
+def _finalize_from_state(
+    state: _PhaseState,
+    max_phases: int,
+    forced_k: int | None = None,
+    verbose: bool = False,
+    rank: int | None = None,
+) -> list[PhaseWindow]:
+    """Run DP traceback and labeling from pre-computed state (steps 9b + 10).
+
+    O(n_segs × k) — fast; no profile access required.
+    """
+    tag = f"[phase rank={rank}]" if rank is not None else "[phase]"
+
+    def _s(ns: int) -> str:
+        return f"{ns / 1e9:.3f}s"
+
+    segs = state.segs
+
+    # Trivial case: no DP was run (single segment or K < 2)
+    if not state.dp:
+        phases = [PhaseWindow(_label(s, state.all_markers), s.start_ns, s.end_ns) for s in segs]
+        return _deduplicate_names(phases)
+
+    n_segs = len(segs)
+    K = state.K
+    best_k = state.best_k
+
+    if forced_k is not None:
+        _forced_clamped = max(1, min(forced_k, K))
+        if verbose and _forced_clamped != best_k:
+            print(
+                f"{tag}         forced_k={forced_k} overrides"
+                f" elbow k={best_k} → using k={_forced_clamped}"
+            )
+        best_k = _forced_clamped
+
+    # Traceback: recover the optimal partition boundaries
+    groups: list[tuple[int, int]] = []
+    idx = n_segs - 1
+    k = best_k
+    while k > 0:
+        m = state.split[k][idx]
+        groups.append((m, idx))
+        idx = m - 1
+        k -= 1
+    groups.reverse()
+
+    if verbose:
         for a, b in groups:
-            seg = segs[a]
-            for j in range(a + 1, b + 1):
-                seg = _merge_segs(seg, segs[j])
-            merged_segs.append(seg)
-        segs = merged_segs
-    elif verbose:
-        print(f"         {n_segs} segment(s) — no merging required")
+            seg_range = f"segs[{a}]" if a == b else f"segs[{a}..{b}]"
+            print(f"           {seg_range}  {_s(segs[a].start_ns)}–{_s(segs[b].end_ns)}")
+
+    # Merge each group into a single _Seg
+    merged_segs: list[_Seg] = []
+    for a, b in groups:
+        seg = segs[a]
+        for j in range(a + 1, b + 1):
+            seg = _merge_segs(seg, segs[j])
+        merged_segs.append(seg)
 
     # Step 10 — Label and deduplicate
-    phases = [PhaseWindow(_label(s, all_markers), s.start_ns, s.end_ns) for s in segs]
+    phases = [PhaseWindow(_label(s, state.all_markers), s.start_ns, s.end_ns) for s in merged_segs]
     result = _deduplicate_names(phases)
 
     if verbose:
@@ -714,12 +778,38 @@ def detect_phases(
         )
         for i, p in enumerate(result):
             sim_str = ""
-            if i < len(segs) - 1:
-                sim = _similarity(segs[i], segs[i + 1])
+            if i < len(merged_segs) - 1:
+                sim = _similarity(merged_segs[i], merged_segs[i + 1])
                 sim_str = f"  → sim_next={sim:.3f}"
             print(f"           {p.name!r}  {_s(p.start_ns)}–{_s(p.end_ns)}{sim_str}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def detect_phases(
+    profile: Profile,
+    max_phases: int = 6,
+    verbose: bool = False,
+    rank: int | None = None,
+    forced_k: int | None = None,
+) -> list[PhaseWindow]:
+    """Detect a flat, ordered, non-overlapping sequence of phases.
+
+    Returns at most `max_phases` PhaseWindow objects covering the full profile span.
+    Set max_phases=1 to skip segmentation and return a single phase.
+    """
+    state = _compute_phase_state(profile, max_phases, verbose=verbose, rank=rank)
+    if state is None:
+        t0, t1 = profile.profile_bounds_ns()
+        if t0 == 0 and t1 == 0:
+            return [PhaseWindow("unknown", 0, 0)]
+        return [PhaseWindow("profile", t0, t1)]
+    return _finalize_from_state(state, max_phases, forced_k=forced_k, verbose=verbose, rank=rank)
 
 
 def compute_phase_cost_curve(
@@ -734,96 +824,39 @@ def compute_phase_cost_curve(
     consensus k before running the full pipeline with forced_k.
     """
     _empty: tuple[int, dict[int, float]] = (1, {1: 0.0})
-
-    # Pre-load all events once; caching in the profile avoids repeated SQLite scans.
-    kernel_evts = profile.kernel_events()
-    memcpy_evts = profile.memcpy_events()
-    marker_evts = profile.marker_ranges()
-    mpi_evts = profile.mpi_ranges()
-
-    t0, t1 = profile.profile_bounds_ns()
-    if t0 == 0 and t1 == 0:
+    state = _compute_phase_state(profile, max_phases, verbose=False, rank=rank)
+    if state is None or not state.costs:
         return _empty
-    if max_phases <= 1:
-        return _empty
+    return state.best_k, {k: state.costs[k - 1] for k in range(1, state.K + 1)}
 
-    span_ns = t1 - t0
-    tolerance_ns = max(5_000_000, int(span_ns * 0.005))
-    vocab = _kernel_vocab(kernel_evts, _TOP_K)
-    bin_width_ns = max(_BIN_WIDTH_FLOOR_NS, min(_BIN_WIDTH_CEIL_NS, span_ns // _N_BINS))
-    bins = _bin_profile(kernel_evts, memcpy_evts, t0, t1, bin_width_ns)
-    dists = [_make_distribution(b, vocab) for b in bins]
 
-    tagged: list[tuple[int, int]] = []
-    n_candidates = _N_CANDIDATES_FACTOR * max_phases
-    tagged.extend(_distribution_boundaries(dists, t0, bin_width_ns, n_candidates))
-    marker_boundaries, _ = _marker_phase_boundaries(marker_evts, span_ns, max_phases)
-    tagged.extend((t, _PRI_MARKER) for t in marker_boundaries)
-    tagged.extend((t, _PRI_MPI) for t in _mpi_cluster_boundaries(mpi_evts))
-    if kernel_evts:
-        gpu_start = min(e.start_ns for e in kernel_evts)
-        gpu_end = max(e.end_ns for e in kernel_evts)
-        tagged.append((gpu_start, _PRI_GPU_EDGE))
-        tagged.append((gpu_end, _PRI_GPU_EDGE))
+def compute_phase_state_and_cost_curve(
+    profile: Profile,
+    max_phases: int = 10,
+    rank: int | None = None,
+) -> tuple[_PhaseState | None, int, dict[int, float]]:
+    """Run phase detection through k-selection; return state, selected_k, and cost_curve.
 
-    tagged = [
-        (c, p) for c, p in tagged if t0 < c < t1 and c - t0 > tolerance_ns and t1 - c > tolerance_ns
-    ]
-    boundaries = sorted(set([t0] + _merge_nearby(tagged, tolerance_ns) + [t1]))
+    The returned ``_PhaseState`` can be passed to ``finalize_phases_from_state`` to
+    produce labeled PhaseWindows for any k without re-loading the profile or
+    re-running the expensive fingerprinting and DP steps.
+    """
+    state = _compute_phase_state(profile, max_phases, verbose=False, rank=rank)
+    if state is None or not state.costs:
+        return None, 1, {1: 0.0}
+    return state, state.best_k, {k: state.costs[k - 1] for k in range(1, state.K + 1)}
 
-    segs = [
-        _fingerprint(kernel_evts, boundaries[i], boundaries[i + 1], bins, t0, bin_width_ns, vocab)
-        for i in range(len(boundaries) - 1)
-        if boundaries[i + 1] > boundaries[i]
-    ]
-    if not segs:
-        return _empty
 
-    changed = True
-    while changed:
-        changed = False
-        i = 0
-        while i < len(segs) - 1:
-            if _js_divergence(segs[i].distribution, segs[i + 1].distribution) < _PREPASS_THRESHOLD:
-                segs = segs[:i] + [_merge_segs(segs[i], segs[i + 1])] + segs[i + 2 :]
-                changed = True
-            else:
-                i += 1
+def finalize_phases_from_state(
+    state: _PhaseState | None,
+    max_phases: int = 10,
+    forced_k: int | None = None,
+) -> list[PhaseWindow]:
+    """Traceback and label phases from a pre-computed ``_PhaseState``.
 
-    n_segs = len(segs)
-    K = min(max_phases, n_segs)
-    if n_segs <= 1 or K < 2:
-        return _empty
-
-    C: list[list[float]] = [[0.0] * n_segs for _ in range(n_segs)]
-    for a in range(n_segs):
-        merged_ab = segs[a]
-        for b in range(a + 1, n_segs):
-            merged_ab = _merge_segs(merged_ab, segs[b])
-            C[a][b] = sum(
-                segs[i].duration_ns * _js_divergence(segs[i].distribution, merged_ab.distribution)
-                for i in range(a, b + 1)
-            )
-
-    INF = float("inf")
-    dp = [[INF] * n_segs for _ in range(K + 1)]
-    for i in range(n_segs):
-        dp[1][i] = C[0][i]
-    for k in range(2, K + 1):
-        for i in range(k - 1, n_segs):
-            for m in range(k - 1, i + 1):
-                prev = dp[k - 1][m - 1] if m > 0 else 0.0
-                c = prev + C[m][i]
-                if c < dp[k][i]:
-                    dp[k][i] = c
-
-    costs = [dp[k][n_segs - 1] for k in range(1, K + 1)]
-    total_range = costs[0] - costs[-1]
-    best_k = 1
-    if total_range > 0:
-        for k in range(2, K + 1):
-            gain = (costs[k - 2] - costs[k - 1]) / total_range
-            if gain >= _DP_ELBOW_THRESHOLD:
-                best_k = k
-
-    return best_k, {k: costs[k - 1] for k in range(1, K + 1)}
+    Does not require the profile to be open.  O(n_segs × k) — fast.
+    Returns a single ``PhaseWindow("profile", 0, 0)`` if state is None.
+    """
+    if state is None:
+        return [PhaseWindow("profile", 0, 0)]
+    return _finalize_from_state(state, max_phases, forced_k=forced_k, verbose=False, rank=None)

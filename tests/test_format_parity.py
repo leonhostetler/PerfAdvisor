@@ -15,9 +15,9 @@ Known format-specific None fields (by design, not defects):
     - total_memory_GiB: None for rocpd
     - l2_cache_MiB: None for rocpd
   KernelSummary level:
-    - short_name: optional for rocpd (populated from extdata truncated_kernel_name or fallback parsing)
+    - short_name: optional for rocpd (from extdata truncated_kernel_name or fallback parsing)
     - estimated_occupancy: None for rocpd (no thread-count fields on KernelRow)
-    - avg_launch_overhead_us / max_launch_overhead_us: None for rocpd (no CPU-GPU timing correlation)
+    - avg_launch_overhead_us / max_launch_overhead_us: None for rocpd (no CPU-GPU correlation)
 """
 from __future__ import annotations
 
@@ -35,7 +35,6 @@ from perf_advisor.analysis.models import (
     ProfileSummary,
     StreamSummary,
 )
-
 
 # ---------------------------------------------------------------------------
 # Session-scoped computed summaries

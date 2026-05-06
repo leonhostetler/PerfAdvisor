@@ -25,7 +25,13 @@ from .models import (
     ProfileSummary,
     StreamSummary,
 )
-from .phases import PhaseWindow, detect_phases
+from .phases import (
+    PhaseWindow,
+    _PhaseState,
+    compute_phase_state_and_cost_curve,
+    detect_phases,
+    finalize_phases_from_state,
+)
 
 # ---------------------------------------------------------------------------
 # Individual metric functions
@@ -530,6 +536,7 @@ def compute_profile_summary(
     verbose: bool = False,
     rank: int | None = None,
     forced_k: int | None = None,
+    _phase_state: _PhaseState | None = None,
 ) -> ProfileSummary:
     """Compute all metrics for a profile and return a ProfileSummary.
 
@@ -538,6 +545,8 @@ def compute_profile_summary(
     ``{"phase_detection_s": ..., "metrics_s": ...}``.
     Set forced_k to override the automatic elbow-based k selection in the DP
     segmentation step (used in multi-rank mode after cross-rank consensus).
+    Pass ``_phase_state`` (from ``compute_profile_summary_and_state``) to skip
+    re-fingerprinting: only the fast DP traceback + per-phase stats are re-run.
     """
     t_start = time.perf_counter()
 
@@ -553,9 +562,14 @@ def compute_profile_summary(
     cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(kernel_s)
 
     t_phase = time.perf_counter()
-    phases_windows = detect_phases(
-        profile, max_phases=max_phases, verbose=verbose, rank=rank, forced_k=forced_k
-    )
+    if _phase_state is not None:
+        phases_windows = finalize_phases_from_state(
+            _phase_state, max_phases=max_phases, forced_k=forced_k
+        )
+    else:
+        phases_windows = detect_phases(
+            profile, max_phases=max_phases, verbose=verbose, rank=rank, forced_k=forced_k
+        )
     t_phase_done = time.perf_counter()
 
     profile_start_ns = phases_windows[0].start_ns if phases_windows else 0
@@ -598,3 +612,83 @@ def compute_profile_summary(
         cpu_sync_blocked_s=cpu_sync_s,
         cpu_sync_blocked_pct=cpu_sync_pct,
     )
+
+
+def compute_profile_summary_and_state(
+    profile: Profile,
+    max_phases: int = 6,
+    timings: dict[str, float] | None = None,
+    verbose: bool = False,
+    rank: int | None = None,
+) -> tuple[ProfileSummary, _PhaseState | None, int, dict[int, float]]:
+    """Compute all metrics in a single pass and also return the phase detection state.
+
+    The returned ``_PhaseState`` can be passed to
+    ``compute_profile_summary(..., _phase_state=state, forced_k=k)`` on a
+    subsequent pass to skip re-fingerprinting: only the fast DP traceback and
+    per-phase statistics are re-computed.  Used by the multi-rank path to run
+    one disk read + one fingerprinting pass per rank instead of two.
+
+    Returns ``(summary, state, selected_k, cost_curve)``.
+    """
+    t_start = time.perf_counter()
+
+    device_info = compute_device_info(profile)
+    peak_bw = device_info.peak_memory_bandwidth_GBs
+
+    span_s = compute_profile_span(profile)
+    kernel_s = compute_gpu_kernel_time(profile)
+    memcpy_s = compute_gpu_memcpy_time(profile)
+    sync_s = compute_gpu_sync_time(profile)
+    total_idle_s, gap_histogram = compute_gap_histogram(profile)
+    loh = profile.launch_overhead()
+    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(kernel_s)
+
+    t_phase = time.perf_counter()
+    state, selected_k, cost_curve = compute_phase_state_and_cost_curve(
+        profile, max_phases=max_phases, rank=rank
+    )
+    phases_windows = finalize_phases_from_state(state, max_phases=max_phases, forced_k=None)
+    t_phase_done = time.perf_counter()
+
+    profile_start_ns = phases_windows[0].start_ns if phases_windows else 0
+    global_mpi_ops, all_phase_mpi = _compute_all_mpi_stats(profile, phases_windows)
+    phase_summaries = [
+        compute_phase_summary(
+            profile,
+            pw,
+            profile_start_ns,
+            mpi_ops=all_phase_mpi[i],
+            device_info=device_info,
+            launch_overhead=loh,
+        )
+        for i, pw in enumerate(phases_windows)
+    ]
+
+    if timings is not None:
+        t_end = time.perf_counter()
+        timings["phase_detection_s"] = t_phase_done - t_phase
+        timings["metrics_s"] = (t_end - t_start) - (t_phase_done - t_phase)
+
+    summary = ProfileSummary(
+        profile_path=str(profile.path),
+        device_info=device_info,
+        profile_span_s=round(span_s, 3),
+        gpu_kernel_s=round(kernel_s, 3),
+        gpu_memcpy_s=round(memcpy_s, 3),
+        gpu_sync_s=round(sync_s, 3),
+        gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
+        total_gpu_idle_s=round(total_idle_s, 3),
+        gap_histogram=gap_histogram,
+        top_kernels=compute_top_kernels(profile, device_info=device_info, launch_overhead=loh),
+        memcpy_by_kind=compute_memcpy_by_kind(profile, peak_bandwidth_GBs=peak_bw),
+        streams=compute_streams(profile),
+        marker_ranges=compute_marker_ranges(profile),
+        mpi_ops=global_mpi_ops,
+        mpi_present=profile.capabilities.has_mpi,
+        phases=phase_summaries,
+        peak_memory_bandwidth_GBs=peak_bw,
+        cpu_sync_blocked_s=cpu_sync_s,
+        cpu_sync_blocked_pct=cpu_sync_pct,
+    )
+    return summary, state, selected_k, cost_curve

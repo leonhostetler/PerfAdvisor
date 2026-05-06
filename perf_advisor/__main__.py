@@ -197,7 +197,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             select_consensus_k,
             select_primary_rank,
         )
-        from perf_advisor.analysis.phases import compute_phase_cost_curve
+        from perf_advisor.analysis.metrics import compute_profile_summary_and_state
 
         profile_paths = [_Path(p) for p in args.profile]
         rank_ids, parsed_ok = parse_rank_ids(profile_paths)
@@ -241,14 +241,26 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             for rid, path in sorted(rank_id_to_path.items()):
                 print(f"         rank={rid}  {path}")
 
-        # Pass 1 — lightweight cost-curve extraction for consensus k selection
+        # Single pass: compute full summaries and cache phase state per rank.
+        _phase_states: dict = {}
         _cost_curves: dict[int, dict[int, float]] = {}
         _selected_ks: dict[int, int] = {}
+        timings: dict[str, float] = {}
+        summaries: dict = {}
         for rid, path in sorted(rank_id_to_path.items()):
+            _rank_timings: dict[str, float] = {}
             with open_profile(path) as _prof:
-                _selected_ks[rid], _cost_curves[rid] = compute_phase_cost_curve(
-                    _prof, max_phases=args.max_phases, rank=rid
+                summaries[rid], _phase_states[rid], _selected_ks[rid], _cost_curves[rid] = (
+                    compute_profile_summary_and_state(
+                        _prof,
+                        max_phases=args.max_phases,
+                        timings=_rank_timings,
+                        verbose=args.verbose,
+                        rank=rid,
+                    )
                 )
+            for k, v in _rank_timings.items():
+                timings[k] = timings.get(k, 0.0) + v
 
         _consensus_k, _consensus_abort = select_consensus_k(
             _cost_curves, _selected_ks, args.max_phases, verbose=args.verbose
@@ -257,25 +269,27 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         if not args.quiet and _consensus_abort is None and len(set(_selected_ks.values())) > 1:
             _ks_str = ", ".join(f"rank {r}: k={_selected_ks[r]}" for r in sorted(_selected_ks))
             console.print(
-                f"  Phase consensus: k={_consensus_k} (per-rank selections differed — {_ks_str})"
+                f"  Phase consensus: k={_consensus_k}"
+                f" (per-rank selections differed — {_ks_str})"
             )
 
-        # Pass 2 — full pipeline; forced_k=None if consensus aborted (each rank uses its elbow)
-        timings: dict[str, float] = {}
-        summaries: dict = {}
-        for rid, path in sorted(rank_id_to_path.items()):
-            _rank_timings: dict[str, float] = {}
-            with open_profile(path) as _prof:
-                summaries[rid] = compute_profile_summary(
-                    _prof,
-                    max_phases=args.max_phases,
-                    forced_k=_consensus_k,
-                    timings=_rank_timings,
-                    verbose=args.verbose,
-                    rank=rid,
-                )
-            for k, v in _rank_timings.items():
-                timings[k] = timings.get(k, 0.0) + v
+        # Re-run only ranks whose per-rank k differs from consensus (rare).
+        if _consensus_k is not None:
+            for rid, path in sorted(rank_id_to_path.items()):
+                if _selected_ks[rid] != _consensus_k:
+                    _rank_timings = {}
+                    with open_profile(path) as _prof:
+                        summaries[rid] = compute_profile_summary(
+                            _prof,
+                            max_phases=args.max_phases,
+                            forced_k=_consensus_k,
+                            timings=_rank_timings,
+                            verbose=args.verbose,
+                            rank=rid,
+                            _phase_state=_phase_states[rid],
+                        )
+                    for k, v in _rank_timings.items():
+                        timings[k] = timings.get(k, 0.0) + v
 
         # Primary rank selection
         if args.primary_rank is not None:
@@ -1241,7 +1255,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                     select_consensus_k,
                     select_primary_rank,
                 )
-                from perf_advisor.analysis.phases import compute_phase_cost_curve
+                from perf_advisor.analysis.metrics import compute_profile_summary_and_state
 
                 profile_paths = run_cfg.sqlite_paths
                 rank_ids, _ = parse_rank_ids(profile_paths)
@@ -1262,29 +1276,38 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                         "All profiles in the same run must use the same profiler."
                     )
 
-                # Pass 1 — cost curves for consensus k
+                # Single pass: compute full summaries and cache phase state per rank.
+                _eval_phase_states: dict = {}
                 _eval_cost_curves: dict[int, dict[int, float]] = {}
                 _eval_selected_ks: dict[int, int] = {}
+                summaries: dict = {}
                 for rid, path in sorted(rank_id_to_path.items()):
                     with open_profile(path) as _prof:
-                        _eval_selected_ks[rid], _eval_cost_curves[rid] = compute_phase_cost_curve(
-                            _prof, max_phases=args.max_phases
+                        (
+                            summaries[rid],
+                            _eval_phase_states[rid],
+                            _eval_selected_ks[rid],
+                            _eval_cost_curves[rid],
+                        ) = compute_profile_summary_and_state(
+                            _prof, max_phases=args.max_phases, verbose=False,
                         )
 
                 _eval_consensus_k, _eval_consensus_abort = select_consensus_k(
                     _eval_cost_curves, _eval_selected_ks, args.max_phases
                 )
 
-                # Pass 2 — full pipeline
-                summaries: dict = {}
-                for rid, path in sorted(rank_id_to_path.items()):
-                    with open_profile(path) as _prof:
-                        summaries[rid] = compute_profile_summary(
-                            _prof,
-                            max_phases=args.max_phases,
-                            forced_k=_eval_consensus_k,
-                            verbose=False,
-                        )
+                # Re-run only ranks whose per-rank k differs from consensus (rare).
+                if _eval_consensus_k is not None:
+                    for rid, path in sorted(rank_id_to_path.items()):
+                        if _eval_selected_ks[rid] != _eval_consensus_k:
+                            with open_profile(path) as _prof:
+                                summaries[rid] = compute_profile_summary(
+                                    _prof,
+                                    max_phases=args.max_phases,
+                                    forced_k=_eval_consensus_k,
+                                    verbose=False,
+                                    _phase_state=_eval_phase_states[rid],
+                                )
 
                 primary_rank_id, _ = select_primary_rank(summaries)
                 primary_profile = str(rank_id_to_path[primary_rank_id])

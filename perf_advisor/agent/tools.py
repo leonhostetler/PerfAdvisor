@@ -111,7 +111,9 @@ def tool_gap_histogram(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        total_idle_s, buckets = _window_idle_time(profile.kernel_events(), int(start_ns), int(end_ns))
+        total_idle_s, buckets = _window_idle_time(
+            profile.kernel_events(), int(start_ns), int(end_ns)
+        )
     else:
         total_idle_s, buckets = compute_gap_histogram(profile)
     return {
@@ -148,7 +150,9 @@ def tool_marker_ranges(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ranges = _window_marker_ranges(profile.marker_ranges(), int(start_ns), int(end_ns), limit=limit)
+        ranges = _window_marker_ranges(
+            profile.marker_ranges(), int(start_ns), int(end_ns), limit=limit
+        )
     else:
         ranges = compute_marker_ranges(profile, limit=limit)
     return {
