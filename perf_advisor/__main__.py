@@ -20,6 +20,14 @@ from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
 
 console = Console(record=True)
 
+
+def _print_capability_notes(fmt, caps) -> None:
+    from perf_advisor.analysis.diagnostics import capability_notes
+
+    for note in capability_notes(fmt, caps):
+        console.print(f"[cyan]ℹ[/cyan] {note.message}", highlight=False)
+
+
 _PHASE_WARNING = (
     "[orange1]Warning: automated phase detection has no semantic understanding of the "
     "application and can produce logically incorrect segmentations. Cross-reference results "
@@ -238,9 +246,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         # Reject mixed-format directories before any heavy work.
         _rank_formats: dict[int, Format] = {}
+        _first_caps = None
         for _rid, _path in sorted(rank_id_to_path.items()):
             with open_profile(_path) as _p:
                 _rank_formats[_rid] = _p.format
+                if _first_caps is None:
+                    _first_caps = _p.capabilities
         _unique_formats = set(_rank_formats.values())
         if len(_unique_formats) > 1:
             _fmt_strs = ", ".join(
@@ -261,6 +272,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             console.print(
                 f"  Multi-rank mode: {len(profile_paths)} profiles, rank IDs {sorted(rank_ids)}"
             )
+            if _first_caps is not None:
+                _print_capability_notes(next(iter(_unique_formats)), _first_caps)
 
         if args.verbose:
             print("[phase] Rank → file mapping:")
@@ -409,6 +422,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         primary_profile = args.profile[0]
         timings = {}
         with open_profile(primary_profile) as profile:
+            if not args.quiet:
+                _print_capability_notes(profile.format, profile.capabilities)
             summary = compute_profile_summary(
                 profile,
                 max_phases=args.max_phases,
@@ -828,9 +843,13 @@ def cmd_compare(args: argparse.Namespace) -> None:
             )
 
     with open_profile(args.profile_a) as pa:
+        if not args.quiet:
+            _print_capability_notes(pa.format, pa.capabilities)
         _fmt_a = pa.format
         summary_a = compute_profile_summary(pa, max_phases=args.max_phases)
     with open_profile(args.profile_b) as pb:
+        if not args.quiet:
+            _print_capability_notes(pb.format, pb.capabilities)
         _fmt_b = pb.format
         summary_b = compute_profile_summary(pb, max_phases=args.max_phases)
     if _fmt_a != _fmt_b:
@@ -1041,6 +1060,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
     from perf_advisor.ingestion import open_profile
 
     with open_profile(args.profile) as profile:
+        if not args.json:
+            _print_capability_notes(profile.format, profile.capabilities)
         summary = compute_profile_summary(profile, max_phases=args.max_phases, verbose=args.verbose)
 
     if args.json:
