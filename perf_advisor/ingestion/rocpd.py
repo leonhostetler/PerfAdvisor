@@ -23,16 +23,34 @@ from .base import Format, KernelRow, MemcpyRow, ProfileCapabilities, RangeRow
 if TYPE_CHECKING:
     from perf_advisor.analysis.models import DeviceInfo
 
-# Region categories written by rocprofv3 --sys-trace (HIP/HSA API tracing).
-# Anything in rocpd_region NOT in this set (or "MPI") is a user marker (rocTX).
+# Region categories that are NOT user markers, covering both rocprofv3 and rocprof-sys names.
+#   rocprofv3:    HIP_RUNTIME_API_EXT, HIP_COMPILER_API_EXT, HSA_CORE_API, HSA_AMD_EXT_API
+#   rocprof-sys:  rocm_hip_api, rocm_hsa_api, timer_sampling, numa, pthread, host
 _ROCPD_API_CATEGORIES: frozenset[str] = frozenset(
     {
+        # rocprofv3
         "HSA_CORE_API",
         "HSA_AMD_EXT_API",
         "HIP_RUNTIME_API_EXT",
         "HIP_COMPILER_API_EXT",
+        # rocprof-sys
+        "rocm_hip_api",
+        "rocm_hsa_api",
+        "timer_sampling",
+        "numa",
+        "pthread",
+        "host",
     }
 )
+
+# MPI category names: rocprofv3 uses "MPI", rocprof-sys uses "mpi".
+_ROCPD_MPI_CATEGORIES: frozenset[str] = frozenset({"MPI", "mpi"})
+
+# Pre-built SQL IN-clause literals (constants, not user input — safe to interpolate).
+_ROCPD_NON_MARKER_SQL = ",".join(
+    f"'{c}'" for c in sorted(_ROCPD_API_CATEGORIES | _ROCPD_MPI_CATEGORIES)
+)
+_ROCPD_MPI_SQL = ",".join(f"'{c}'" for c in sorted(_ROCPD_MPI_CATEGORIES))
 
 def _rocpd_short_name(display_name: str) -> str | None:
     """Extract a short base function name from a rocpd display_name for terminal display.
@@ -174,8 +192,8 @@ class RocpdProfile:
                 has_kernels=self._table_has_data("rocpd_kernel_dispatch"),
                 has_memcpy=self._table_has_data("rocpd_memory_copy"),
                 has_runtime_api=bool(cats & _ROCPD_API_CATEGORIES),
-                has_markers=bool(cats - _ROCPD_API_CATEGORIES - {"MPI"}),
-                has_mpi="MPI" in cats,
+                has_markers=bool(cats - _ROCPD_API_CATEGORIES - _ROCPD_MPI_CATEGORIES),
+                has_mpi=bool(cats & _ROCPD_MPI_CATEGORIES),
                 has_cpu_samples=self._table_has_data("rocpd_sample"),
                 has_pmc_counters=self._table_has_data("rocpd_pmc_event"),
                 has_sysmetrics=False,
@@ -356,9 +374,6 @@ class RocpdProfile:
     ) -> list[RangeRow]:
         if not self.capabilities.has_markers:
             return []
-        _api_cats = (
-            "'HSA_CORE_API','HSA_AMD_EXT_API','HIP_RUNTIME_API_EXT','HIP_COMPILER_API_EXT','MPI'"
-        )
         and_clause = f"AND {where}" if where else ""
         limit_clause = f"LIMIT {limit}" if limit is not None else ""
         rows = self.query(f"""
@@ -367,7 +382,7 @@ class RocpdProfile:
             INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
             INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
             INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
-            WHERE CS.string NOT IN ({_api_cats})
+            WHERE CS.string NOT IN ({_ROCPD_NON_MARKER_SQL})
             {and_clause}
             {limit_clause}
         """)
@@ -403,7 +418,7 @@ class RocpdProfile:
             INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
             INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
             INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
-            WHERE CS.string = 'MPI'
+            WHERE CS.string IN ({_ROCPD_MPI_SQL})
             {and_clause}
             {limit_clause}
         """)
@@ -465,7 +480,7 @@ class RocpdProfile:
         if not self.has_table("rocpd_info_agent"):
             return DeviceInfo()
         rows = self.query("""
-            SELECT product_name, vendor_name, type, extdata
+            SELECT product_name, model_name, vendor_name, type, extdata
             FROM rocpd_info_agent
             WHERE type = 'GPU'
             LIMIT 1
@@ -488,9 +503,11 @@ class RocpdProfile:
         max_threads_per_cu = wave_front_size * max_waves_per_cu if max_waves_per_cu else None
         clock_mhz = _int("max_engine_clk_fcompute")
 
+        # rocprof-sys leaves extdata={} — fall back to product_name/model_name from main columns.
+        gpu_name = r["product_name"] or r["model_name"]
         return DeviceInfo(
             vendor="amd",
-            name=r["product_name"],
+            name=gpu_name,
             compute_capability=None,
             sm_count=cu_count,
             max_threads_per_sm=max_threads_per_cu,

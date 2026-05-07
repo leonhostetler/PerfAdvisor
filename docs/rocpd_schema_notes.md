@@ -106,10 +106,14 @@ already do the GUID-aware joins — prefer these to hand-rolled SQL.
 ## 3. Region category vocabulary
 
 `rocpd_region.event_id → rocpd_event.category_id → rocpd_string.string`.
-The `regions` view exposes this as a `category` column. **The clean
-`--sys-trace` fixture exposes exactly four categories** (cross-checked
-on ranks 0, 4, and 7 — counts vary by ~few % across ranks from runtime
-HSA-polling jitter):
+The `regions` view exposes this as a `category` column. Category strings
+differ between rocprofv3 and rocprof-sys — both tools write schema v3 but
+use different vocabulary.
+
+### rocprofv3 `--sys-trace` categories (test7 fixture, rank 0)
+
+**The clean `--sys-trace` fixture exposes exactly four categories** (counts
+vary by ~few % across ranks from runtime HSA-polling jitter):
 
 | Category string | Meaning | Row count (rank 0) |
 |---|---|---:|
@@ -118,49 +122,57 @@ HSA-polling jitter):
 | `HIP_RUNTIME_API_EXT`  | HIP API (`hipLaunchKernel`, `hipMemcpyAsync`, `hipEventQuery`, …) | 2,205,172 |
 | `HIP_COMPILER_API_EXT` | `__hipRegister*` (binary load) | 28,890 |
 
+### rocprof-sys categories (test8 fixture, rank 683330)
+
+rocprof-sys produces a strict superset of tables but uses **different
+category names** and adds new categories:
+
+| Category string | Meaning | Row count |
+|---|---|---:|
+| `mpi`              | MPI calls (PMPI wrapper) | 5,882,455 |
+| `rocm_marker_api`  | ROCm marker API (ROCTX user markers + HIP-wrapped markers) | 666,666 |
+| `rocm_hip_api`     | HIP API calls — analog of rocprofv3 `HIP_RUNTIME_API_EXT` | 666,666 |
+| `timer_sampling`   | Sampling timestamps from rocprof-sys timer-based sampler | 557,082 |
+| `numa`             | NUMA topology events | 216 |
+| `pthread`          | pthread events | 9 |
+| `host`             | host-level events | 7 |
+
+Note: `rocm_marker_api` count equals `rocm_hip_api` count — rocprof-sys
+wraps each HIP call with a marker annotation in addition to recording it
+directly. User ROCTX markers (if the app emits any) also land under
+`rocm_marker_api`.
+
+### Category → PerfAdvisor concept mapping
+
+| PerfAdvisor concept | rocprofv3 category | rocprof-sys category |
+|---|---|---|
+| HIP/HSA runtime API | `HIP_RUNTIME_API_EXT`, `HIP_COMPILER_API_EXT`, `HSA_CORE_API`, `HSA_AMD_EXT_API` | `rocm_hip_api`, `rocm_hsa_api` |
+| User markers (ROCTX) | `MARKER_CORE_API`, `ROCTX` (absent if app is uninstrumented) | `rocm_marker_api` (subset of entries) |
+| MPI calls | absent (rocprofv3 cannot intercept MPI) | `mpi` |
+| CPU sampling | absent | `timer_sampling` |
+
 `KERNEL_DISPATCH` and `MEMORY_COPY` are **not** stored as `rocpd_region`
 rows in v3 — they live in their own dedicated tables
-(`rocpd_kernel_dispatch`, `rocpd_memory_copy`) and are surfaced by the
-`kernels` / `memory_copies` views, not by `regions`. The
-`kernels`-view rows are stamped with `category='KERNEL_DISPATCH'` and
-`memory_copies`-view rows with `category='MEMORY_COPY'` only as a view
-convenience — they don't appear in `SELECT DISTINCT category FROM regions`.
-
-### Categories `--sys-trace` adds **only when the app emits them**
-
-| Category | Source | Why absent from this fixture |
-|---|---|---|
-| `MARKER_CORE_API` / `MARKER_CONTROL_API` (rocTX) | App calls `roctxRangePush/Pop` (or `roctxMark`) | QUDA / MILC are not roctx-instrumented; flag is enabled but app emits no markers |
-| `RCCL` | App uses RCCL collectives | QUDA does its own MPI-based comms — RCCL is not loaded |
-| `MPI` | `rocprof-sys` with `ROCPROFSYS_USE_MPI=true` (rocprofv3 does **not** intercept MPI) | rocprofv3 alone never produces `MPI` regions; need rocprof-sys |
-| `OMPT` / `KFD_API` / others | rocprof-sys with extra layers | not relied on |
-
-This means the four-category set we observe is the maximum a
-`rocprofv3 --sys-trace` capture of an uninstrumented MPI+HIP app can
-produce. To unlock phase-detection (markers) and MPI-overlap analysis
-in PerfAdvisor we need either app-side roctx instrumentation or a
-parallel `rocprof-sys` capture — see §9.
-
-Capability detection must still look up category strings
-*case-insensitively* and treat unknown strings as benign extras.
+(`rocpd_kernel_dispatch`, `rocpd_memory_copy`).
 
 ### Capability detection rule
 
+The implementation in `perf_advisor/ingestion/rocpd.py` uses two category
+sets to handle both tools:
+
 ```python
-def derive_capabilities(profile):
-    cats = set(c.upper() for c in profile.query("SELECT DISTINCT category FROM regions"))
-    return ProfileCapabilities(
-        has_kernels       = profile.has_table("rocpd_kernel_dispatch") and profile.has_rows("rocpd_kernel_dispatch"),
-        has_memcpy        = profile.has_table("rocpd_memory_copy")     and profile.has_rows("rocpd_memory_copy"),
-        has_runtime_api   = bool(cats & {"HIP_RUNTIME_API_EXT", "HIP_COMPILER_API_EXT"}),
-        has_markers       = any("MARKER" in c or "ROCTX" in c for c in cats),
-        has_mpi           = "MPI" in cats,
-        has_cpu_samples   = profile.has_rows("rocpd_sample"),
-        has_pmc_counters  = profile.has_rows("rocpd_pmc_event"),
-        has_sysmetrics    = False,                # not seen in rocprofv3 schema v3
-        schema_version    = "3",
-    )
+_ROCPD_API_CATEGORIES = frozenset({
+    # rocprofv3
+    "HSA_CORE_API", "HSA_AMD_EXT_API", "HIP_RUNTIME_API_EXT", "HIP_COMPILER_API_EXT",
+    # rocprof-sys
+    "rocm_hip_api", "rocm_hsa_api", "timer_sampling", "numa", "pthread", "host",
+})
+_ROCPD_MPI_CATEGORIES = frozenset({"MPI", "mpi"})  # rocprofv3 vs rocprof-sys casing
 ```
+
+- `has_runtime_api` = `cats & _ROCPD_API_CATEGORIES` is non-empty
+- `has_markers` = `cats - _ROCPD_API_CATEGORIES - _ROCPD_MPI_CATEGORIES` is non-empty
+- `has_mpi` = `cats & _ROCPD_MPI_CATEGORIES` is non-empty
 
 ---
 
@@ -350,19 +362,38 @@ which means PerfAdvisor's cross-rank loader can confidently aggregate
 without fearing per-rank schema drift. Region row counts vary by ~few %
 from runtime HSA-polling jitter — expected.
 
-## 9. What `rocprof-sys` would add on top
+## 9. What `rocprof-sys` adds on top (confirmed, test8 fixture)
 
-Once `rocprof-sys` is unblocked on Frontier, expect:
+Empirically verified against `test8_rocprofsys_3rhs/rank_683330_rocpd-0.db`
+(rocprof-sys-sample run of same MILC/QUDA app on Frontier MI250X, 3 RHS):
 
-- `MPI` regions populate (PMPI wrapper inside `rocprof-sys`) →
-  `MpiOpSummary` & cross-rank collective imbalance work.
-- `rocpd_sample` populates if `ROCPROFSYS_USE_SAMPLING=true` →
-  CPU sampling tracks via `rocpd_track` + `samples` view.
-- Possibly system-metric tables (power, SMI) if
-  `ROCPROFSYS_USE_AMD_SMI=true`. Schema TBD until we capture one.
+**Confirmed additive tables:**
 
-These are additive — the rocprof-sys file should be a strict superset
-of the rocprofv3 file. Confirm in Phase 10.
+| Addition | Details |
+|---|---|
+| `mpi` regions (5.88M) | PMPI wrapper — `MPI_Start`, `MPI_Wait`, `MPI_Request_free`, `MPI_Barrier`, `MPI_Allreduce`, etc. |
+| `rocpd_sample` (727K) | CPU timer-sampling timestamps, linked via `rocpd_track` (60 tracks) |
+| `rocpd_pmc_event` (170K) | Hardware counter values per event, linked via `rocpd_info_pmc` |
+| Additional views | `busy`, `code_objects`, `counters_collection`, `events_args`, `kernel_summary`, `kernel_summary_region`, `kernel_symbols`, `memory_allocations`, `memory_copies`, `pmc_events`, `pmc_info`, `region_args`, `regions_and_samples`, `sample_regions`, `scratch_memory`, `stream_args` |
+
+**Key schema differences vs rocprofv3:**
+
+1. **Category names differ** — see §3 table. The `regions` view correctly
+   exposes `category` via join in both cases.
+2. **`rocpd_region` has no `category` column** — this is true in both tools;
+   category is always accessed via `rocpd_event.category_id → rocpd_string`.
+3. **`rocpd_info_agent.extdata` is `{}`** (empty JSON) for GPU agents in the
+   rocprof-sys file. The `cu_count`, `wave_front_size`, `max_engine_clk_fcompute`
+   fields that rocprofv3 populates in `extdata` are absent. GPU name
+   (`product_name` = "AMD Instinct MI250X") and arch (`model_name` = "aldebaran")
+   are in the main columns and remain readable.
+4. **`rocpd_kernel_dispatch` has extra columns** in rocprof-sys: `region_name_id`
+   and `event_id` (both optional/nullable in rocprofv3). These are ignored by
+   the current ingestion layer and cause no breakage.
+5. **`rocpd_info_agent` lists all GPUs on the node** (8 GCDs for 4×MI250X),
+   same as rocprofv3.
+
+**`rocprof-sys` is a strict schema superset of `rocprofv3` at schema_version=3.**
 
 ---
 
