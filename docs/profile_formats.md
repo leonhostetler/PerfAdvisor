@@ -77,14 +77,47 @@ This gives the writer up to 5 minutes to finalize after SIGTERM before SIGKILL a
 
 ### AMD rocprof-sys (for MPI imbalance analysis)
 
+rocprof-sys wraps the application with an MPIP interposer and writes MPI region timings to `rocpd_region` under the `MPI` category, enabling PerfAdvisor's cross-rank collective-imbalance analysis. Without rocprof-sys, `capabilities.has_mpi = False` and the MPI Wait column will be empty.
+
+Recommended environment block (set these before calling `srun … rocprof-sys-sample`):
+
 ```bash
-ROCPROFSYS_USE_MPI=true \
-ROCPROFSYS_ROCPD_OUTPUT=true \
-rocprof-sys-sample \
-  -- mpirun -n <ranks> <app> <args>
+# rocpd output — one .db file per rank
+export ROCPROFSYS_USE_ROCPD=true
+export ROCPROFSYS_TIME_OUTPUT=false      # no timestamp suffix on output directory
+export ROCPROFSYS_USE_PID=true           # suffix each file with the MPI rank / PID
+export ROCPROFSYS_OUTPUT_PREFIX="rank_"  # e.g. rank_rocpd-0.db, rank_rocpd-1.db
+
+# ROCm tracing — explicit domain list so hip_runtime_api_ext is guaranteed
+export ROCPROFSYS_USE_ROCM=true
+export ROCPROFSYS_ROCM_DOMAINS="hip_runtime_api_ext,kernel_dispatch,memory_copy,memory_allocation,marker_api,marker_core_range_api"
+
+# MPI interception — required for has_mpi = True and mpi_ranges() output
+export ROCPROFSYS_USE_MPIP=true
+
+# Backends: timemory statistical profile yes, perfetto trace no
+# (rocpd is the target format; perfetto .proto files are not consumed by PerfAdvisor)
+export ROCPROFSYS_PROFILE=true
+export ROCPROFSYS_TRACE=false
+
+export ROCPROFSYS_VERBOSE=0
 ```
 
-rocprof-sys wraps the application with an MPIP interposer and writes MPI region timings to `rocpd_region` under the `MPI` category, enabling PerfAdvisor's cross-rank collective-imbalance analysis. Without rocprof-sys, `capabilities.has_mpi = False` and the MPI Wait column will be empty.
+Then invoke with `srun`:
+
+```bash
+srun -n <ranks> rocprof-sys-sample -o <outdir> -- <app> <args>
+```
+
+| Variable | Why it matters |
+|---|---|
+| `ROCPROFSYS_USE_ROCPD=true` | Write output as rocpd SQLite (`.db`), not perfetto proto |
+| `ROCPROFSYS_ROCM_DOMAINS` | Explicit list ensures `hip_runtime_api_ext` is captured (sync stall detection) and `memory_allocation` is included; default domain set is version-dependent |
+| `ROCPROFSYS_USE_MPIP=true` | Enables MPIP interposer → `rocpd_region` MPI entries → `has_mpi = True`; without this, MPI timing is invisible to PerfAdvisor |
+| `ROCPROFSYS_TRACE=false` | Disables the perfetto backend; removes per-rank `.proto` files that PerfAdvisor does not read, reducing disk use and capture overhead |
+| `ROCPROFSYS_USE_PID=true` + `OUTPUT_PREFIX` | Produces one `.db` file per rank (e.g. `rank_rocpd-0.db`) required for multi-rank analysis |
+
+**Hardware counters (separate pass):** to populate `rocpd_pmc_event` (checked by `capabilities.has_pmc_counters`), add `ROCPROFSYS_ROCM_EVENTS` with counter names specific to GFX90A (MI250X), e.g. `SQ_WAVES,SQ_BUSY_CYCLES,GRBM_GUI_ACTIVE`. Counter collection serializes kernel re-replay and adds significant overhead — run it as a separate job, not alongside the timing profiles used for bottleneck detection. Verify counter names first with `rocprof-sys-avail -r` on the target system.
 
 ---
 
@@ -97,7 +130,7 @@ PerfAdvisor's pre-flight check (`preflight.py`) prints actionable messages when 
 | `rocpd_kernel_dispatch`, `rocpd_memory_copy`, `rocpd_memory_allocate` all empty **and** a SQLite journal sidecar (`.db-journal` or `.db-wal`) is present next to the file | rocpd writer killed mid-flush (SLURM SIGKILL, OOM, manual kill) | Add `--signal=SIGTERM@300` (or larger) to your `#SBATCH` header so the writer can finalize before SIGKILL arrives. The HIP/HSA API regions already on disk are still usable, but kernel/memcpy analysis will be sparse. |
 | `rocpd_kernel_dispatch` and/or `rocpd_memory_copy` empty, no journal sidecar | Capture used a narrow flag set (e.g. `--hip-trace --hsa-trace` only) | Re-capture with `rocprofv3 --sys-trace --output-format rocpd`. The `--sys-trace` bundle adds `--kernel-trace --memory-copy-trace` and the other required flags. |
 | No marker ranges (rocTX) | App is not roctx-instrumented, or roctx is not loaded | Instrument the app with `roctxRangePush` / `roctxRangePop` (or `roctxMark`) around iteration boundaries and re-capture with `--sys-trace` (or at minimum `--marker-trace`). Phase detection will still run from kernel-distribution change-points, but phases will be labeled by dominant kernel name rather than user-defined names. |
-| No MPI ranges, format is rocpd | rocprofv3 does not intercept MPI | For MPI cross-rank collective-imbalance analysis, capture with `rocprof-sys` (`ROCPROFSYS_USE_MPI=true`). PerfAdvisor will skip MPI-overlap hypotheses and leave the MPI Wait column empty for this profile. |
+| No MPI ranges, format is rocpd | rocprofv3 does not intercept MPI | For MPI cross-rank collective-imbalance analysis, capture with `rocprof-sys` (`ROCPROFSYS_USE_MPIP=true`). PerfAdvisor will skip MPI-overlap hypotheses and leave the MPI Wait column empty for this profile. |
 
 These are the same messages printed at runtime; you can search for the exact wording here for the longer explanation.
 

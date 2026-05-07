@@ -40,8 +40,10 @@ export ROCPROFSYS_TIME_OUTPUT=false
 export ROCPROFSYS_USE_PID=true         # one rocpd file per rank (keyed by PID)
 export ROCPROFSYS_OUTPUT_PREFIX="rank_"
 export ROCPROFSYS_USE_ROCM=true
+export ROCPROFSYS_ROCM_DOMAINS="hip_runtime_api_ext,kernel_dispatch,memory_copy,memory_allocation,marker_api,marker_core_range_api"
+export ROCPROFSYS_USE_MPIP=true        # MPI region tracing — required for MPI analysis
 export ROCPROFSYS_PROFILE=true
-export ROCPROFSYS_TRACE=true
+export ROCPROFSYS_TRACE=false          # perfetto not needed; rocpd is the target format
 export ROCPROFSYS_VERBOSE=0
 
 BENCH_DIR="${SLURM_SUBMIT_DIR}"

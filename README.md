@@ -129,7 +129,20 @@ Versions tested:
 rocprofv3 --sys-trace --output-format rocpd -d <outdir> -o rank_%pid% <app> <args>
 ```
 
-`--sys-trace` bundles `--kernel-trace --memory-copy-trace --hip-trace --hsa-trace --marker-trace --rccl-trace --scratch-memory-trace`, enabling all metrics PerfAdvisor uses. For MPI cross-rank imbalance analysis, rocprof-sys with `ROCPROFSYS_USE_MPI=true` is required (rocprofv3 alone does not intercept MPI).
+`--sys-trace` bundles `--kernel-trace --memory-copy-trace --hip-trace --hsa-trace --marker-trace --rccl-trace --scratch-memory-trace`, enabling all metrics PerfAdvisor uses.
+
+For MPI cross-rank imbalance analysis, rocprofv3 alone is insufficient — it does not intercept MPI. Use `rocprof-sys-sample` with the following environment block instead:
+
+```bash
+export ROCPROFSYS_USE_ROCPD=true
+export ROCPROFSYS_USE_ROCM=true
+export ROCPROFSYS_ROCM_DOMAINS="hip_runtime_api_ext,kernel_dispatch,memory_copy,memory_allocation,marker_api,marker_core_range_api"
+export ROCPROFSYS_USE_MPIP=true   # MPI region tracing — required for MPI analysis
+export ROCPROFSYS_PROFILE=true
+export ROCPROFSYS_TRACE=false     # rocpd is the target; perfetto not needed
+```
+
+See [docs/profile_formats.md](docs/profile_formats.md) for the full per-flag rationale and per-rank output naming settings.
 
 **Important:** on SLURM systems, add `--signal=SIGTERM@300` (or a larger grace period) so the rocpd writer can finalize before the job is killed:
 
