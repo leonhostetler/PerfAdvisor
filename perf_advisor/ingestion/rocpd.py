@@ -25,7 +25,11 @@ if TYPE_CHECKING:
 
 # Region categories that are NOT user markers, covering both rocprofv3 and rocprof-sys names.
 #   rocprofv3:    HIP_RUNTIME_API_EXT, HIP_COMPILER_API_EXT, HSA_CORE_API, HSA_AMD_EXT_API
-#   rocprof-sys:  rocm_hip_api, rocm_hsa_api, timer_sampling, numa, pthread, host
+#   rocprof-sys:  rocm_hip_api, rocm_marker_api, rocm_hsa_api, timer_sampling, numa, pthread, host
+#
+# rocprof-sys records every HIP API call under *both* rocm_hip_api and rocm_marker_api; the
+# latter must also be excluded or HIP function names (hipLaunchKernel etc.) leak into phase
+# labels as if they were ROCTX user markers.
 _ROCPD_API_CATEGORIES: frozenset[str] = frozenset(
     {
         # rocprofv3
@@ -35,6 +39,7 @@ _ROCPD_API_CATEGORIES: frozenset[str] = frozenset(
         "HIP_COMPILER_API_EXT",
         # rocprof-sys
         "rocm_hip_api",
+        "rocm_marker_api",
         "rocm_hsa_api",
         "timer_sampling",
         "numa",
@@ -57,16 +62,23 @@ def _rocpd_short_name(display_name: str) -> str | None:
 
     E.g. "dslash_function<Dslash3D,int>" → "dslash_function"
          "void QUDA::dslashKernel<float>(int)" → "dslashKernel"
+         "std::enable_if<...>::type quda::Kernel3D<...>" → "Kernel3D"
     Returns None when no shortening is possible (name is already bare).
     """
     name = display_name
-    # strip leading return type (e.g. "void ")
+    # Strip SFINAE return-type prefix used by QUDA/CUDA template kernels:
+    # "std::enable_if<(device::use_kernel_arg<...>)(), void>::type quda::Kernel3D<...>"
+    # Without this step, splitting on "::" picks the last segment deep inside the
+    # template argument list (e.g. "quda::DDNo") rather than the actual kernel name.
+    name = re.sub(r"^.*?void>::type\s+", "", name)
+    # strip leading return type word (e.g. "void ")
     name = re.sub(r"^\s*\w+\s+", "", name)
+    # strip template parameters and argument list BEFORE splitting on "::" so that
+    # template arguments containing "::" (e.g. "quda::DDNo" inside <...>) are gone
+    name = re.sub(r"[<(\[].*", "", name).strip()
     # take last :: segment (strip namespace prefix)
     if "::" in name:
-        name = name.split("::")[-1]
-    # strip template parameters and argument list
-    name = re.sub(r"[<(].*", "", name).strip()
+        name = name.split("::")[-1].strip()
     return name if name and name != display_name else None
 
 

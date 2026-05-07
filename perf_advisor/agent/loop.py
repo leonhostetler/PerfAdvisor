@@ -377,15 +377,28 @@ Output ONLY a JSON array of hypothesis objects — no prose, no markdown fences.
 
 
 def _extract_hypotheses(text: str) -> list[dict[str, Any]]:
-    """Extract a JSON array of hypotheses from a text response."""
+    """Extract a JSON array of hypotheses from a text response.
+
+    Scans left-to-right through candidate '[' positions rather than using
+    rfind('['), which fails when string values inside the array contain '['
+    (e.g. AMD/ROCm kernel names like 'kernel_a [clone .kd]').
+    """
     text = text.strip()
-    start = text.rfind("[")
     end = text.rfind("]") + 1
-    if start != -1 and end > start:
+    if end == 0:
+        return []
+    pos = 0
+    while True:
+        start = text.find("[", pos)
+        if start == -1 or start >= end:
+            break
         try:
-            return json.loads(text[start:end])
+            result = json.loads(text[start:end])
+            if isinstance(result, list):
+                return result
         except json.JSONDecodeError:
             pass
+        pos = start + 1
     return []
 
 
