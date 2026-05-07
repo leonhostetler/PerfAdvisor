@@ -798,7 +798,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             console.print(f"  Transcript: {_transcript_path}")
 
 
-def _print_phase_table(summary, title: str, max_phases: int = 10) -> None:
+def _print_phase_table(
+    summary, title: str, max_phases: int = 10, show_warning: bool = True
+) -> None:
     """Print a phases table for one profile, or a note if no phases were detected."""
     if not summary.phases:
         console.print(f"[dim]{title}: no phases detected[/dim]")
@@ -826,7 +828,7 @@ def _print_phase_table(summary, title: str, max_phases: int = 10) -> None:
             top_kernel,
         )
     console.print(ph)
-    if max_phases > 1:
+    if show_warning and max_phases > 1:
         console.print(_PHASE_WARNING)
 
 
@@ -899,7 +901,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"\n  Profile A: [cyan]{Path(args.profile_a).name}[/cyan]"
             f"\n  Profile B: [cyan]{Path(args.profile_b).name}[/cyan]"
         )
-    _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}", args.max_phases)
+    _print_phase_table(
+        summary_a, f"Phases — {Path(args.profile_a).name}", args.max_phases, show_warning=False
+    )
     _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}", args.max_phases)
 
     # Compute diff — also determines comparison_mode
