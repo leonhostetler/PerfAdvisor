@@ -83,21 +83,31 @@ def discover_runs(profiles_dir: Path, bench_dir: Path) -> list[RunConfig]:
             scenario = gt_runtime.get("scenario", "")
             gt_meta = meta.get(scenario)  # None if scenario not in meta
 
-            # Resolve SQLite file(s).
-            # Multi-rank: test_NN.0.sqlite, test_NN.1.sqlite, …
-            # Single-GPU: test_NN.sqlite
+            # Resolve profile file(s).  Three naming conventions:
+            #   1. Nsight/CUDA flat multi-rank: test_NN.0.sqlite, test_NN.1.sqlite, …
+            #   2. Nsight/CUDA flat single-GPU: test_NN.sqlite
+            #   3. rocprof-sys: .db files written into a per-run subdirectory
+            #      profiles/{Ngpu}/test_NN/{prefix}rocpd-{N}.db  (one per rank)
             multi_rank = sorted(
                 subdir_path.glob(f"{run_id}.[0-9]*.sqlite"),
                 key=_rank_from_path,
             )
             single = subdir_path / f"{run_id}.sqlite"
+            run_subdir = subdir_path / run_id
 
             if multi_rank:
                 sqlite_paths = multi_rank
             elif single.exists():
                 sqlite_paths = [single]
+            elif run_subdir.is_dir():
+                # rocprof-sys output: *.db files inside the per-run directory.
+                # Sort alphabetically for deterministic ordering (rank order is cosmetic).
+                rocpd_files = sorted(run_subdir.glob("*.db"))
+                if not rocpd_files:
+                    continue
+                sqlite_paths = rocpd_files
             else:
-                continue  # no SQLite found — skip
+                continue  # no profiles found — skip
 
             runs.append(
                 RunConfig(

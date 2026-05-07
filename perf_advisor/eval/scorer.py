@@ -17,6 +17,17 @@ from typing import Any
 # Bottleneck detection
 # ---------------------------------------------------------------------------
 
+# Runs whose expected_bottleneck is in this set represent an *optimal* execution
+# path — no deficiency was injected and no bottleneck detection is expected.
+# They are still profiled and shown in the table but excluded from the detection
+# accuracy numerator/denominator so they don't penalise the score.
+OPTIMAL_PATH_BOTTLENECKS: frozenset[str] = frozenset(
+    {
+        "p2p_direct_transfer",  # scen_h: ROCm-aware MPI intra-node ring (no deficiency)
+        "gpu_direct_transfer",  # scen_n: GPU-Direct RDMA optimal path (no deficiency)
+    }
+)
+
 # Maps expected_bottleneck (ground-truth JSON) → advisor bottleneck_type enum values.
 # Intentionally loose: some advisor types map to multiple expected labels because
 # the advisor's vocabulary is coarser than the benchmark's.
@@ -39,6 +50,8 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
         "launch latency",
         "tiny kernel",
         "cuda graph",
+        "hip graph",          # AMD HIP equivalent of CUDA Graphs
+        "hipgraphcreate",
         "kernel launch",
         "launch gap",
         "frequent launch",
@@ -46,6 +59,7 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
     "cpu_sync_stall": [
         "sync stall",
         "cudastreamsynchronize",
+        "hipstreamsynchronize",   # AMD HIP equivalent
         "stream synchronize",
         "blocking sync",
         "cpu block",
@@ -58,6 +72,7 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
         "transfer-bound",
         "transfer bound",
         "memcpy",
+        "hipmemcpy",          # AMD HIP equivalent of cudaMemcpy
         "h2d",
         "d2h",
         "host-to-device",
@@ -80,14 +95,19 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
         "host staging",
         "host-staged",
         "cuda-aware",
+        "rocm-aware",         # AMD equivalent of CUDA-aware MPI
+        "hip-aware",
         "device pointer",
         "intra-node",
         "intranode",
         "p2p",
         "nvlink",
+        "xgmi",               # AMD Infinity Fabric inter-GCD link
+        "infinity fabric",
         "unnecessary copy",
         "host copy",
         "stage to host",
+        "mpich_gpu_support_enabled",
     ],
     "mpi_load_imbalance": [
         "load imbalance",
@@ -104,6 +124,7 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
         "host-staged",
         "host staged",
         "nccl",
+        "rccl",               # AMD equivalent of NCCL
         "collective",
         "mpi_allreduce",
         "device pointer",
@@ -115,11 +136,13 @@ _BOTTLENECK_KEYWORDS: dict[str, list[str]] = {
         "host staged",
         "gpu-direct",
         "rdma",
+        "rocm-aware mpi",     # AMD: ROCm-aware MPI with device pointers
         "sendrecv",
         "mpi_sendrecv",
         "inter-node",
         "internode",
         "staging halo",
+        "gdrcopy",            # GPU-Direct RDMA copy path on both NVIDIA and AMD
     ],
 }
 
@@ -332,6 +355,9 @@ class RunScore:
     false_positive_count: int = 0
     # Timing
     elapsed_s: float = 0.0
+    # Optimal-path flag: True when no bottleneck was injected (e.g. GPU-Direct path).
+    # These runs are shown in the table but excluded from detection accuracy tallies.
+    is_optimal_path: bool = False
     # Error (set when PerfAdvisor itself failed)
     error: str | None = None
 
@@ -349,6 +375,7 @@ class RunScore:
             "coverage_pct": self.coverage_pct,
             "false_positive_count": self.false_positive_count,
             "elapsed_s": self.elapsed_s,
+            "is_optimal_path": self.is_optimal_path,
             "error": self.error,
         }
 
@@ -377,6 +404,7 @@ class RunScore:
             coverage_pct=d.get("coverage_pct", 0.0),
             false_positive_count=d.get("false_positive_count", 0),
             elapsed_s=d.get("elapsed_s", 0.0),
+            is_optimal_path=d.get("is_optimal_path", False),
             error=d.get("error"),
         )
 
@@ -395,6 +423,7 @@ def score_run(
     """Score one run's hypotheses against ground truth."""
     scenario = gt_runtime.get("scenario", "unknown")
     expected_bottleneck = gt_runtime.get("expected_bottleneck", "unknown")
+    is_optimal = expected_bottleneck in OPTIMAL_PATH_BOTTLENECKS
 
     detected, match_type, matched_idx = score_bottleneck(hypotheses, expected_bottleneck)
     fp_count = false_positive_count(hypotheses, expected_bottleneck)
@@ -420,4 +449,5 @@ def score_run(
         coverage_pct=cov,
         false_positive_count=fp_count,
         elapsed_s=elapsed_s,
+        is_optimal_path=is_optimal,
     )

@@ -35,7 +35,8 @@ build/
 # Profile exports and agent output logs
 *.sqlite
 *_log.txt
-bench/profiles/
+bench/cuda/profiles/
+bench/hip/profiles/
 eval_*_transcript.txt
 eval_*.json
 

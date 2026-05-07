@@ -1,23 +1,28 @@
 #!/bin/bash
 #SBATCH -A m1647_g
-#SBATCH -J bench_4gpu
+#SBATCH -J bench_8gpu
 #SBATCH -q debug
 #SBATCH -t 00:10:00
-#SBATCH -N 1
+#SBATCH -N 2
 #SBATCH -C gpu&hbm40g
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-task=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpu-bind=map_gpu:0,1,2,3
+#SBATCH --distribution=cyclic
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs #11–#13: intra-node multi-GPU scenarios (1 node, 4 GPUs, 4 MPI ranks).
-# Run #11: intra-node P2P host-staged ring (D2H → MPI_Sendrecv → H2D).
-# Runs #12–#13: MPI collectives (4 ranks, one GPU each via map_gpu:0,1,2,3).
-# Note: run #10 (scen_h, intra-node GPU-Direct NVLink) is omitted — true NVLink
-# between separate MPI processes requires CUDA IPC, which fails when each rank
-# owns a different physical GPU (--gpus-per-task=1); GTL has no working fallback.
+# Run #14: inter-node MPI scenario (8 ranks, 4 GPUs × 2 nodes).
+# Run #16 (GPU-Direct RDMA, optimized baseline) was removed — it has no visible
+# deficiency in Nsight Systems and serves only as a reference, not a bad run.
+#
+# --distribution=cyclic interleaves ranks across nodes:
+#   rank 0 → node 0, rank 1 → node 1, rank 2 → node 0, rank 3 → node 1, …
+# Every adjacent pair in the ring therefore crosses the network, ensuring
+# GTL never attempts intra-node CUDA IPC (which fails with --gpus-per-task=1
+# because each rank owns a different physical GPU and cudaIpcOpenMemHandle
+# rejects cross-device handles). All transfers go via GDRCopy + Slingshot.
 
 module reset
 module load cudatoolkit
@@ -28,11 +33,11 @@ export MPICH_RDMA_ENABLED_CUDA=1
 
 BENCH_DIR=`pwd`
 BIN="${BENCH_DIR}/synthetic_cuda_benchmark_mpi"
-PROFILES="${BENCH_DIR}/profiles/4gpu"
+PROFILES="${BENCH_DIR}/profiles/8gpu"
 mkdir -p "${PROFILES}"
 
 [[ -x "${BIN}" ]] || { echo "ERROR: binary not found: ${BIN}" >&2
-                        echo "       Run bench/build.sh first." >&2; exit 1; }
+                        echo "       Run build.sh first." >&2; exit 1; }
 
 echo ""
 echo "Binary:   ${BIN}"
@@ -40,7 +45,7 @@ echo "Profiles: ${PROFILES}"
 printenv | grep SLURM
 echo ""
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 # profile_mpi <id> <nranks> [benchmark args...]
 #   Profiles all ranks with nsys (one .nsys-rep per rank), writes ground-truth
 #   JSON (rank 0 only), exports each rank's profile to SQLite.
@@ -63,20 +68,10 @@ profile_mpi() {
     done
 }
 
-# ── Run #11: intra-node P2P staged — D2H → MPI_Sendrecv → H2D ring, 4 ranks ─
-profile_mpi test_05 4 \
-    --scenario scen_i \
+# ── Run #14: inter-node halo exchange baseline — host-staged ring sendrecv ────
+profile_mpi test_08 8 \
+    --scenario scen_l \
     --transfer-size-mb 64 --reps 50
-
-# ── Run #12: MPI load imbalance — GPU compute imbalance → barrier stall (4 ranks)
-profile_mpi test_06 4 \
-    --scenario scen_j \
-    --n 16777216 --work-iters 16 --reps 20
-
-# ── Run #13: host-staged collective — D2H → MPI_Allreduce → H2D (4 ranks) ────
-profile_mpi test_07 4 \
-    --scenario scen_k \
-    --n 2097152 --work-iters 4 --reps 30
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"
