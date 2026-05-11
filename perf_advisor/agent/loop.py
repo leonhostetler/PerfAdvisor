@@ -1305,7 +1305,7 @@ def _run_gemini(
             if text:
                 log(f"[← llm] {_trunc(text)}")
             for fc in function_calls:
-                log(f"[← llm:tool] {fc.name}({_trunc(str(dict(fc.args)), 120)})")
+                log(f"[← llm:tool] {fc.name}({_trunc(str(dict(fc.args or {})), 120)})")
 
         if not function_calls:
             text = response.text or ""
@@ -1323,7 +1323,7 @@ def _run_gemini(
         parts = []
         parts_data: list[dict] = []
         for fc in function_calls:
-            result_json = dispatch(profile, fc.name, dict(fc.args))
+            result_json = dispatch(profile, fc.name, dict(fc.args or {}))
             if verbose:
                 log(f"[local] {fc.name} → {_trunc(result_json)}")
             parts_data.append(
