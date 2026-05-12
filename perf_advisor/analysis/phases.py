@@ -93,13 +93,13 @@ class _PhaseState:
     Peak size is O(n_segs × K) — a few KB per rank at most.
     """
 
-    segs: list[_Seg]                         # pre-pass-merged segments (typically 10–100)
+    segs: list[_Seg]  # pre-pass-merged segments (typically 10–100)
     all_markers: list[tuple[int, int, str]]  # long marker ranges for labeling
-    dp: list[list[float]]                    # DP cost table (K+1 × n_segs); [] if trivial
-    split: list[list[int]]                   # DP split table (K+1 × n_segs); [] if trivial
-    K: int                                   # effective max k used in DP
-    costs: list[float]                       # dp[k][n_segs-1] for k=1..K
-    best_k: int                              # elbow-selected k (per-rank)
+    dp: list[list[float]]  # DP cost table (K+1 × n_segs); [] if trivial
+    split: list[list[int]]  # DP split table (K+1 × n_segs); [] if trivial
+    K: int  # effective max k used in DP
+    costs: list[float]  # dp[k][n_segs-1] for k=1..K
+    best_k: int  # elbow-selected k (per-rank)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +246,7 @@ def _distribution_boundaries(
 
 
 def _marker_phase_boundaries(
-    marker_evts: list,
+    profile: Profile,
     span_ns: int,
     max_phases: int,
 ) -> tuple[list[int], list[tuple[int, int, str]]]:
@@ -254,20 +254,18 @@ def _marker_phase_boundaries(
 
     Only ranges that appear <= max_phases times contribute boundaries;
     frequently-repeated ranges are iterations, not phase transitions.
+    The duration filter is pushed into SQL so we never materialise the full
+    marker table in Python.
     """
-    if not marker_evts:
+    if not profile.capabilities.has_markers:
         return [], []
 
     min_dur_ns = max(int(span_ns * 0.02), 100_000_000)  # >= 2% of span or >= 100ms
-    long_ranges = sorted(
-        [(e.start_ns, e.end_ns, e.name) for e in marker_evts if e.duration_ns >= min_dur_ns],
-        key=lambda x: x[1] - x[0],
-        reverse=True,
-    )[:200]
-    if not long_ranges:
+    long_rows = profile.long_marker_ranges(min_duration_ns=min_dur_ns, limit=200)
+    if not long_rows:
         return [], []
 
-    all_long = long_ranges
+    all_long = [(r.start_ns, r.end_ns, r.name) for r in long_rows]
     top_level = [
         (s, e, n)
         for i, (s, e, n) in enumerate(all_long)
@@ -280,9 +278,15 @@ def _marker_phase_boundaries(
     return boundaries, all_long
 
 
-def _mpi_cluster_boundaries(mpi_evts: list) -> list[int]:
-    """Return end-of-cluster timestamps for MPI_Barrier bursts."""
-    ends = sorted(e.end_ns for e in mpi_evts if e.name == "MPI_Barrier" and e.end_ns is not None)
+def _mpi_cluster_boundaries(profile: Profile) -> list[int]:
+    """Return end-of-cluster timestamps for MPI_Barrier bursts.
+
+    Only Barrier end timestamps are fetched from SQL — the rest of the MPI
+    table (typically dominated by P2P sends/recvs) is never materialised.
+    """
+    if not profile.capabilities.has_mpi:
+        return []
+    ends = profile.mpi_event_ends_by_name("MPI_Barrier")
     if not ends:
         return []
     boundaries: list[int] = []
@@ -466,11 +470,12 @@ def _compute_phase_state(
     def _s(ns: int) -> str:
         return f"{ns / 1e9:.3f}s"
 
-    # Pre-load all events once; caching in the profile avoids repeated SQLite scans.
+    # Pre-load kernel and memcpy events once; phase fingerprinting needs random
+    # access into them.  Marker and MPI tables are accessed via narrow SQL
+    # fetchers below to avoid materialising millions of rows on heavy-MPI
+    # rocprof-sys profiles.
     kernel_evts = profile.kernel_events()
     memcpy_evts = profile.memcpy_events()
-    marker_evts = profile.marker_ranges()
-    mpi_evts = profile.mpi_ranges()
 
     # Step 1 — Profile bounds
     t0, t1 = profile.profile_bounds_ns()
@@ -525,9 +530,9 @@ def _compute_phase_state(
     n_candidates = _N_CANDIDATES_FACTOR * max_phases
     dist_candidates = _distribution_boundaries(dists, t0, bin_width_ns, n_candidates)
     tagged.extend(dist_candidates)
-    marker_boundaries, all_markers = _marker_phase_boundaries(marker_evts, span_ns, max_phases)
+    marker_boundaries, all_markers = _marker_phase_boundaries(profile, span_ns, max_phases)
     tagged.extend((t, _PRI_MARKER) for t in marker_boundaries)
-    mpi_bounds = _mpi_cluster_boundaries(mpi_evts)
+    mpi_bounds = _mpi_cluster_boundaries(profile)
     tagged.extend((t, _PRI_MPI) for t in mpi_bounds)
     gpu_tagged: list[tuple[int, int]] = []
     if kernel_evts:
@@ -646,8 +651,7 @@ def _compute_phase_state(
         for b in range(a + 1, n_segs):
             merged_ab = _merge_segs(merged_ab, segs[b])
             C[a][b] = sum(
-                segs[i].duration_ns
-                * _js_divergence(segs[i].distribution, merged_ab.distribution)
+                segs[i].duration_ns * _js_divergence(segs[i].distribution, merged_ab.distribution)
                 for i in range(a, b + 1)
             )
 

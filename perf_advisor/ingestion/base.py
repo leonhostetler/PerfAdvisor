@@ -7,10 +7,27 @@ import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from perf_advisor.analysis.models import DeviceInfo
+
+
+class MpiOpAgg(NamedTuple):
+    """SQL-side aggregation of MPI calls by operation name."""
+
+    op: str
+    calls: int
+    total_ns: int
+    max_ns: int
+
+
+class MarkerAgg(NamedTuple):
+    """SQL-side aggregation of marker (NVTX/rocTX) ranges by name."""
+
+    name: str
+    calls: int
+    total_ns: int
 
 
 class Format(Enum):
@@ -33,7 +50,7 @@ class ProfileCapabilities:
     schema_version: str
 
 
-@dataclass
+@dataclass(slots=True)
 class KernelRow:
     """One GPU kernel dispatch, normalised across both profile formats."""
 
@@ -50,7 +67,7 @@ class KernelRow:
     total_threads: float | None = None  # gridX*gridY*gridZ × blockX*blockY*blockZ
 
 
-@dataclass
+@dataclass(slots=True)
 class MemcpyRow:
     """One memory transfer, direction normalised to vendor-neutral vocabulary."""
 
@@ -61,7 +78,7 @@ class MemcpyRow:
     duration_ns: int
 
 
-@dataclass
+@dataclass(slots=True)
 class RangeRow:
     """One annotated time range (NVTX, rocTX, or MPI call)."""
 
@@ -113,6 +130,26 @@ class Profile(Protocol):
     def mpi_ranges(
         self, *, where: str | None = None, limit: int | None = None
     ) -> list[RangeRow]: ...
+
+    def mpi_op_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 10,
+    ) -> list[MpiOpAgg]: ...
+
+    def marker_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 20,
+    ) -> list[MarkerAgg]: ...
+
+    def mpi_event_ends_by_name(self, name: str) -> list[int]: ...
+
+    def long_marker_ranges(self, *, min_duration_ns: int, limit: int = 200) -> list[RangeRow]: ...
 
     def device_info(self) -> DeviceInfo: ...
 

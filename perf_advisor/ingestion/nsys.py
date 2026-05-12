@@ -7,7 +7,15 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .base import Format, KernelRow, MemcpyRow, ProfileCapabilities, RangeRow
+from .base import (
+    Format,
+    KernelRow,
+    MarkerAgg,
+    MemcpyRow,
+    MpiOpAgg,
+    ProfileCapabilities,
+    RangeRow,
+)
 
 
 class NsysProfile:
@@ -36,8 +44,10 @@ class NsysProfile:
             file_size = 64 * 1024 * 1024  # fallback: 64 MB
         # Cache: up to 25% of file size, capped at 512 MB, minimum 16 MB
         cache_kb = max(16 * 1024, min(file_size // (1024 * 4), 512 * 1024))
-        # mmap: full file size, capped at 16 GB
-        mmap_size = min(file_size, 16 * 1024**3)
+        # mmap: capped at 256 MB. A larger cap reduces cold-cache scan latency but
+        # keeps file-backed pages resident, which combines badly with parallel
+        # multi-rank analysis on memory-constrained hosts.
+        mmap_size = min(file_size, 256 * 1024**2)
         self._conn.execute(f"PRAGMA cache_size = -{cache_kb}")
         self._conn.execute(f"PRAGMA mmap_size = {mmap_size}")
         self._tables: set[str] | None = None
@@ -350,6 +360,141 @@ class NsysProfile:
                 for r in rows
             )
         return ranges
+
+    # ------------------------------------------------------------------
+    # SQL-side aggregations (avoid materialising whole tables in Python)
+    # ------------------------------------------------------------------
+
+    def mpi_op_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 10,
+    ) -> list[MpiOpAgg]:
+        if not self.has_mpi():
+            return []
+        window = ""
+        params: tuple[Any, ...] = ()
+        if start_ns is not None and end_ns is not None:
+            window = "AND e.start >= ? AND e.end <= ?"
+            params = (start_ns, end_ns)
+        sub_selects: list[str] = []
+        for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
+            if not self.has_table(table):
+                continue
+            sub_selects.append(
+                f"SELECT s.value AS name, (e.end - e.start) AS dur "
+                f"FROM {table} e JOIN StringIds s ON e.textId = s.id "
+                f"WHERE e.end IS NOT NULL AND e.end > e.start {window}"
+            )
+        if not sub_selects:
+            return []
+        union_sql = " UNION ALL ".join(sub_selects)
+        # Each sub-select carries its own window predicate, so params repeat per sub-select.
+        full_params: tuple[Any, ...] = params * len(sub_selects)
+        rows = self._conn.execute(
+            f"SELECT name, COUNT(*) AS calls, SUM(dur) AS total_ns, MAX(dur) AS max_ns "
+            f"FROM ({union_sql}) "
+            f"GROUP BY name "
+            f"ORDER BY total_ns DESC "
+            f"LIMIT ?",
+            full_params + (limit,),
+        ).fetchall()
+        return [
+            MpiOpAgg(
+                op=r["name"],
+                calls=int(r["calls"]),
+                total_ns=int(r["total_ns"] or 0),
+                max_ns=int(r["max_ns"] or 0),
+            )
+            for r in rows
+        ]
+
+    def marker_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 20,
+    ) -> list[MarkerAgg]:
+        if not self.has_nvtx():
+            return []
+        window = ""
+        params: tuple[Any, ...] = ()
+        if start_ns is not None and end_ns is not None:
+            window = "AND start >= ? AND end <= ?"
+            params = (start_ns, end_ns)
+        rows = self._conn.execute(
+            f"SELECT text AS name, COUNT(*) AS calls, SUM(end - start) AS total_ns "
+            f"FROM NVTX_EVENTS "
+            f"WHERE eventType = 59 "
+            f"  AND end IS NOT NULL "
+            f"  AND end > start "
+            f"  AND text IS NOT NULL "
+            f"  {window} "
+            f"GROUP BY text "
+            f"ORDER BY total_ns DESC "
+            f"LIMIT ?",
+            params + (limit,),
+        ).fetchall()
+        return [
+            MarkerAgg(name=r["name"], calls=int(r["calls"]), total_ns=int(r["total_ns"] or 0))
+            for r in rows
+        ]
+
+    def mpi_event_ends_by_name(self, name: str) -> list[int]:
+        """Return sorted end_ns timestamps for MPI events matching ``name`` exactly.
+
+        Used by phase-boundary detection (e.g. MPI_Barrier clusters).  Pulls only
+        the end column for matching events — orders of magnitude less memory than
+        materialising all mpi_ranges() when only one event class is of interest.
+        """
+        if not self.has_mpi():
+            return []
+        ends: list[int] = []
+        for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
+            if not self.has_table(table):
+                continue
+            rows = self._conn.execute(
+                f"SELECT e.end FROM {table} e "
+                f"JOIN StringIds s ON e.textId = s.id "
+                f"WHERE e.end IS NOT NULL AND s.value = ?",
+                (name,),
+            ).fetchall()
+            ends.extend(int(r[0]) for r in rows)
+        ends.sort()
+        return ends
+
+    def long_marker_ranges(self, *, min_duration_ns: int, limit: int = 200) -> list[RangeRow]:
+        """Return the longest marker ranges with duration >= ``min_duration_ns``.
+
+        Phase-boundary detection only needs long markers; pushing the duration
+        filter into SQL keeps the result set bounded regardless of profile size.
+        """
+        if not self.has_nvtx():
+            return []
+        rows = self.query(
+            f"SELECT start, end, text AS name "
+            f"FROM NVTX_EVENTS "
+            f"WHERE eventType = 59 "
+            f"  AND end IS NOT NULL "
+            f"  AND end > start "
+            f"  AND text IS NOT NULL "
+            f"  AND (end - start) >= {int(min_duration_ns)} "
+            f"ORDER BY (end - start) DESC "
+            f"LIMIT {int(limit)}"
+        )
+        return [
+            RangeRow(
+                start_ns=r["start"],
+                end_ns=r["end"],
+                name=r["name"],
+                category="NVTX",
+                duration_ns=r["end"] - r["start"],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Profile-level aggregate methods (vendor-neutral Protocol methods)

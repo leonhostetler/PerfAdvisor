@@ -6,8 +6,10 @@ CLAUDE.md
 done.md
 notes/
 paper/
+poster/
 run_books/
 *_synthetic_bench/
+*_hip_bench/
 *_AB_tests/
 *_ABcarveout_tests/
 changelog.txt

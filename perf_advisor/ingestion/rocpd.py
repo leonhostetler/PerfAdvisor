@@ -18,7 +18,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .base import Format, KernelRow, MemcpyRow, ProfileCapabilities, RangeRow
+from .base import (
+    Format,
+    KernelRow,
+    MarkerAgg,
+    MemcpyRow,
+    MpiOpAgg,
+    ProfileCapabilities,
+    RangeRow,
+)
 
 if TYPE_CHECKING:
     from perf_advisor.analysis.models import DeviceInfo
@@ -56,6 +64,7 @@ _ROCPD_NON_MARKER_SQL = ",".join(
     f"'{c}'" for c in sorted(_ROCPD_API_CATEGORIES | _ROCPD_MPI_CATEGORIES)
 )
 _ROCPD_MPI_SQL = ",".join(f"'{c}'" for c in sorted(_ROCPD_MPI_CATEGORIES))
+
 
 def _rocpd_short_name(display_name: str) -> str | None:
     """Extract a short base function name from a rocpd display_name for terminal display.
@@ -124,7 +133,10 @@ class RocpdProfile:
         except OSError:
             file_size = 64 * 1024 * 1024
         cache_kb = max(16 * 1024, min(file_size // (1024 * 4), 512 * 1024))
-        mmap_size = min(file_size, 16 * 1024**3)
+        # mmap: capped at 256 MB. A larger cap reduces cold-cache scan latency but
+        # keeps file-backed pages resident, which combines badly with parallel
+        # multi-rank analysis on memory-constrained hosts.
+        mmap_size = min(file_size, 256 * 1024**2)
         self._conn.execute(f"PRAGMA cache_size = -{cache_kb}")
         self._conn.execute(f"PRAGMA mmap_size = {mmap_size}")
         self._tables: set[str] | None = None
@@ -324,15 +336,17 @@ class RocpdProfile:
                 short = tn if tn != full_name else None
             else:
                 short = _rocpd_short_name(full_name)
-            result.append(KernelRow(
-                start_ns=r["start"],
-                end_ns=r["end"],
-                name=full_name,
-                short_name=short,
-                device_id=r["device_id"],
-                stream_id=r["stream_id"],
-                duration_ns=r["end"] - r["start"],
-            ))
+            result.append(
+                KernelRow(
+                    start_ns=r["start"],
+                    end_ns=r["end"],
+                    name=full_name,
+                    short_name=short,
+                    device_id=r["device_id"],
+                    stream_id=r["stream_id"],
+                    duration_ns=r["end"] - r["start"],
+                )
+            )
         return result
 
     def memcpy_events(
@@ -440,6 +454,143 @@ class RocpdProfile:
                 end_ns=r["end"],
                 name=r["name"] or "",
                 category="MPI",
+                duration_ns=r["end"] - r["start"],
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # SQL-side aggregations (avoid materialising whole tables in Python)
+    # ------------------------------------------------------------------
+
+    def mpi_op_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 10,
+    ) -> list[MpiOpAgg]:
+        if not self.capabilities.has_mpi:
+            return []
+        window = ""
+        params: tuple[Any, ...] = ()
+        if start_ns is not None and end_ns is not None:
+            window = "AND R.start >= ? AND R.end <= ?"
+            params = (start_ns, end_ns)
+        rows = self._conn.execute(
+            f"""
+            SELECT NS.string AS name,
+                   COUNT(*) AS calls,
+                   SUM(R.end - R.start) AS total_ns,
+                   MAX(R.end - R.start) AS max_ns
+            FROM rocpd_region R
+            INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
+            INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
+            INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
+            WHERE CS.string IN ({_ROCPD_MPI_SQL})
+              AND R.end > R.start
+              {window}
+            GROUP BY NS.string
+            ORDER BY total_ns DESC
+            LIMIT ?
+            """,
+            params + (limit,),
+        ).fetchall()
+        return [
+            MpiOpAgg(
+                op=r["name"] or "",
+                calls=int(r["calls"]),
+                total_ns=int(r["total_ns"] or 0),
+                max_ns=int(r["max_ns"] or 0),
+            )
+            for r in rows
+        ]
+
+    def marker_aggregates(
+        self,
+        *,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        limit: int = 20,
+    ) -> list[MarkerAgg]:
+        if not self.capabilities.has_markers:
+            return []
+        window = ""
+        params: tuple[Any, ...] = ()
+        if start_ns is not None and end_ns is not None:
+            window = "AND R.start >= ? AND R.end <= ?"
+            params = (start_ns, end_ns)
+        rows = self._conn.execute(
+            f"""
+            SELECT NS.string AS name,
+                   COUNT(*) AS calls,
+                   SUM(R.end - R.start) AS total_ns
+            FROM rocpd_region R
+            INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
+            INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
+            INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
+            WHERE CS.string NOT IN ({_ROCPD_NON_MARKER_SQL})
+              AND R.end > R.start
+              {window}
+            GROUP BY NS.string
+            ORDER BY total_ns DESC
+            LIMIT ?
+            """,
+            params + (limit,),
+        ).fetchall()
+        return [
+            MarkerAgg(
+                name=r["name"] or "",
+                calls=int(r["calls"]),
+                total_ns=int(r["total_ns"] or 0),
+            )
+            for r in rows
+        ]
+
+    def mpi_event_ends_by_name(self, name: str) -> list[int]:
+        """Return sorted end_ns timestamps for MPI events matching ``name`` exactly."""
+        if not self.capabilities.has_mpi:
+            return []
+        rows = self._conn.execute(
+            f"""
+            SELECT R.end
+            FROM rocpd_region R
+            INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
+            INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
+            INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
+            WHERE CS.string IN ({_ROCPD_MPI_SQL})
+              AND NS.string = ?
+              AND R.end IS NOT NULL
+            ORDER BY R.end
+            """,
+            (name,),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def long_marker_ranges(self, *, min_duration_ns: int, limit: int = 200) -> list[RangeRow]:
+        """Return the longest marker ranges with duration >= ``min_duration_ns``."""
+        if not self.capabilities.has_markers:
+            return []
+        rows = self.query(
+            f"""
+            SELECT R.start, R.end, NS.string AS name, CS.string AS category
+            FROM rocpd_region R
+            INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
+            INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
+            INNER JOIN rocpd_string CS ON CS.id = E.category_id AND CS.guid = E.guid
+            WHERE CS.string NOT IN ({_ROCPD_NON_MARKER_SQL})
+              AND R.end > R.start
+              AND (R.end - R.start) >= {int(min_duration_ns)}
+            ORDER BY (R.end - R.start) DESC
+            LIMIT {int(limit)}
+            """
+        )
+        return [
+            RangeRow(
+                start_ns=r["start"],
+                end_ns=r["end"],
+                name=r["name"] or "",
+                category=r["category"],
                 duration_ns=r["end"] - r["start"],
             )
             for r in rows

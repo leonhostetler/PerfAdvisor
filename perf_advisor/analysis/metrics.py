@@ -11,7 +11,7 @@ import math
 import time
 from collections import defaultdict
 
-from perf_advisor.ingestion.base import KernelRow, MemcpyRow, Profile
+from perf_advisor.ingestion.base import KernelRow, MarkerAgg, MemcpyRow, MpiOpAgg, Profile
 
 from ._utils import _normalize_demangled
 from .models import (
@@ -244,29 +244,36 @@ def compute_streams(profile: Profile) -> list[StreamSummary]:
     return result
 
 
+def _marker_aggs_to_summaries(aggs: list[MarkerAgg]) -> list[MarkerRangeSummary]:
+    return [
+        MarkerRangeSummary(
+            name=a.name,
+            calls=a.calls,
+            total_s=round(a.total_ns / 1e9, 3),
+            avg_ms=round(a.total_ns / a.calls / 1e6, 3) if a.calls else 0.0,
+        )
+        for a in aggs
+    ]
+
+
+def _mpi_aggs_to_summaries(aggs: list[MpiOpAgg]) -> list[MpiOpSummary]:
+    return [
+        MpiOpSummary(
+            op=a.op,
+            calls=a.calls,
+            total_s=round(a.total_ns / 1e9, 3),
+            avg_ms=round(a.total_ns / a.calls / 1e6, 3) if a.calls else 0.0,
+            max_ms=round(a.max_ns / 1e6, 3),
+        )
+        for a in aggs
+    ]
+
+
 def compute_marker_ranges(profile: Profile, limit: int = 20) -> list[MarkerRangeSummary]:
     """Return aggregated marker ranges (NVTX or rocTX), sorted by total time."""
     if not profile.capabilities.has_markers:
         return []
-    evts = profile.marker_ranges()
-    by_name: dict[str, dict] = {}
-    for e in evts:
-        n = e.name
-        if n not in by_name:
-            by_name[n] = {"count": 0, "total_ns": 0}
-        by_name[n]["count"] += 1
-        by_name[n]["total_ns"] += e.duration_ns
-    result = [
-        MarkerRangeSummary(
-            name=n,
-            calls=s["count"],
-            total_s=round(s["total_ns"] / 1e9, 3),
-            avg_ms=round(s["total_ns"] / s["count"] / 1e6, 3),
-        )
-        for n, s in by_name.items()
-    ]
-    result.sort(key=lambda x: x.total_s, reverse=True)
-    return result[:limit]
+    return _marker_aggs_to_summaries(profile.marker_aggregates(limit=limit))
 
 
 def compute_device_info(profile: Profile) -> DeviceInfo:
@@ -276,30 +283,7 @@ def compute_device_info(profile: Profile) -> DeviceInfo:
 def compute_mpi_ops(profile: Profile, limit: int = 10) -> list[MpiOpSummary]:
     if not profile.capabilities.has_mpi:
         return []
-    return _aggregate_mpi_ops(profile.mpi_ranges(), limit)
-
-
-def _aggregate_mpi_ops(evts: list, limit: int = 10) -> list[MpiOpSummary]:
-    by_op: dict[str, dict] = {}
-    for e in evts:
-        op = e.name
-        if op not in by_op:
-            by_op[op] = {"calls": 0, "total_ns": 0, "max_ns": 0}
-        by_op[op]["calls"] += 1
-        by_op[op]["total_ns"] += e.duration_ns
-        by_op[op]["max_ns"] = max(by_op[op]["max_ns"], e.duration_ns)
-    result = [
-        MpiOpSummary(
-            op=op,
-            calls=s["calls"],
-            total_s=round(s["total_ns"] / 1e9, 3),
-            avg_ms=round(s["total_ns"] / s["calls"] / 1e6, 3),
-            max_ms=round(s["max_ns"] / 1e6, 3),
-        )
-        for op, s in by_op.items()
-    ]
-    result.sort(key=lambda x: x.total_s, reverse=True)
-    return result[:limit]
+    return _mpi_aggs_to_summaries(profile.mpi_op_aggregates(limit=limit))
 
 
 def _compute_all_mpi_stats(
@@ -308,15 +292,21 @@ def _compute_all_mpi_stats(
     global_limit: int = 10,
     phase_limit: int = 5,
 ) -> tuple[list[MpiOpSummary], list[list[MpiOpSummary]]]:
-    """Compute global and per-phase MPI stats from cached mpi_ranges()."""
+    """Compute global and per-phase MPI stats via SQL-side aggregation.
+
+    Issues N+1 GROUP BY queries (one global + one per phase) rather than
+    materialising the full MPI event list in Python.  The per-phase queries
+    use the same indexed scan as the global one with a windowing predicate.
+    """
     if not profile.capabilities.has_mpi:
         return [], [[] for _ in phases]
-    all_mpi = profile.mpi_ranges()
-    global_ops = _aggregate_mpi_ops(all_mpi, global_limit)
-    per_phase = []
-    for phase in phases:
-        window = [e for e in all_mpi if e.start_ns >= phase.start_ns and e.end_ns <= phase.end_ns]
-        per_phase.append(_aggregate_mpi_ops(window, phase_limit))
+    global_ops = _mpi_aggs_to_summaries(profile.mpi_op_aggregates(limit=global_limit))
+    per_phase = [
+        _mpi_aggs_to_summaries(
+            profile.mpi_op_aggregates(start_ns=p.start_ns, end_ns=p.end_ns, limit=phase_limit)
+        )
+        for p in phases
+    ]
     return global_ops, per_phase
 
 
@@ -383,9 +373,12 @@ def _window_top_kernels(
     return _aggregate_kernel_summaries(window, total_kernel_s, limit, device_info, launch_overhead)
 
 
-def _window_mpi_ops(evts: list, start_ns: int, end_ns: int, limit: int = 5) -> list[MpiOpSummary]:
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
-    return _aggregate_mpi_ops(window, limit)
+def _window_mpi_ops(
+    profile: Profile, start_ns: int, end_ns: int, limit: int = 5
+) -> list[MpiOpSummary]:
+    return _mpi_aggs_to_summaries(
+        profile.mpi_op_aggregates(start_ns=start_ns, end_ns=end_ns, limit=limit)
+    )
 
 
 def _window_memcpy_by_kind(
@@ -449,27 +442,11 @@ def _window_streams(evts: list[KernelRow], start_ns: int, end_ns: int) -> list[S
 
 
 def _window_marker_ranges(
-    evts: list, start_ns: int, end_ns: int, limit: int = 20
+    profile: Profile, start_ns: int, end_ns: int, limit: int = 20
 ) -> list[MarkerRangeSummary]:
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
-    by_name: dict[str, dict] = {}
-    for e in window:
-        n = e.name
-        if n not in by_name:
-            by_name[n] = {"count": 0, "total_ns": 0}
-        by_name[n]["count"] += 1
-        by_name[n]["total_ns"] += e.duration_ns
-    result = [
-        MarkerRangeSummary(
-            name=n,
-            calls=s["count"],
-            total_s=round(s["total_ns"] / 1e9, 3),
-            avg_ms=round(s["total_ns"] / s["count"] / 1e6, 3),
-        )
-        for n, s in by_name.items()
-    ]
-    result.sort(key=lambda x: x.total_s, reverse=True)
-    return result[:limit]
+    return _marker_aggs_to_summaries(
+        profile.marker_aggregates(start_ns=start_ns, end_ns=end_ns, limit=limit)
+    )
 
 
 def compute_phase_summary(
@@ -489,7 +466,6 @@ def compute_phase_summary(
     """
     all_kernel = profile.kernel_events()
     all_memcpy = profile.memcpy_events()
-    all_mpi = profile.mpi_ranges()
 
     kernel_s = _window_kernel_time(all_kernel, phase.start_ns, phase.end_ns)
     memcpy_s = _window_memcpy_time(all_memcpy, phase.start_ns, phase.end_ns)
@@ -498,7 +474,7 @@ def compute_phase_summary(
     start_s = (phase.start_ns - profile_start_ns) / 1e9
 
     if mpi_ops is None:
-        mpi_ops = _window_mpi_ops(all_mpi, phase.start_ns, phase.end_ns)
+        mpi_ops = _window_mpi_ops(profile, phase.start_ns, phase.end_ns)
 
     return PhaseSummary(
         name=phase.name,

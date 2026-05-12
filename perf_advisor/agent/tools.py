@@ -138,7 +138,7 @@ def tool_mpi_summary(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ops = _window_mpi_ops(profile.mpi_ranges(), int(start_ns), int(end_ns))
+        ops = _window_mpi_ops(profile, int(start_ns), int(end_ns))
     else:
         ops = compute_mpi_ops(profile)
     return {"mpi_present": profile.capabilities.has_mpi, "ops": [o.model_dump() for o in ops]}
@@ -150,9 +150,7 @@ def tool_marker_ranges(profile: Profile, args: dict[str, Any]) -> dict:
     start_ns = args.get("start_ns")
     end_ns = args.get("end_ns")
     if start_ns is not None and end_ns is not None:
-        ranges = _window_marker_ranges(
-            profile.marker_ranges(), int(start_ns), int(end_ns), limit=limit
-        )
+        ranges = _window_marker_ranges(profile, int(start_ns), int(end_ns), limit=limit)
     else:
         ranges = compute_marker_ranges(profile, limit=limit)
     return {
