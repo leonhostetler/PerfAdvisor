@@ -6,9 +6,12 @@ CLAUDE.md
 done.md
 notes/
 paper/
+poster/
 run_books/
 *_synthetic_bench/
+*_hip_bench/
 *_AB_tests/
+*_ABcarveout_tests/
 changelog.txt
 todo_list.md
 
@@ -34,7 +37,8 @@ build/
 # Profile exports and agent output logs
 *.sqlite
 *_log.txt
-bench/profiles/
+bench/cuda/profiles/
+bench/hip/profiles/
 eval_*_transcript.txt
 eval_*.json
 

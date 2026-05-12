@@ -1,9 +1,10 @@
-"""CLI entry point: python -m perf_advisor analyze <profile.sqlite>"""
+"""CLI entry point: python -m perf_advisor analyze <profile>"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -19,11 +20,44 @@ from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
 
 console = Console(record=True)
 
+
+def _print_capability_notes(fmt, caps) -> None:
+    from perf_advisor.analysis.diagnostics import capability_notes
+
+    for note in capability_notes(fmt, caps):
+        console.print(f"[cyan]ℹ[/cyan] {note.message}", highlight=False)
+
+
+def _warn_wal_truncation(profile, path: str) -> None:
+    """Warn if a rocpd profile has a stale WAL or journal file (interrupted writer)."""
+    emp = getattr(profile, "emptiness", None)
+    if emp is None or not emp.writer_truncation_suspected:
+        return
+    console.print(
+        f"[yellow]Warning:[/yellow] A WAL or journal file exists alongside "
+        f"{Path(path).name!r} — the rocpd writer may have been interrupted. "
+        "Profile data may be incomplete.",
+        highlight=False,
+    )
+
+
+def _abort_if_empty(profile, path: str) -> None:
+    """Exit with an error if the profile contains no kernel events."""
+    if not profile.capabilities.has_kernels:
+        console.print(
+            f"[red]Error:[/red] No kernel events found in {Path(path).name!r}. "
+            "The profile appears empty or was truncated before kernel data was written. "
+            "Re-capture with kernel tracing enabled and ensure the application ran GPU kernels.",
+            highlight=False,
+        )
+        sys.exit(1)
+
+
 _PHASE_WARNING = (
     "[orange1]Warning: automated phase detection has no semantic understanding of the "
     "application and can produce logically incorrect segmentations. Cross-reference results "
-    "against your knowledge of the application's natural compute stages and the Nsight Systems "
-    "GUI timeline; adjust --max-phases if the segmentation does not match expectations.[/orange1]"
+    "against your knowledge of the application's natural compute stages and the profiler GUI "
+    "timeline; adjust --max-phases if the segmentation does not match expectations.[/orange1]"
 )
 
 
@@ -134,6 +168,31 @@ def _print_cross_rank_tables(cross_rank_summary) -> None:
         )
 
 
+def _process_rank(args_tuple: tuple) -> tuple:
+    """Worker function for parallel per-rank phase detection (ProcessPoolExecutor).
+
+    Must be module-level so pickle can find it. Opens its own SQLite connection
+    because connections cannot cross process boundaries.
+
+    Args: (rid, path, max_phases, verbose, rank)
+    Returns: (rid, summary, phase_state, selected_k, cost_curve, rank_timings)
+    """
+    rid, path, max_phases, verbose, rank = args_tuple
+    from perf_advisor.analysis.metrics import compute_profile_summary_and_state
+    from perf_advisor.ingestion import open_profile
+
+    rank_timings: dict[str, float] = {}
+    with open_profile(path) as _prof:
+        summary, phase_state, selected_k, cost_curve = compute_profile_summary_and_state(
+            _prof,
+            max_phases=max_phases,
+            timings=rank_timings,
+            verbose=verbose,
+            rank=rank,
+        )
+    return rid, summary, phase_state, selected_k, cost_curve, rank_timings
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     from perf_advisor.agent.loop import (
         _build_system_prompt,
@@ -152,7 +211,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     )
     from perf_advisor.agent.tools import tool_schemas
     from perf_advisor.analysis.metrics import compute_profile_summary
-    from perf_advisor.ingestion.profile import NsysProfile
+    from perf_advisor.ingestion import Format, open_profile
 
     # Resolve provider early so we can fail fast before any expensive work.
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
@@ -197,7 +256,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             select_consensus_k,
             select_primary_rank,
         )
-        from perf_advisor.analysis.phases import compute_phase_cost_curve
+        from perf_advisor.analysis.metrics import compute_profile_summary_and_state
 
         profile_paths = [_Path(p) for p in args.profile]
         rank_ids, parsed_ok = parse_rank_ids(profile_paths)
@@ -210,24 +269,89 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         rank_id_to_path = dict(zip(rank_ids, profile_paths))
 
+        # Reject mixed-format directories before any heavy work.
+        _rank_formats: dict[int, Format] = {}
+        _first_caps = None
+        for _rid, _path in sorted(rank_id_to_path.items()):
+            with open_profile(_path) as _p:
+                _rank_formats[_rid] = _p.format
+                if _first_caps is None:
+                    _first_caps = _p.capabilities
+                _warn_wal_truncation(_p, str(_path))
+                _abort_if_empty(_p, str(_path))
+        _unique_formats = set(_rank_formats.values())
+        if len(_unique_formats) > 1:
+            _fmt_strs = ", ".join(
+                f"rank {r}: {_rank_formats[r].value}" for r in sorted(_rank_formats)
+            )
+            console.print(
+                Panel(
+                    f"[red]Mixed-format profiles are not supported in multi-rank mode "
+                    f"({_fmt_strs}). All profiles in the same run must use the same "
+                    f"profiler. Re-capture all ranks with the same tool.[/red]",
+                    title="[red]Error: Mixed Profile Formats[/red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+
         if not args.quiet:
             console.print(
                 f"  Multi-rank mode: {len(profile_paths)} profiles, rank IDs {sorted(rank_ids)}"
             )
+            if _first_caps is not None:
+                _print_capability_notes(next(iter(_unique_formats)), _first_caps)
 
         if args.verbose:
             print("[phase] Rank → file mapping:")
             for rid, path in sorted(rank_id_to_path.items()):
                 print(f"         rank={rid}  {path}")
 
-        # Pass 1 — lightweight cost-curve extraction for consensus k selection
+        # Single pass: compute full summaries and cache phase state per rank.
+        _phase_states: dict = {}
         _cost_curves: dict[int, dict[int, float]] = {}
         _selected_ks: dict[int, int] = {}
-        for rid, path in sorted(rank_id_to_path.items()):
-            with NsysProfile(path) as _prof:
-                _selected_ks[rid], _cost_curves[rid] = compute_phase_cost_curve(
-                    _prof, max_phases=args.max_phases, rank=rid
+        timings: dict[str, float] = {}
+        summaries: dict = {}
+
+        _n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+        _n_workers = min(_n_workers, len(rank_id_to_path))
+
+        if _n_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor
+
+            if args.verbose:
+                console.print(
+                    f"[dim]  (--workers {_n_workers}: parallel phase detection;"
+                    " per-rank verbose output suppressed)[/dim]"
                 )
+            _worker_args = [
+                (rid, path, args.max_phases, False, rid)
+                for rid, path in sorted(rank_id_to_path.items())
+            ]
+            with ProcessPoolExecutor(max_workers=_n_workers) as _pool:
+                for _rid, _sm, _ps, _sk, _cc, _rt in _pool.map(_process_rank, _worker_args):
+                    summaries[_rid] = _sm
+                    _phase_states[_rid] = _ps
+                    _selected_ks[_rid] = _sk
+                    _cost_curves[_rid] = _cc
+                    for k, v in _rt.items():
+                        timings[k] = timings.get(k, 0.0) + v
+        else:
+            for rid, path in sorted(rank_id_to_path.items()):
+                _rank_timings: dict[str, float] = {}
+                with open_profile(path) as _prof:
+                    summaries[rid], _phase_states[rid], _selected_ks[rid], _cost_curves[rid] = (
+                        compute_profile_summary_and_state(
+                            _prof,
+                            max_phases=args.max_phases,
+                            timings=_rank_timings,
+                            verbose=args.verbose,
+                            rank=rid,
+                        )
+                    )
+                for k, v in _rank_timings.items():
+                    timings[k] = timings.get(k, 0.0) + v
 
         _consensus_k, _consensus_abort = select_consensus_k(
             _cost_curves, _selected_ks, args.max_phases, verbose=args.verbose
@@ -236,25 +360,27 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         if not args.quiet and _consensus_abort is None and len(set(_selected_ks.values())) > 1:
             _ks_str = ", ".join(f"rank {r}: k={_selected_ks[r]}" for r in sorted(_selected_ks))
             console.print(
-                f"  Phase consensus: k={_consensus_k} (per-rank selections differed — {_ks_str})"
+                f"  Phase consensus: k={_consensus_k}"
+                f" (per-rank selections differed — {_ks_str})"
             )
 
-        # Pass 2 — full pipeline; forced_k=None if consensus aborted (each rank uses its elbow)
-        timings: dict[str, float] = {}
-        summaries: dict = {}
-        for rid, path in sorted(rank_id_to_path.items()):
-            _rank_timings: dict[str, float] = {}
-            with NsysProfile(path) as _prof:
-                summaries[rid] = compute_profile_summary(
-                    _prof,
-                    max_phases=args.max_phases,
-                    forced_k=_consensus_k,
-                    timings=_rank_timings,
-                    verbose=args.verbose,
-                    rank=rid,
-                )
-            for k, v in _rank_timings.items():
-                timings[k] = timings.get(k, 0.0) + v
+        # Re-run only ranks whose per-rank k differs from consensus (rare).
+        if _consensus_k is not None:
+            for rid, path in sorted(rank_id_to_path.items()):
+                if _selected_ks[rid] != _consensus_k:
+                    _rank_timings = {}
+                    with open_profile(path) as _prof:
+                        summaries[rid] = compute_profile_summary(
+                            _prof,
+                            max_phases=args.max_phases,
+                            forced_k=_consensus_k,
+                            timings=_rank_timings,
+                            verbose=args.verbose,
+                            rank=rid,
+                            _phase_state=_phase_states[rid],
+                        )
+                    for k, v in _rank_timings.items():
+                        timings[k] = timings.get(k, 0.0) + v
 
         # Primary rank selection
         if args.primary_rank is not None:
@@ -322,7 +448,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         # Single-rank path (original behaviour)
         primary_profile = args.profile[0]
         timings = {}
-        with NsysProfile(primary_profile) as profile:
+        with open_profile(primary_profile) as profile:
+            _warn_wal_truncation(profile, primary_profile)
+            _abort_if_empty(profile, primary_profile)
+            if not args.quiet:
+                _print_capability_notes(profile.format, profile.capabilities)
             summary = compute_profile_summary(
                 profile,
                 max_phases=args.max_phases,
@@ -373,9 +503,14 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         console.print("[bold]── End ProfileSummary ──[/bold]\n")
 
     # Pre-flight token estimate
+    with open_profile(primary_profile) as _pf:
+        _primary_format = _pf.format
+        _primary_caps = _pf.capabilities
     _system_prompt = _build_system_prompt(
         grounded=not args.allow_app_knowledge,
         device_info=summary.device_info,
+        profile_format=_primary_format,
+        capabilities=_primary_caps,
     )
     _summary_json = summary.model_dump_json(indent=2)
     _schemas = tool_schemas()
@@ -663,7 +798,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             console.print(f"  Transcript: {_transcript_path}")
 
 
-def _print_phase_table(summary, title: str, max_phases: int = 10) -> None:
+def _print_phase_table(
+    summary, title: str, max_phases: int = 10, show_warning: bool = True
+) -> None:
     """Print a phases table for one profile, or a note if no phases were detected."""
     if not summary.phases:
         console.print(f"[dim]{title}: no phases detected[/dim]")
@@ -691,7 +828,7 @@ def _print_phase_table(summary, title: str, max_phases: int = 10) -> None:
             top_kernel,
         )
     console.print(ph)
-    if max_phases > 1:
+    if show_warning and max_phases > 1:
         console.print(_PHASE_WARNING)
 
 
@@ -709,7 +846,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     )
     from perf_advisor.analysis.diff import compute_profile_diff
     from perf_advisor.analysis.metrics import compute_profile_summary
-    from perf_advisor.ingestion.profile import NsysProfile
+    from perf_advisor.ingestion import open_profile
 
     resolved_provider, resolved_model, reason = _parse_provider_and_model(args.model)
 
@@ -736,10 +873,27 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 f"[yellow]Warning:[/yellow] {p} provider unavailable ({hint})", highlight=False
             )
 
-    with NsysProfile(args.profile_a) as pa:
+    with open_profile(args.profile_a) as pa:
+        _warn_wal_truncation(pa, args.profile_a)
+        _abort_if_empty(pa, args.profile_a)
+        if not args.quiet:
+            _print_capability_notes(pa.format, pa.capabilities)
+        _fmt_a = pa.format
         summary_a = compute_profile_summary(pa, max_phases=args.max_phases)
-    with NsysProfile(args.profile_b) as pb:
+    with open_profile(args.profile_b) as pb:
+        _warn_wal_truncation(pb, args.profile_b)
+        _abort_if_empty(pb, args.profile_b)
+        if not args.quiet:
+            _print_capability_notes(pb.format, pb.capabilities)
+        _fmt_b = pb.format
         summary_b = compute_profile_summary(pb, max_phases=args.max_phases)
+    if _fmt_a != _fmt_b:
+        console.print(
+            f"[red]Error:[/red] Mixed-format comparison is not supported "
+            f"({_fmt_a.value} vs {_fmt_b.value}). "
+            "Both profiles must use the same format."
+        )
+        sys.exit(1)
 
     # Always print both phase tables first
     if not args.quiet:
@@ -747,7 +901,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"\n  Profile A: [cyan]{Path(args.profile_a).name}[/cyan]"
             f"\n  Profile B: [cyan]{Path(args.profile_b).name}[/cyan]"
         )
-    _print_phase_table(summary_a, f"Phases — {Path(args.profile_a).name}", args.max_phases)
+    _print_phase_table(
+        summary_a, f"Phases — {Path(args.profile_a).name}", args.max_phases, show_warning=False
+    )
     _print_phase_table(summary_b, f"Phases — {Path(args.profile_b).name}", args.max_phases)
 
     # Compute diff — also determines comparison_mode
@@ -938,9 +1094,13 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
 def cmd_summary(args: argparse.Namespace) -> None:
     from perf_advisor.analysis.metrics import compute_profile_summary
-    from perf_advisor.ingestion.profile import NsysProfile
+    from perf_advisor.ingestion import open_profile
 
-    with NsysProfile(args.profile) as profile:
+    with open_profile(args.profile) as profile:
+        _warn_wal_truncation(profile, args.profile)
+        _abort_if_empty(profile, args.profile)
+        if not args.json:
+            _print_capability_notes(profile.format, profile.capabilities)
         summary = compute_profile_summary(profile, max_phases=args.max_phases, verbose=args.verbose)
 
     if args.json:
@@ -1016,7 +1176,8 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
         save_results,
     )
     from perf_advisor.eval.scorer import RunScore, score_run
-    from perf_advisor.ingestion.profile import NsysProfile
+    from perf_advisor.ingestion import Format as _Format
+    from perf_advisor.ingestion import open_profile
 
     _start_time = datetime.now()
     _ts = _start_time.strftime("%Y%m%d_%H%M%S")
@@ -1205,35 +1366,79 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                     select_consensus_k,
                     select_primary_rank,
                 )
-                from perf_advisor.analysis.phases import compute_phase_cost_curve
+                from perf_advisor.analysis.metrics import compute_profile_summary_and_state
 
                 profile_paths = run_cfg.sqlite_paths
                 rank_ids, _ = parse_rank_ids(profile_paths)
                 rank_id_to_path = dict(zip(rank_ids, profile_paths))
 
-                # Pass 1 — cost curves for consensus k
+                # Reject mixed-format runs early.
+                _eval_rank_formats: dict[int, _Format] = {}
+                for _rid2, _path2 in sorted(rank_id_to_path.items()):
+                    with open_profile(_path2) as _p2:
+                        _eval_rank_formats[_rid2] = _p2.format
+                if len(set(_eval_rank_formats.values())) > 1:
+                    _fmt_strs2 = ", ".join(
+                        f"rank {r}: {_eval_rank_formats[r].value}"
+                        for r in sorted(_eval_rank_formats)
+                    )
+                    raise ValueError(
+                        f"Mixed-format profiles in run {run_cfg.run_id} ({_fmt_strs2}). "
+                        "All profiles in the same run must use the same profiler."
+                    )
+
+                # Single pass: compute full summaries and cache phase state per rank.
+                _eval_phase_states: dict = {}
                 _eval_cost_curves: dict[int, dict[int, float]] = {}
                 _eval_selected_ks: dict[int, int] = {}
-                for rid, path in sorted(rank_id_to_path.items()):
-                    with NsysProfile(path) as _prof:
-                        _eval_selected_ks[rid], _eval_cost_curves[rid] = compute_phase_cost_curve(
-                            _prof, max_phases=args.max_phases
-                        )
+                summaries: dict = {}
+
+                _eval_n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+                _eval_n_workers = min(_eval_n_workers, len(rank_id_to_path))
+
+                if _eval_n_workers > 1:
+                    from concurrent.futures import ProcessPoolExecutor as _ProcPool
+
+                    _eval_worker_args = [
+                        (rid, path, args.max_phases, False, rid)
+                        for rid, path in sorted(rank_id_to_path.items())
+                    ]
+                    with _ProcPool(max_workers=_eval_n_workers) as _pool:
+                        for _rid, _sm, _ps, _sk, _cc, _ in _pool.map(
+                            _process_rank, _eval_worker_args
+                        ):
+                            summaries[_rid] = _sm
+                            _eval_phase_states[_rid] = _ps
+                            _eval_selected_ks[_rid] = _sk
+                            _eval_cost_curves[_rid] = _cc
+                else:
+                    for rid, path in sorted(rank_id_to_path.items()):
+                        with open_profile(path) as _prof:
+                            (
+                                summaries[rid],
+                                _eval_phase_states[rid],
+                                _eval_selected_ks[rid],
+                                _eval_cost_curves[rid],
+                            ) = compute_profile_summary_and_state(
+                                _prof, max_phases=args.max_phases, verbose=False,
+                            )
 
                 _eval_consensus_k, _eval_consensus_abort = select_consensus_k(
                     _eval_cost_curves, _eval_selected_ks, args.max_phases
                 )
 
-                # Pass 2 — full pipeline
-                summaries: dict = {}
-                for rid, path in sorted(rank_id_to_path.items()):
-                    with NsysProfile(path) as _prof:
-                        summaries[rid] = compute_profile_summary(
-                            _prof,
-                            max_phases=args.max_phases,
-                            forced_k=_eval_consensus_k,
-                            verbose=False,
-                        )
+                # Re-run only ranks whose per-rank k differs from consensus (rare).
+                if _eval_consensus_k is not None:
+                    for rid, path in sorted(rank_id_to_path.items()):
+                        if _eval_selected_ks[rid] != _eval_consensus_k:
+                            with open_profile(path) as _prof:
+                                summaries[rid] = compute_profile_summary(
+                                    _prof,
+                                    max_phases=args.max_phases,
+                                    forced_k=_eval_consensus_k,
+                                    verbose=False,
+                                    _phase_state=_eval_phase_states[rid],
+                                )
 
                 primary_rank_id, _ = select_primary_rank(summaries)
                 primary_profile = str(rank_id_to_path[primary_rank_id])
@@ -1266,7 +1471,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             else:
                 primary_profile = str(run_cfg.sqlite_paths[0])
                 cross_rank_summary = None
-                with NsysProfile(primary_profile) as _prof:
+                with open_profile(primary_profile) as _prof:
                     summary = compute_profile_summary(
                         _prof,
                         max_phases=args.max_phases,
@@ -1390,8 +1595,8 @@ def main() -> None:
         help="Run agent hypothesis generation on a profile",
         description=(
             "Run agent hypothesis generation on a profile. "
-            "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
-            "configured LLM API provider. "
+            "Profile data (kernel names, marker annotations (NVTX or rocTX), timing metrics) "
+            "is sent to the configured LLM API provider. "
             "Only analyze profiles from trusted sources — profile data is inserted verbatim "
             "into the LLM prompt and could contain instruction-like text. "
             "See README § Risks for details."
@@ -1401,8 +1606,8 @@ def main() -> None:
         "profile",
         nargs="+",
         help=(
-            "Path(s) to .sqlite profile(s). Pass multiple files (or a shell glob) "
-            "to enable multi-rank analysis."
+            "Path(s) to GPU profile(s) (.sqlite for Nsight Systems or rocpd). "
+            "Pass multiple files (or a shell glob) to enable multi-rank analysis."
         ),
     )
     p_analyze.add_argument("--json", action="store_true", help="Output raw JSON")
@@ -1425,6 +1630,18 @@ def main() -> None:
             "Multi-rank mode: use rank N as the primary rank for detailed analysis "
             "(N is the parsed rank ID from the filename, not the file index). "
             "By default the outlier rank (highest GPU idle time) is selected automatically."
+        ),
+    )
+    p_analyze.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel worker processes for Stage 1 (phase detection + metrics) "
+            "in multi-rank mode (default: 1 — serial). Set to 0 to use all available CPU "
+            "cores. Has no effect when analyzing a single profile. "
+            "Verbose phase output (--verbose) is suppressed inside workers."
         ),
     )
     p_analyze.add_argument(
@@ -1500,15 +1717,15 @@ def main() -> None:
         help="Compare two profiles and summarize differences",
         description=(
             "Compare two profiles and summarize differences. "
-            "Profile data (kernel names, NVTX annotations, timing metrics) is sent to the "
-            "configured LLM API provider. "
+            "Profile data (kernel names, marker annotations (NVTX or rocTX), timing metrics) "
+            "is sent to the configured LLM API provider. "
             "Only analyze profiles from trusted sources — profile data is inserted verbatim "
             "into the LLM prompt and could contain instruction-like text. "
             "See README § Risks for details."
         ),
     )
-    p_compare.add_argument("profile_a", help="Path to first .sqlite profile")
-    p_compare.add_argument("profile_b", help="Path to second .sqlite profile")
+    p_compare.add_argument("profile_a", help="Path to first GPU profile (.sqlite)")
+    p_compare.add_argument("profile_b", help="Path to second GPU profile (.sqlite)")
     p_compare.add_argument("--json", action="store_true", help="Output raw JSON")
     p_compare.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     p_compare.add_argument(
@@ -1630,6 +1847,16 @@ def main() -> None:
         help="Max execution phases to detect per profile (default: 10).",
     )
     p_evaluate.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel worker processes for per-rank Stage 1 in multi-rank runs "
+            "(default: 1 — serial). Set to 0 to use all available CPU cores."
+        ),
+    )
+    p_evaluate.add_argument(
         "--output",
         metavar="PATH",
         default=None,
@@ -1701,7 +1928,7 @@ def main() -> None:
     )
 
     p_summary = sub.add_parser("summary", help="Print structured metrics summary")
-    p_summary.add_argument("profile", help="Path to .sqlite profile")
+    p_summary.add_argument("profile", help="Path to GPU profile (.sqlite)")
     p_summary.add_argument("--json", action="store_true", help="Output raw JSON")
     p_summary.add_argument(
         "--verbose", action="store_true", help="Print phase detection debug output"

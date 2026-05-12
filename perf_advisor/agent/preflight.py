@@ -1,4 +1,4 @@
-"""Pre-flight token estimation helpers for analyze and compare."""
+"""Pre-flight checks and token estimation helpers for analyze and compare."""
 
 from __future__ import annotations
 
@@ -154,3 +154,4 @@ def estimate_cache_breakdown(
         "input": 0,
         "cost_equivalent": cost_equivalent,
     }
+

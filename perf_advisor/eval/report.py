@@ -36,8 +36,12 @@ def print_summary_table(results: list[RunScore], console: Console) -> None:
             )
             continue
 
-        det_str = "[green]✓[/green]" if r.bottleneck_detected else "[red]✗[/red]"
-        match_str = r.match_type or "—"
+        if r.is_optimal_path:
+            det_str = "[dim]—[/dim]"   # no bottleneck expected; excluded from accuracy
+            match_str = "[dim]opt[/dim]"
+        else:
+            det_str = "[green]✓[/green]" if r.bottleneck_detected else "[red]✗[/red]"
+            match_str = r.match_type or "—"
 
         if r.suggestion_scores:
             valid = [s for s in r.suggestion_scores if s.score >= 0]
@@ -65,20 +69,25 @@ def print_summary_table(results: list[RunScore], console: Console) -> None:
 
     console.print(t)
 
-    # Aggregate stats (errors excluded)
+    # Aggregate stats (errors and optimal-path runs excluded from accuracy tallies)
     completed = [r for r in results if not r.error]
     errors = [r for r in results if r.error]
     if not completed:
         return
 
-    n_detected = sum(1 for r in completed if r.bottleneck_detected)
-    all_sugg = [s for r in completed for s in r.suggestion_scores if s.score >= 0]
-    total_fp = sum(r.false_positive_count for r in completed)
+    scorable = [r for r in completed if not r.is_optimal_path]
+    n_detected = sum(1 for r in scorable if r.bottleneck_detected)
+    all_sugg = [s for r in scorable for s in r.suggestion_scores if s.score >= 0]
+    total_fp = sum(r.false_positive_count for r in scorable)
+    n_optimal = len(completed) - len(scorable)
 
+    det_denom = len(scorable)
+    det_pct = f"({100 * n_detected / det_denom:.0f}%)" if det_denom else "(n/a)"
+    opt_note = f"  [dim](+{n_optimal} optimal-path run(s) excluded)[/dim]" if n_optimal else ""
     console.print(
         f"\n  Detection accuracy:  "
-        f"[bold]{n_detected} / {len(completed)}[/bold]"
-        f"  ({100 * n_detected / len(completed):.0f}%)"
+        f"[bold]{n_detected} / {det_denom}[/bold]"
+        f"  {det_pct}{opt_note}"
     )
     if all_sugg:
         raw_total = sum(s.score for s in all_sugg)
@@ -90,7 +99,7 @@ def print_summary_table(results: list[RunScore], console: Console) -> None:
         )
     else:
         console.print("  Suggestion coverage: [dim]—  (judge skipped)[/dim]")
-    console.print(f"  False positives:     [bold]{total_fp}[/bold] total")
+    console.print(f"  False positives:     [bold]{total_fp}[/bold] total (scorable runs only)")
     if errors:
         console.print(f"  [red]Errors:              {len(errors)} run(s) failed[/red]")
 

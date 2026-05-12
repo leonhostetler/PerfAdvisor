@@ -25,13 +25,16 @@ Cross-rank analysis is part of Stage 1 (local, no LLM). It runs between per-rank
 `ProfileSummary` computation and Stage 2 pre-seeding. See [pipeline.md](pipeline.md) for the
 full pipeline diagram.
 
-The path is activated whenever `analyze` receives more than one `.sqlite` file:
+The path is activated whenever `analyze` receives more than one `.sqlite` (or `.db` / `.rocpd`) file:
 
 ```
-python -m perf_advisor analyze rank*.sqlite
+python -m perf_advisor analyze rank*.sqlite        # Nsight Systems per-rank exports
+python -m perf_advisor analyze rank_*.db           # rocpd per-rank files
 # or equivalently
 python -m perf_advisor analyze rank0.sqlite rank1.sqlite rank2.sqlite ...
 ```
+
+**Note for AMD rocpd profiles:** `rocprofv3` does not intercept MPI, so `mpi_wait_s`, the MPI Wait column, and the Top Collective Imbalance column will all be empty for rocpd profiles captured with `rocprofv3 --sys-trace`. Phase detection and GPU-kernel imbalance analysis remain fully functional. For cross-rank MPI imbalance analysis on AMD hardware, capture with `rocprof-sys` (`ROCPROFSYS_USE_MPI=true`) instead — that tool injects an MPIP wrapper and writes MPI ranges to `rocpd_region` under the `MPI` category.
 
 ---
 

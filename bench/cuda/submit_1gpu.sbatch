@@ -27,7 +27,7 @@ PROFILES="${BENCH_DIR}/profiles/1gpu"
 mkdir -p "${PROFILES}"
 
 [[ -x "${BIN}" ]] || { echo "ERROR: binary not found: ${BIN}" >&2
-                        echo "       Run bench/build.sh first." >&2; exit 1; }
+                        echo "       Run build.sh first." >&2; exit 1; }
 
 echo ""
 echo "Binary:   ${BIN}"
