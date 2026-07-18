@@ -256,12 +256,20 @@ def _judge_openai(prompt: str, model: str) -> dict[str, Any]:
     import openai
 
     client = openai.OpenAI()
-    resp = client.chat.completions.create(
+    # Responses API: gpt-5.x / o-series reasoning models need room for reasoning
+    # tokens before the JSON answer, so give them a much larger output budget
+    # than the small non-reasoning cap.
+    reasoning = model.lower().startswith(("gpt-5", "o1", "o3", "o4"))
+    kwargs: dict[str, Any] = dict(
         model=model,
-        max_tokens=256,
-        messages=[{"role": "user", "content": prompt}],
+        instructions="Respond only with the requested JSON. No prose, no markdown fences.",
+        input=prompt,
+        max_output_tokens=4096 if reasoning else 256,
     )
-    return json.loads(_strip_fences(resp.choices[0].message.content))
+    if reasoning:
+        kwargs["reasoning"] = {"effort": "medium"}
+    resp = client.responses.create(**kwargs)
+    return json.loads(_strip_fences(resp.output_text or ""))
 
 
 @dataclass

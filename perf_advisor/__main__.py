@@ -1659,10 +1659,10 @@ def main() -> None:
         default=None,
         help=(
             "Model for hypothesis generation. Examples: "
-            "'openai:gpt-4o' (provider prefix + model), "
+            "'openai:gpt-5.6' (provider prefix + model), "
             "'openai' (provider only, uses default model), "
             "'claude-haiku-4-5-20251001' (model only, provider auto-detected). "
-            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai), gemini-2.5-flash (gemini)."
+            "Defaults: claude-opus-4-8 (anthropic), gpt-5.6 (openai), gemini-3.5-flash (gemini)."
         ),
     )
     p_analyze.add_argument(
@@ -1742,7 +1742,7 @@ def main() -> None:
         default=None,
         help=(
             "Model for comparison. Same format as analyze --model: "
-            "'openai:gpt-4o', 'openai', or a bare model ID."
+            "'openai:gpt-5.6', 'openai', or a bare model ID."
         ),
     )
     p_compare.add_argument(
@@ -1822,7 +1822,7 @@ def main() -> None:
         default=None,
         help=(
             "Model for hypothesis generation. Same format as 'analyze --model'. "
-            "Defaults: claude-opus-4-6 (anthropic), gpt-4o (openai)."
+            "Defaults: claude-opus-4-8 (anthropic), gpt-5.6 (openai)."
         ),
     )
     p_evaluate.add_argument(

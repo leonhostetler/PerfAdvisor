@@ -156,40 +156,34 @@ def _call_anthropic(prompt: str, model: str, system_prompt: str) -> tuple[str, i
     return text, response.usage.input_tokens, response.usage.output_tokens
 
 
+def _openai_is_reasoning_model(model: str) -> bool:
+    """True for OpenAI reasoning models (gpt-5.x, o-series) that accept the
+    Responses `reasoning` parameter; older chat models reject it."""
+    m = model.lower()
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
 def _call_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
     try:
         from openai import OpenAI
     except ImportError:
         raise ImportError("openai package required: pip install openai")
     client = OpenAI()
-    # Try max_tokens first; fall back to max_completion_tokens for newer models
-    _limit_param = "max_tokens"
-
-    def _create() -> Any:
-        nonlocal _limit_param
-        from openai import BadRequestError
-
-        kwargs: dict[str, Any] = dict(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            **{_limit_param: 4096},
-        )
-        try:
-            return client.chat.completions.create(**kwargs)
-        except BadRequestError as e:
-            if _limit_param == "max_tokens" and "max_completion_tokens" in str(e):
-                _limit_param = "max_completion_tokens"
-                kwargs[_limit_param] = kwargs.pop("max_tokens")
-                return client.chat.completions.create(**kwargs)
-            raise
-
-    response = _create()
-    text = response.choices[0].message.content or ""
-    inp = response.usage.prompt_tokens if response.usage else 0
-    out = response.usage.completion_tokens if response.usage else 0
+    # Responses API: required so gpt-5.x reasoning models work (and reasoning
+    # tokens count against the output budget, hence the larger cap for them).
+    reasoning = _openai_is_reasoning_model(model)
+    kwargs: dict[str, Any] = dict(
+        model=model,
+        instructions=system_prompt,
+        input=prompt,
+        max_output_tokens=8192 if reasoning else 4096,
+    )
+    if reasoning:
+        kwargs["reasoning"] = {"effort": "medium"}
+    response = client.responses.create(**kwargs)
+    text = response.output_text or ""
+    inp = response.usage.input_tokens if response.usage else 0
+    out = response.usage.output_tokens if response.usage else 0
     return text, inp, out
 
 

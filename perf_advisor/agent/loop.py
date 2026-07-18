@@ -3,18 +3,20 @@
 Three backends are supported:
   - anthropic (default when ANTHROPIC_API_KEY is set): multi-turn tool-use loop
     via the Anthropic SDK. Supports pre-seeding to skip 2 round-trips.
-  - openai (when OPENAI_API_KEY is set): OpenAI function-calling format.
-    Uses the same tool schemas, translated to OpenAI's "type":"function" wrapper.
+  - openai (when OPENAI_API_KEY is set): OpenAI Responses API tool-use loop.
+    Uses the same tool schemas (translated to the Responses function-tool
+    format) and enables reasoning for gpt-5.x / o-series models — which is why
+    the Responses API is required (Chat Completions rejects reasoning + tools).
   - gemini (when GOOGLE_API_KEY is set): Google GenerativeAI function declarations.
     Summary is injected into the initial message rather than pre-seeded.
   - claude_code (fallback): pre-computes the full ProfileSummary and sends it to
     `claude -p` via subprocess. No API key required.
 
 Select a provider via --model:
-  openai:gpt-4o          (provider prefix + model)
+  openai:gpt-5.6         (provider prefix + model)
   openai                 (provider only, uses default model)
-  gemini:gemini-2.5-flash
-  anthropic:claude-opus-4-6
+  gemini:gemini-3.5-flash
+  anthropic:claude-opus-4-8
 
 LLM interaction logging (opt-in via --log / --log-file):
   {profile_stem}_{timestamp}_log.txt
@@ -37,13 +39,13 @@ from perf_advisor.analysis.models import DeviceInfo, ProfileSummary
 from perf_advisor.ingestion import open_profile
 from perf_advisor.ingestion.base import Format, Profile, ProfileCapabilities
 
-MODEL = "claude-opus-4-6"
+MODEL = "claude-opus-4-8"
 
 _DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": "claude-opus-4-6",
-    "openai": "gpt-4o",
-    "gemini": "gemini-2.5-flash",
-    "claude_code": "claude-opus-4-6",
+    "anthropic": "claude-opus-4-8",
+    "openai": "gpt-5.6",
+    "gemini": "gemini-3.5-flash",
+    "claude_code": "claude-opus-4-8",
 }
 MAX_TURNS = 20
 # Inject a wrap-up warning this many turns before the limit so the model has
@@ -439,13 +441,13 @@ def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
     """Resolve (provider, model_id, reason) from the --model string.
 
     Model strings may carry a provider prefix or be a bare provider name:
-      "openai:gpt-4o"     → provider=openai,   model=gpt-4o
+      "openai:gpt-5.6"    → provider=openai,   model=gpt-5.6
       "openai"            → provider=openai,   model=<default>
-      "claude-opus-4-6"   → provider auto-detected from env vars
+      "claude-opus-4-8"   → provider auto-detected from env vars
       None                → provider auto-detected from env vars
 
     Resolution order:
-      1. Provider prefix in model string (e.g. "openai:gpt-4o")
+      1. Provider prefix in model string (e.g. "openai:gpt-5.6")
       2. Bare provider name in model string (e.g. "openai")
       3. Auto-detect from available API keys (ANTHROPIC > OPENAI > GOOGLE)
       4. Fall back to claude_code subprocess
@@ -485,18 +487,29 @@ def _parse_provider_and_model(model: str | None) -> tuple[str, str, str]:
 
 
 def _schemas_to_openai(schemas: list[dict]) -> list[dict]:
-    """Wrap Anthropic tool schemas in OpenAI's {"type":"function","function":{...}} envelope."""
+    """Convert Anthropic tool schemas to OpenAI Responses-API function-tool format.
+
+    Responses-API function tools are flat (name/description/parameters live
+    alongside ``type``), unlike Chat Completions which nests them under a
+    ``function`` key.
+    """
     return [
         {
             "type": "function",
-            "function": {
-                "name": s["name"],
-                "description": s["description"],
-                "parameters": s["input_schema"],
-            },
+            "name": s["name"],
+            "description": s["description"],
+            "parameters": s["input_schema"],
         }
         for s in schemas
     ]
+
+
+def _is_openai_reasoning_model(model: str) -> bool:
+    """True for OpenAI reasoning models (gpt-5.x, o-series) that accept the
+    ``reasoning`` parameter on the Responses API. Older chat models (gpt-4o,
+    gpt-4.1, …) reject it, so it must be omitted for them."""
+    m = model.lower()
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +836,12 @@ def _preseed_messages_openai(
     summary: ProfileSummary,
     cross_rank_summary=None,
 ) -> list[dict]:
-    """Inject pre-computed profile/phase summaries in OpenAI's tool-call format."""
+    """Inject pre-computed profile/phase summaries as Responses-API input items.
+
+    Seeds the conversation with developer-authored ``function_call`` /
+    ``function_call_output`` pairs so the model sees the summaries as if it had
+    already called those tools — saving 2-3 round-trips.
+    """
     profile_result = json.dumps(
         {
             "format": profile.format.value,
@@ -837,39 +855,29 @@ def _preseed_messages_openai(
     )
     phase_result = json.dumps({"phases": [p.model_dump() for p in summary.phases]})
 
-    tool_calls = [
-        {
-            "id": "pre_1",
-            "type": "function",
-            "function": {"name": "profile_summary", "arguments": "{}"},
-        },
-        {
-            "id": "pre_2",
-            "type": "function",
-            "function": {"name": "phase_summary", "arguments": "{}"},
-        },
-    ]
-    tool_results = [
-        {"role": "tool", "tool_call_id": "pre_1", "content": profile_result},
-        {"role": "tool", "tool_call_id": "pre_2", "content": phase_result},
+    items: list[dict] = [
+        {"role": "user", "content": "Begin analysis."},
+        {"type": "function_call", "call_id": "pre_1", "name": "profile_summary", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "pre_1", "output": profile_result},
+        {"type": "function_call", "call_id": "pre_2", "name": "phase_summary", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "pre_2", "output": phase_result},
     ]
 
     if cross_rank_summary is not None:
         cross_rank_result = json.dumps(cross_rank_summary.model_dump())
-        tool_calls.append(
+        items.append(
             {
-                "id": "pre_3",
-                "type": "function",
-                "function": {"name": "cross_rank_summary", "arguments": "{}"},
+                "type": "function_call",
+                "call_id": "pre_3",
+                "name": "cross_rank_summary",
+                "arguments": "{}",
             }
         )
-        tool_results.append({"role": "tool", "tool_call_id": "pre_3", "content": cross_rank_result})
+        items.append(
+            {"type": "function_call_output", "call_id": "pre_3", "output": cross_rank_result}
+        )
 
-    return [
-        {"role": "user", "content": "Begin analysis."},
-        {"role": "assistant", "content": None, "tool_calls": tool_calls},
-        *tool_results,
-    ]
+    return items
 
 
 def _run_openai(
@@ -897,135 +905,102 @@ def _run_openai(
     client = OpenAI()
     schemas = tool_schemas()
     openai_tools = _schemas_to_openai(schemas)
-    messages: list[dict] = (
+    # Responses-API input items (function_call / function_call_output / message).
+    input_items: list[dict] = (
         _preseed_messages_openai(profile, summary, cross_rank_summary)
         if summary is not None
         else [{"role": "user", "content": "Begin analysis."}]
     )
-    # Prepend system prompt as a system message
+    # The system prompt is delivered via the Responses `instructions` field
+    # rather than as a message item.
     _device_info = summary.device_info if summary is not None else None
-    messages = [
-        {
-            "role": "system",
-            "content": _build_system_prompt(
-                grounded,
-                device_info=_device_info,
-                profile_format=profile.format,
-                capabilities=profile.capabilities,
-            ),
-        }
-    ] + messages
+    system_prompt = _build_system_prompt(
+        grounded,
+        device_info=_device_info,
+        profile_format=profile.format,
+        capabilities=profile.capabilities,
+    )
+    # gpt-5.x / o-series reasoning models accept (and benefit from) `reasoning`;
+    # older chat models reject it, so it is omitted for them. Reasoning tokens
+    # count against the output budget, so give reasoning models more headroom.
+    reasoning = {"effort": "medium"} if _is_openai_reasoning_model(model) else None
+    max_output_tokens = 8192 if reasoning is not None else 4096
     input_tokens = 0
     output_tokens = 0
-    # Older models use max_tokens; newer models (o-series, gpt-4.1+) require max_completion_tokens.
-    # Detect which parameter to use on the first call and reuse that for subsequent turns.
-    _token_limit_param = "max_tokens"
 
-    def _create(msgs: list[dict]) -> Any:
-        nonlocal _token_limit_param
-        from openai import BadRequestError
-
-        kwargs = dict(
+    def _create(items: list[dict], *, tool_choice: str = "auto") -> Any:
+        kwargs: dict[str, Any] = dict(
             model=model,
-            messages=msgs,
+            instructions=system_prompt,
+            input=items,
             tools=openai_tools,
-            tool_choice="auto",
-            **{_token_limit_param: 4096},
+            tool_choice=tool_choice,
+            max_output_tokens=max_output_tokens,
         )
-        try:
-            return client.chat.completions.create(**kwargs)
-        except BadRequestError as e:
-            if _token_limit_param == "max_tokens" and "max_completion_tokens" in str(e):
-                _token_limit_param = "max_completion_tokens"
-                kwargs[_token_limit_param] = kwargs.pop("max_tokens")
-                return client.chat.completions.create(**kwargs)
-            raise
+        if reasoning is not None:
+            kwargs["reasoning"] = reasoning
+        return client.responses.create(**kwargs)
+
+    def _usage_dict(resp: Any) -> dict[str, Any]:
+        u = getattr(resp, "usage", None)
+        return {
+            "input_tokens": getattr(u, "input_tokens", None) if u else None,
+            "output_tokens": getattr(u, "output_tokens", None) if u else None,
+        }
+
+    def _cached_tokens(resp: Any) -> int:
+        u = getattr(resp, "usage", None)
+        return getattr(getattr(u, "input_tokens_details", None), "cached_tokens", 0) or 0
 
     for turn in range(1, max_turns + 1):
         if logger:
-            logger.write_request(
-                turn,
-                {"messages": messages, "tools": openai_tools},
-            )
-        response = _create(messages)
+            logger.write_request(turn, {"input": input_items, "tools": openai_tools})
+        response = _create(input_items)
+
+        # Append the model's output items (reasoning + message + function_call,
+        # in order) to the running history so reasoning state carries forward.
+        output_dicts = [item.model_dump(exclude_none=True) for item in response.output]
+        input_items.extend(output_dicts)
+
+        if response.usage:
+            input_tokens += response.usage.input_tokens
+            output_tokens += response.usage.output_tokens
+
+        function_calls = [item for item in response.output if item.type == "function_call"]
+        assistant_text = response.output_text or ""
+
         if logger:
-            _msg_dict_log: dict[str, Any] = {
-                "role": "assistant",
-                "content": response.choices[0].message.content,
-            }
-            if response.choices[0].message.tool_calls:
-                _msg_dict_log["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in response.choices[0].message.tool_calls
-                ]
             logger.write_response(
                 turn,
                 {
-                    "finish_reason": response.choices[0].finish_reason,
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
-                        "completion_tokens": response.usage.completion_tokens
-                        if response.usage
-                        else None,
-                    },
-                    "message": _msg_dict_log,
+                    "status": response.status,
+                    "usage": _usage_dict(response),
+                    "output": output_dicts,
                 },
             )
-        if response.usage:
-            input_tokens += response.usage.prompt_tokens
-            output_tokens += response.usage.completion_tokens
-        choice = response.choices[0]
-        msg = choice.message
-
-        # Serialize to dict for the history (SDK objects aren't JSON-serializable)
-        msg_dict: dict[str, Any] = {"role": "assistant", "content": msg.content}
-        if msg.tool_calls:
-            msg_dict["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(msg_dict)
 
         if verbose:
             _turn_header(turn, max_turns, log)
             if response.usage:
-                ctx_tokens = response.usage.prompt_tokens
-                cached_tokens = (
-                    getattr(
-                        getattr(response.usage, "prompt_tokens_details", None),
-                        "cached_tokens",
-                        0,
-                    )
-                    or 0
-                )
+                ctx_tokens = response.usage.input_tokens
+                cached_tokens = _cached_tokens(response)
                 if cached_tokens:
                     log(f"[local] Context size ≈ {ctx_tokens:,} tokens ({cached_tokens:,} cached)")
                 else:
                     log(f"[local] Context size ≈ {ctx_tokens:,} tokens")
-            if msg.content:
-                log(f"[← llm] {_trunc(msg.content)}")
-            for tc in msg.tool_calls or []:
-                log(f"[← llm:tool] {tc.function.name}({_trunc(tc.function.arguments, 120)})")
+            if assistant_text:
+                log(f"[← llm] {_trunc(assistant_text)}")
+            for fc in function_calls:
+                log(f"[← llm:tool] {fc.name}({_trunc(fc.arguments, 120)})")
 
-        if choice.finish_reason == "stop":
-            hypotheses = _extract_hypotheses(msg.content or "")
+        if not function_calls:
+            hypotheses = _extract_hypotheses(assistant_text)
             if hypotheses:
                 return hypotheses, input_tokens, 0, 0, output_tokens
-            # Model stopped without a valid JSON array — inject a recovery prompt and continue.
+            # Model produced no tool calls and no valid JSON array — nudge it.
             if verbose:
                 log("[local] stop with no JSON array — injecting recovery prompt")
-            messages.append(
+            input_items.append(
                 {
                     "role": "user",
                     "content": (
@@ -1037,22 +1012,22 @@ def _run_openai(
             )
             continue
 
-        # finish_reason == "tool_calls"
-        for tc in msg.tool_calls or []:
-            result_json = dispatch(profile, tc.function.name, json.loads(tc.function.arguments))
+        # Execute the requested tool calls and feed results back.
+        for fc in function_calls:
+            result_json = dispatch(profile, fc.name, json.loads(fc.arguments))
             if verbose:
-                log(f"[local] {tc.function.name} → {_trunc(result_json)}")
-            messages.append(
+                log(f"[local] {fc.name} → {_trunc(result_json)}")
+            input_items.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_json,
+                    "type": "function_call_output",
+                    "call_id": fc.call_id,
+                    "output": result_json,
                 }
             )
 
         turns_left = max_turns - turn
         if turns_left == WARN_TURNS_BEFORE_LIMIT:
-            messages.append(
+            input_items.append(
                 {
                     "role": "user",
                     "content": _WRAP_UP_WARNING.format(remaining=turns_left),
@@ -1061,9 +1036,11 @@ def _run_openai(
             if verbose:
                 log(f"[local] ({turns_left} turns remaining — wrap-up warning injected)")
         elif turns_left == 0:
-            messages.append({"role": "user", "content": _FINAL_FORCED_PROMPT})
+            input_items.append({"role": "user", "content": _FINAL_FORCED_PROMPT})
 
-    # All turns exhausted — make one final call without tools to force text output.
+    # All turns exhausted — make one final call with tool_choice="none" to force
+    # a text-only answer (tools stay defined so prior function_call items in the
+    # history remain valid).
     if verbose:
         log("[local] Turn limit reached — forcing final output (no tool calls).")
     _forced_turn = max_turns + 1
@@ -1071,33 +1048,22 @@ def _run_openai(
         if logger:
             logger.write_request(
                 _forced_turn,
-                {"messages": messages, "(forced_output_no_tools)": True},
+                {"input": input_items, "(forced_output_no_tools)": True},
             )
-        response_forced = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            **{_token_limit_param: 4096},
-        )
+        response_forced = _create(input_items, tool_choice="none")
         if logger:
             logger.write_response(
                 _forced_turn,
                 {
-                    "finish_reason": response_forced.choices[0].finish_reason,
-                    "usage": {
-                        "prompt_tokens": response_forced.usage.prompt_tokens
-                        if response_forced.usage
-                        else None,
-                        "completion_tokens": response_forced.usage.completion_tokens
-                        if response_forced.usage
-                        else None,
-                    },
-                    "content": response_forced.choices[0].message.content,
+                    "status": response_forced.status,
+                    "usage": _usage_dict(response_forced),
+                    "content": response_forced.output_text,
                 },
             )
         if response_forced.usage:
-            input_tokens += response_forced.usage.prompt_tokens
-            output_tokens += response_forced.usage.completion_tokens
-        forced_content = response_forced.choices[0].message.content or ""
+            input_tokens += response_forced.usage.input_tokens
+            output_tokens += response_forced.usage.output_tokens
+        forced_content = response_forced.output_text or ""
         hypotheses = _extract_hypotheses(forced_content)
         if hypotheses:
             return hypotheses, input_tokens, 0, 0, output_tokens
@@ -1505,7 +1471,7 @@ def run_agent(
     """Analyze a profile and return a list of hypothesis dicts.
 
     Provider selection order:
-      1. Provider prefix in model string (e.g. "openai:gpt-4o")
+      1. Provider prefix in model string (e.g. "openai:gpt-5.6")
       2. Bare provider name in model string (e.g. "openai")
       3. Auto-detect from ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY
       4. Fall back to `claude -p` subprocess (no API key required)

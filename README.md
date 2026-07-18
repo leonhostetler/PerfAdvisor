@@ -327,7 +327,7 @@ perf-advisor compare profile_a.sqlite profile_b.sqlite --log-file /tmp/compare.l
 
 Provider resolution order (first match wins):
 
-1. Provider prefix in `--model`: `openai:gpt-4o`, `gemini:gemini-2.5-flash`, `anthropic:claude-opus-4-6`
+1. Provider prefix in `--model`: `openai:gpt-5.6`, `gemini:gemini-3.5-flash`, `anthropic:claude-opus-4-8`
 2. Bare provider name in `--model`: `openai`, `gemini`, `anthropic` (uses that provider's default model)
 3. Auto-detect from environment: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY`
 4. Fallback to `claude -p` subprocess (Claude Code CLI, no API key required)
@@ -344,18 +344,18 @@ perf-advisor analyze profile.sqlite --model claude-haiku-4-5-20251001   # faster
 
 ```bash
 export OPENAI_API_KEY=sk-...
-perf-advisor analyze profile.sqlite --model openai:gpt-4o
-perf-advisor analyze profile.sqlite --model openai:gpt-4o-mini
-perf-advisor analyze profile.sqlite --model openai   # uses gpt-4o (default)
+perf-advisor analyze profile.sqlite --model openai:gpt-5.6
+perf-advisor analyze profile.sqlite --model openai:gpt-5.6-luna
+perf-advisor analyze profile.sqlite --model openai   # uses gpt-5.6 (default)
 ```
 
 ### Google Gemini
 
 ```bash
 export GOOGLE_API_KEY=...
-perf-advisor analyze profile.sqlite --model gemini:gemini-2.5-flash
-perf-advisor analyze profile.sqlite --model gemini:gemini-2.5-pro
-perf-advisor analyze profile.sqlite --model gemini   # uses gemini-2.5-flash (default)
+perf-advisor analyze profile.sqlite --model gemini:gemini-3.5-flash
+perf-advisor analyze profile.sqlite --model gemini:gemini-3.1-pro-preview
+perf-advisor analyze profile.sqlite --model gemini   # uses gemini-3.5-flash (default)
 ```
 
 ### Claude Code fallback (no API key)
@@ -385,7 +385,7 @@ Token estimate (Anthropic, sliding prompt cache):
   Non-cached:  ~0 tokens
   Output:      ~3,800 – 12,800 (5 – 20 turns)
   Cost-equiv:  ~81,600 tokens  (heuristic)
-  Model:       claude-opus-4-6 (anthropic)
+  Model:       claude-opus-4-8 (anthropic)
 Proceed? [Y/n]
 ```
 
@@ -398,7 +398,7 @@ Token estimate (Gemini, explicit context cache):
   Non-cached:    ~285,000 tokens  (incremental per-turn history)
   Output:        ~3,800 – 12,800 (5 – 20 turns)
   Cost-equiv:    ~333,000 tokens  (heuristic)
-  Model:         gemini-2.5-flash (gemini)
+  Model:         gemini-3.5-flash (gemini)
 Proceed? [Y/n]
 ```
 
@@ -409,7 +409,7 @@ Token estimate (total across up to 20 turns):
   Input:  ~370,000 (heuristic)
   (OpenAI applies automatic ~50% caching to repeated prefixes)
   Output: ~3,800 – 12,800
-  Model:  gpt-4o (openai)
+  Model:  gpt-5.6 (openai)
 Proceed? [Y/n]
 ```
 
@@ -467,10 +467,10 @@ Gemini runs use explicit context caching automatically. The pre-flight estimate 
 perf-advisor analyze profile.sqlite --model claude-haiku-4-5-20251001
 
 # OpenAI
-perf-advisor analyze profile.sqlite --model openai:gpt-4o-mini
+perf-advisor analyze profile.sqlite --model openai:gpt-5.6-luna
 
 # Gemini — generous free tier
-perf-advisor analyze profile.sqlite --model gemini:gemini-2.5-flash
+perf-advisor analyze profile.sqlite --model gemini:gemini-3.5-flash
 ```
 
 **Inspect before analyzing:**
