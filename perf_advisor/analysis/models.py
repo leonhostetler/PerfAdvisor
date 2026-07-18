@@ -153,8 +153,14 @@ class PhaseSummary(BaseModel):
     duration_s: float
     start_ns: int  # absolute timestamp (nanoseconds); pass to windowed tools
     end_ns: int
-    gpu_utilization_pct: float
-    gpu_kernel_s: float
+    gpu_utilization_pct: float = Field(description="gpu_busy_s / duration_s * 100")
+    gpu_kernel_s: float = Field(
+        description="Sum of kernel durations; exceeds gpu_busy_s when kernels run concurrently"
+    )
+    gpu_busy_s: float = Field(
+        default=0.0,
+        description="Wall-clock time with at least one kernel running (overlaps merged)",
+    )
     gpu_memcpy_s: float
     total_gpu_idle_s: float
     gap_histogram: list[GapBucket] = Field(default_factory=list)
@@ -173,13 +179,33 @@ class ProfileSummary(BaseModel):
 
     # Overall timing
     profile_span_s: float  # wall-clock duration captured in profile
-    gpu_kernel_s: float  # total time all kernels were running on GPU
+    gpu_kernel_s: float = Field(
+        description=(
+            "Total kernel work: the sum of individual kernel durations. Kernels running "
+            "concurrently on different streams each contribute their full duration, so this "
+            "can exceed profile_span_s. It is the denominator for per-kernel work shares."
+        )
+    )
+    gpu_busy_s: float = Field(
+        default=0.0,
+        description=(
+            "Wall-clock time during which at least one kernel was executing, with "
+            "overlapping kernels merged. Bounded by profile_span_s."
+        ),
+    )
+    kernel_concurrency_factor: float | None = Field(
+        default=None,
+        description=(
+            "gpu_kernel_s / gpu_busy_s. 1.0 means kernels never overlapped; higher values "
+            "indicate concurrent execution across streams (or devices sharing this profile)."
+        ),
+    )
     gpu_memcpy_s: float  # total time spent in memory transfers
     gpu_sync_s: float  # total time in GPU sync operations
-    gpu_utilization_pct: float  # gpu_kernel_s / profile_span_s * 100
+    gpu_utilization_pct: float = Field(description="gpu_busy_s / profile_span_s * 100")
 
     # GPU idle
-    total_gpu_idle_s: float  # sum of all inter-kernel gaps
+    total_gpu_idle_s: float  # sum of gaps between merged kernel execution intervals
     gap_histogram: list[GapBucket]
 
     # Breakdown tables

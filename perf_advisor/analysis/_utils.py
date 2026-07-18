@@ -1,6 +1,48 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+
+
+def merge_intervals(intervals: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping/adjacent [start, end) intervals into a disjoint, sorted list.
+
+    GPU kernels run concurrently across streams (and across devices sharing one
+    profile), so summing individual durations double-counts wall-clock time.
+    Merging first gives the true occupied span.
+
+    Zero-length and inverted intervals are dropped; adjacent intervals that
+    merely touch (``prev_end == start``) are coalesced, since there is no idle
+    time between them.
+    """
+    ordered = sorted((s, e) for s, e in intervals if e > s)
+    if not ordered:
+        return []
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            if end > last_end:
+                merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def busy_time_ns(intervals: Iterable[tuple[int, int]]) -> int:
+    """Total wall-clock time covered by at least one of ``intervals``."""
+    return sum(e - s for s, e in merge_intervals(intervals))
+
+
+def interval_gaps_ns(intervals: Iterable[tuple[int, int]]) -> list[int]:
+    """Idle gaps between merged intervals.
+
+    Computed from the merged set, so a long kernel overlapping shorter ones can
+    no longer produce a phantom gap: gaps are measured from the running maximum
+    end, not from the previous event in start order.
+    """
+    merged = merge_intervals(intervals)
+    return [merged[i][0] - merged[i - 1][1] for i in range(1, len(merged))]
 
 
 def _normalize_demangled(name: str) -> str:

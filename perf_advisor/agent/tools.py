@@ -24,6 +24,7 @@ from perf_advisor.analysis.metrics import (
     _window_top_kernels,
     compute_device_info,
     compute_gap_histogram,
+    compute_gpu_busy_time,
     compute_gpu_kernel_time,
     compute_marker_ranges,
     compute_memcpy_by_kind,
@@ -68,11 +69,14 @@ def tool_profile_summary(profile: Profile, _args: dict[str, Any]) -> dict:
     """Return the top-level time budget for the profile."""
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
+    busy_s = compute_gpu_busy_time(profile)
     return {
         "format": profile.format.value,
         "profile_span_s": round(span_s, 3),
         "gpu_kernel_s": round(kernel_s, 3),
-        "gpu_utilization_pct": round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
+        "gpu_busy_s": round(busy_s, 3),
+        "kernel_concurrency_factor": round(kernel_s / busy_s, 2) if busy_s else None,
+        "gpu_utilization_pct": round(100.0 * busy_s / span_s, 1) if span_s else 0.0,
         "mpi_present": profile.capabilities.has_mpi,
         "markers_present": profile.capabilities.has_markers,
         "tables": sorted(profile.tables),

@@ -37,6 +37,7 @@ The pipeline has two distinct stages:
 
 - **Phase detection** — segments the timeline into non-overlapping execution phases (initialization, main compute, teardown, etc.) by binning the timeline into fixed-width windows, fingerprinting each window as a probability distribution over the top-K kernels, detecting boundaries from Jensen-Shannon divergence peaks and GPU idle transitions, then selecting the optimal segmentation via dynamic-programming k-segmentation with elbow-based k selection; see [docs/phase_detection.md](docs/phase_detection.md) for details
 - **Per-kernel metrics** — grouped by full demangled template name (e.g. `quda::Kernel3D<quda::dslash_functor, ...>`) rather than the short display name (`Kernel3D`), so each distinct template instantiation is tracked separately; total/avg/min/max time, coefficient of variation, register usage, shared memory, estimated SM occupancy, CPU launch overhead
+- **GPU busy time vs. kernel work** — `gpu_kernel_s` is the sum of individual kernel durations (total work; kernels running concurrently on different streams each contribute in full), while `gpu_busy_s` merges overlapping kernel intervals to give true wall-clock occupancy. `gpu_utilization_pct` is computed from `gpu_busy_s`, so it is bounded by 100%. Their ratio is reported as `kernel_concurrency_factor` — `1.0` means kernels never overlapped, higher values quantify concurrent execution
 - **Memory transfer summary** — by direction (H2D/D2H/D2D), with effective bandwidth vs. peak
 - **MPI breakdown** — per-operation total and call count (collectives, P2P, wait)
 - **GPU idle histogram** — bucketed gap distribution (`<10µs` through `>100ms`)
@@ -79,7 +80,7 @@ is clamped to `[0, 100]`.
 
 | Tool              | What it returns                                                         |
 | ----------------- | ----------------------------------------------------------------------- |
-| `profile_summary` | Wall-clock span, GPU kernel time, utilization, which tables are present |
+| `profile_summary` | Wall-clock span, GPU kernel work, busy time, concurrency factor, utilization, which tables are present |
 | `phase_summary`   | Per-phase metrics (GPU util, top kernels, MPI, idle gaps)               |
 | `top_kernels`     | Top kernels by total GPU time                                           |
 | `gap_histogram`   | Idle-gap distribution                                                   |

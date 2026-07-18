@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from perf_advisor.ingestion.base import KernelRow, MarkerAgg, MemcpyRow, MpiOpAgg, Profile
 
-from ._utils import _normalize_demangled
+from ._utils import _normalize_demangled, busy_time_ns, interval_gaps_ns
 from .models import (
     DeviceInfo,
     GapBucket,
@@ -45,9 +45,27 @@ def compute_profile_span(profile: Profile) -> float:
 
 
 def compute_gpu_kernel_time(profile: Profile) -> float:
+    """Total kernel *work*: the sum of individual kernel durations.
+
+    Kernels executing concurrently on different streams each contribute their
+    full duration, so this can exceed the wall-clock span. That is intentional —
+    it is the correct denominator for per-kernel shares of total kernel work.
+    Use ``compute_gpu_busy_time`` for anything wall-clock (e.g. utilization).
+    """
     if not profile.capabilities.has_kernels:
         return 0.0
     return sum(e.duration_ns for e in profile.kernel_events()) / 1e9
+
+
+def compute_gpu_busy_time(profile: Profile) -> float:
+    """Wall-clock time during which at least one kernel was executing.
+
+    Overlapping kernels are merged, so this is bounded by the profile span and
+    is the correct numerator for GPU utilization.
+    """
+    if not profile.capabilities.has_kernels:
+        return 0.0
+    return busy_time_ns((e.start_ns, e.end_ns) for e in profile.kernel_events()) / 1e9
 
 
 def compute_gpu_memcpy_time(profile: Profile) -> float:
@@ -183,39 +201,51 @@ def compute_memcpy_by_kind(
     return result
 
 
-def compute_gap_histogram(profile: Profile) -> tuple[float, list[GapBucket]]:
-    """Return (total_idle_s, gap_histogram) for inter-kernel idle time."""
-    if not profile.capabilities.has_kernels:
-        return 0.0, []
-    evts = sorted(profile.kernel_events(), key=lambda e: e.start_ns)
-    gaps = [
-        evts[i].start_ns - evts[i - 1].end_ns
-        for i in range(1, len(evts))
-        if evts[i].start_ns > evts[i - 1].end_ns
-    ]
-    label_order = ["<10us", "10-100us", "100us-1ms", "1-10ms", "10-100ms", ">100ms"]
-    buckets_raw: dict[str, list[int]] = {lb: [] for lb in label_order}
+_GAP_BUCKET_EDGES_NS: list[tuple[str, float]] = [
+    ("<10us", 10_000),
+    ("10-100us", 100_000),
+    ("100us-1ms", 1_000_000),
+    ("1-10ms", 10_000_000),
+    ("10-100ms", 100_000_000),
+    (">100ms", math.inf),
+]
+
+
+def _bucket_gaps(gaps: list[int]) -> tuple[float, list[GapBucket]]:
+    """Bucket idle gaps (ns) into the standard histogram.
+
+    Returns (total_idle_s, non-empty buckets in ascending order).
+    """
+    buckets_raw: dict[str, list[int]] = {label: [] for label, _ in _GAP_BUCKET_EDGES_NS}
     for g in gaps:
-        if g < 10_000:
-            buckets_raw["<10us"].append(g)
-        elif g < 100_000:
-            buckets_raw["10-100us"].append(g)
-        elif g < 1_000_000:
-            buckets_raw["100us-1ms"].append(g)
-        elif g < 10_000_000:
-            buckets_raw["1-10ms"].append(g)
-        elif g < 100_000_000:
-            buckets_raw["10-100ms"].append(g)
-        else:
-            buckets_raw[">100ms"].append(g)
+        for label, upper in _GAP_BUCKET_EDGES_NS:
+            if g < upper:
+                buckets_raw[label].append(g)
+                break
     buckets = [
-        GapBucket(label=lb, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
-        for lb in label_order
-        for vs in [buckets_raw[lb]]
+        GapBucket(label=label, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
+        for label, _ in _GAP_BUCKET_EDGES_NS
+        for vs in [buckets_raw[label]]
         if vs
     ]
-    total_idle_s = sum(b.total_s for b in buckets)
-    return total_idle_s, buckets
+    return sum(b.total_s for b in buckets), buckets
+
+
+def _kernel_gaps_ns(evts: list[KernelRow]) -> list[int]:
+    """Idle gaps between kernels, computed from merged execution intervals.
+
+    Merging first is essential: with concurrent streams the previous event in
+    start order is not the one that finished last, so differencing against it
+    invents gaps that never existed.
+    """
+    return interval_gaps_ns((e.start_ns, e.end_ns) for e in evts)
+
+
+def compute_gap_histogram(profile: Profile) -> tuple[float, list[GapBucket]]:
+    """Return (total_idle_s, gap_histogram) for GPU idle time between kernels."""
+    if not profile.capabilities.has_kernels:
+        return 0.0, []
+    return _bucket_gaps(_kernel_gaps_ns(profile.kernel_events()))
 
 
 def compute_streams(profile: Profile) -> list[StreamSummary]:
@@ -326,38 +356,19 @@ def _window_memcpy_time(evts: list[MemcpyRow], start_ns: int, end_ns: int) -> fl
 def _window_idle_time(
     evts: list[KernelRow], start_ns: int, end_ns: int
 ) -> tuple[float, list[GapBucket]]:
-    """Return (total_idle_s, gap_histogram) for inter-kernel gaps within a time window."""
-    window = sorted(
-        (e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns),
-        key=lambda e: e.start_ns,
+    """Return (total_idle_s, gap_histogram) for GPU idle gaps within a time window."""
+    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    return _bucket_gaps(_kernel_gaps_ns(window))
+
+
+def _window_busy_time(evts: list[KernelRow], start_ns: int, end_ns: int) -> float:
+    """Wall-clock time within the window during which at least one kernel ran."""
+    return (
+        busy_time_ns(
+            (e.start_ns, e.end_ns) for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns
+        )
+        / 1e9
     )
-    gaps = [
-        window[i].start_ns - window[i - 1].end_ns
-        for i in range(1, len(window))
-        if window[i].start_ns > window[i - 1].end_ns
-    ]
-    label_order = ["<10us", "10-100us", "100us-1ms", "1-10ms", "10-100ms", ">100ms"]
-    buckets_raw: dict[str, list[int]] = {lb: [] for lb in label_order}
-    for g in gaps:
-        if g < 10_000:
-            buckets_raw["<10us"].append(g)
-        elif g < 100_000:
-            buckets_raw["10-100us"].append(g)
-        elif g < 1_000_000:
-            buckets_raw["100us-1ms"].append(g)
-        elif g < 10_000_000:
-            buckets_raw["1-10ms"].append(g)
-        elif g < 100_000_000:
-            buckets_raw["10-100ms"].append(g)
-        else:
-            buckets_raw[">100ms"].append(g)
-    buckets = [
-        GapBucket(label=lb, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
-        for lb in label_order
-        for vs in [buckets_raw[lb]]
-        if vs
-    ]
-    return sum(b.total_s for b in buckets), buckets
 
 
 def _window_top_kernels(
@@ -468,6 +479,7 @@ def compute_phase_summary(
     all_memcpy = profile.memcpy_events()
 
     kernel_s = _window_kernel_time(all_kernel, phase.start_ns, phase.end_ns)
+    busy_s = _window_busy_time(all_kernel, phase.start_ns, phase.end_ns)
     memcpy_s = _window_memcpy_time(all_memcpy, phase.start_ns, phase.end_ns)
     idle_s, gap_histogram = _window_idle_time(all_kernel, phase.start_ns, phase.end_ns)
     duration_s = (phase.end_ns - phase.start_ns) / 1e9
@@ -483,8 +495,9 @@ def compute_phase_summary(
         duration_s=round(duration_s, 3),
         start_ns=phase.start_ns,
         end_ns=phase.end_ns,
-        gpu_utilization_pct=round(100.0 * kernel_s / duration_s, 1) if duration_s else 0.0,
+        gpu_utilization_pct=round(100.0 * busy_s / duration_s, 1) if duration_s else 0.0,
         gpu_kernel_s=round(kernel_s, 3),
+        gpu_busy_s=round(busy_s, 3),
         gpu_memcpy_s=round(memcpy_s, 3),
         total_gpu_idle_s=round(idle_s, 3),
         gap_histogram=gap_histogram,
@@ -531,6 +544,7 @@ def compute_profile_summary(
 
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
+    busy_s = compute_gpu_busy_time(profile)
     memcpy_s = compute_gpu_memcpy_time(profile)
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
@@ -572,9 +586,11 @@ def compute_profile_summary(
         device_info=device_info,
         profile_span_s=round(span_s, 3),
         gpu_kernel_s=round(kernel_s, 3),
+        gpu_busy_s=round(busy_s, 3),
+        kernel_concurrency_factor=round(kernel_s / busy_s, 2) if busy_s else None,
         gpu_memcpy_s=round(memcpy_s, 3),
         gpu_sync_s=round(sync_s, 3),
-        gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
+        gpu_utilization_pct=round(100.0 * busy_s / span_s, 1) if span_s else 0.0,
         total_gpu_idle_s=round(total_idle_s, 3),
         gap_histogram=gap_histogram,
         top_kernels=compute_top_kernels(profile, device_info=device_info, launch_overhead=loh),
@@ -614,6 +630,7 @@ def compute_profile_summary_and_state(
 
     span_s = compute_profile_span(profile)
     kernel_s = compute_gpu_kernel_time(profile)
+    busy_s = compute_gpu_busy_time(profile)
     memcpy_s = compute_gpu_memcpy_time(profile)
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
@@ -651,9 +668,11 @@ def compute_profile_summary_and_state(
         device_info=device_info,
         profile_span_s=round(span_s, 3),
         gpu_kernel_s=round(kernel_s, 3),
+        gpu_busy_s=round(busy_s, 3),
+        kernel_concurrency_factor=round(kernel_s / busy_s, 2) if busy_s else None,
         gpu_memcpy_s=round(memcpy_s, 3),
         gpu_sync_s=round(sync_s, 3),
-        gpu_utilization_pct=round(100.0 * kernel_s / span_s, 1) if span_s else 0.0,
+        gpu_utilization_pct=round(100.0 * busy_s / span_s, 1) if span_s else 0.0,
         total_gpu_idle_s=round(total_idle_s, 3),
         gap_histogram=gap_histogram,
         top_kernels=compute_top_kernels(profile, device_info=device_info, launch_overhead=loh),
