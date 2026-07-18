@@ -563,7 +563,19 @@ only by MPI or NVTX candidates) regardless of `max_phases`. Memcpy-only profiles
 handled via the `"__memcpy__"` pseudo-kernel, but any phase distinctions that rely on kernel
 distribution will be lost.
 
-**8. No automated quality metric for the output.**
+**8. Events straddling a phase boundary are attributed to multiple phases.**
+Phases partition the timeline, but events do not respect that partition — a kernel or MPI
+collective can start in one phase and end in the next. Per-phase *time totals* (`gpu_kernel_s`,
+`gpu_memcpy_s`, `gpu_busy_s`, `total_gpu_idle_s`) clip each event's duration to the phase window,
+so they are exact and sum to the profile total. Per-phase *breakdown tables* (`top_kernels`,
+`memcpy_by_kind`, `streams`) instead select every event that overlaps the window and report its
+full, unclipped duration, since those figures describe the event rather than the window. A
+long-running event therefore appears in the table of each phase it spans, and the sum of a
+table's durations can slightly exceed the phase's clipped time total. For kernels — microseconds
+against phases of seconds — the effect is negligible; for long MPI collectives it is not, which
+is why the MPI aggregates clip in SQL.
+
+**9. No automated quality metric for the output.**
 The algorithm has no way to assess whether the segmentation it produces is useful. It cannot
 detect if `max_phases` is set too high (artificially split phases) or too low (over-merged phases
 that should be separate). The `--verbose` flag exposes internal state for manual inspection, but

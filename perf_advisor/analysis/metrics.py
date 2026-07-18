@@ -222,8 +222,10 @@ def _bucket_gaps(gaps: list[int]) -> tuple[float, list[GapBucket]]:
             if g < upper:
                 buckets_raw[label].append(g)
                 break
+    # Rounded to microseconds, not milliseconds: the two smallest buckets span
+    # sub-millisecond gaps and would otherwise always report total_s == 0.0.
     buckets = [
-        GapBucket(label=label, count=len(vs), total_s=round(sum(vs) / 1e9, 3))
+        GapBucket(label=label, count=len(vs), total_s=round(sum(vs) / 1e9, 6))
         for label, _ in _GAP_BUCKET_EDGES_NS
         for vs in [buckets_raw[label]]
         if vs
@@ -345,27 +347,53 @@ def _compute_all_mpi_stats(
 # ---------------------------------------------------------------------------
 
 
+def _overlaps(event: KernelRow | MemcpyRow, start_ns: int, end_ns: int) -> bool:
+    """True if the event intersects [start_ns, end_ns) at all.
+
+    Used instead of full containment so events straddling a phase boundary are
+    attributed to the phases they actually span rather than dropped from both.
+    """
+    return event.start_ns < end_ns and event.end_ns > start_ns
+
+
+def _clipped_duration_ns(event: KernelRow | MemcpyRow, start_ns: int, end_ns: int) -> int:
+    """Portion of the event's duration that falls inside the window."""
+    return max(0, min(event.end_ns, end_ns) - max(event.start_ns, start_ns))
+
+
 def _window_kernel_time(evts: list[KernelRow], start_ns: int, end_ns: int) -> float:
-    return sum(e.duration_ns for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns) / 1e9
+    """Kernel work within the window, with boundary-straddling kernels clipped.
+
+    Clipping (rather than requiring containment) means per-phase times sum to
+    the profile total instead of silently losing every event that crosses a
+    phase boundary.
+    """
+    return sum(_clipped_duration_ns(e, start_ns, end_ns) for e in evts) / 1e9
 
 
 def _window_memcpy_time(evts: list[MemcpyRow], start_ns: int, end_ns: int) -> float:
-    return sum(e.duration_ns for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns) / 1e9
+    return sum(_clipped_duration_ns(e, start_ns, end_ns) for e in evts) / 1e9
 
 
 def _window_idle_time(
     evts: list[KernelRow], start_ns: int, end_ns: int
 ) -> tuple[float, list[GapBucket]]:
     """Return (total_idle_s, gap_histogram) for GPU idle gaps within a time window."""
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
-    return _bucket_gaps(_kernel_gaps_ns(window))
+    clipped = [
+        (max(e.start_ns, start_ns), min(e.end_ns, end_ns))
+        for e in evts
+        if _overlaps(e, start_ns, end_ns)
+    ]
+    return _bucket_gaps(interval_gaps_ns(clipped))
 
 
 def _window_busy_time(evts: list[KernelRow], start_ns: int, end_ns: int) -> float:
     """Wall-clock time within the window during which at least one kernel ran."""
     return (
         busy_time_ns(
-            (e.start_ns, e.end_ns) for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns
+            (max(e.start_ns, start_ns), min(e.end_ns, end_ns))
+            for e in evts
+            if _overlaps(e, start_ns, end_ns)
         )
         / 1e9
     )
@@ -380,7 +408,11 @@ def _window_top_kernels(
     device_info: DeviceInfo | None = None,
     launch_overhead: dict[str, tuple[float, float]] | None = None,
 ) -> list[KernelSummary]:
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    # Selected by overlap rather than containment so a kernel crossing a phase
+    # boundary still appears. Per-kernel durations are reported unclipped (they
+    # describe the kernel, not the window); kernels are orders of magnitude
+    # shorter than phases, so the boundary effect on the table is negligible.
+    window = [e for e in evts if _overlaps(e, start_ns, end_ns)]
     return _aggregate_kernel_summaries(window, total_kernel_s, limit, device_info, launch_overhead)
 
 
@@ -398,7 +430,7 @@ def _window_memcpy_by_kind(
     end_ns: int,
     peak_bandwidth_GBs: float | None = None,
 ) -> list[MemcpySummary]:
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    window = [e for e in evts if _overlaps(e, start_ns, end_ns)]
     by_dir: dict[str, dict] = {}
     for e in window:
         d = e.direction
@@ -430,7 +462,7 @@ def _window_memcpy_by_kind(
 
 
 def _window_streams(evts: list[KernelRow], start_ns: int, end_ns: int) -> list[StreamSummary]:
-    window = [e for e in evts if e.start_ns >= start_ns and e.end_ns <= end_ns]
+    window = [e for e in evts if _overlaps(e, start_ns, end_ns)]
     total_ns = sum(e.duration_ns for e in window)
     by_stream: dict[int, dict] = {}
     for e in window:

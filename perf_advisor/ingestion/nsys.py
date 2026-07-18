@@ -374,17 +374,24 @@ class NsysProfile:
     ) -> list[MpiOpAgg]:
         if not self.has_mpi():
             return []
+        # Select events that *overlap* the window and clip their duration to it,
+        # rather than requiring full containment. A long collective straddling a
+        # phase boundary would otherwise vanish from both phases entirely.
         window = ""
+        dur_expr = "(e.end - e.start)"
         params: tuple[Any, ...] = ()
         if start_ns is not None and end_ns is not None:
-            window = "AND e.start >= ? AND e.end <= ?"
-            params = (start_ns, end_ns)
+            window = "AND e.start < ? AND e.end > ?"
+            dur_expr = "(MIN(e.end, ?) - MAX(e.start, ?))"
+            # Order must match the placeholders as they appear in the SQL text:
+            # dur_expr comes first (SELECT list), then the WHERE predicate.
+            params = (end_ns, start_ns, end_ns, start_ns)
         sub_selects: list[str] = []
         for table in ("MPI_COLLECTIVES_EVENTS", "MPI_P2P_EVENTS", "MPI_START_WAIT_EVENTS"):
             if not self.has_table(table):
                 continue
             sub_selects.append(
-                f"SELECT s.value AS name, (e.end - e.start) AS dur "
+                f"SELECT s.value AS name, {dur_expr} AS dur "
                 f"FROM {table} e JOIN StringIds s ON e.textId = s.id "
                 f"WHERE e.end IS NOT NULL AND e.end > e.start {window}"
             )
@@ -420,13 +427,17 @@ class NsysProfile:
     ) -> list[MarkerAgg]:
         if not self.has_nvtx():
             return []
+        # Overlap + clip (see mpi_op_aggregates): a marker range spanning a phase
+        # boundary must contribute its in-window portion to each phase it covers.
         window = ""
+        total_expr = "SUM(end - start)"
         params: tuple[Any, ...] = ()
         if start_ns is not None and end_ns is not None:
-            window = "AND start >= ? AND end <= ?"
-            params = (start_ns, end_ns)
+            window = "AND start < ? AND end > ?"
+            total_expr = "SUM(MIN(end, ?) - MAX(start, ?))"
+            params = (end_ns, start_ns, end_ns, start_ns)
         rows = self._conn.execute(
-            f"SELECT text AS name, COUNT(*) AS calls, SUM(end - start) AS total_ns "
+            f"SELECT text AS name, COUNT(*) AS calls, {total_expr} AS total_ns "
             f"FROM NVTX_EVENTS "
             f"WHERE eventType = 59 "
             f"  AND end IS NOT NULL "

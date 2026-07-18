@@ -472,17 +472,24 @@ class RocpdProfile:
     ) -> list[MpiOpAgg]:
         if not self.capabilities.has_mpi:
             return []
+        # Select regions that *overlap* the window and clip to it rather than
+        # requiring full containment, so a long collective straddling a phase
+        # boundary does not vanish from both phases.
         window = ""
+        dur = "(R.end - R.start)"
         params: tuple[Any, ...] = ()
         if start_ns is not None and end_ns is not None:
-            window = "AND R.start >= ? AND R.end <= ?"
-            params = (start_ns, end_ns)
+            window = "AND R.start < ? AND R.end > ?"
+            dur = "(MIN(R.end, ?) - MAX(R.start, ?))"
+            # Two placeholders per use of `dur` in the SELECT list (SUM then MAX),
+            # followed by the WHERE predicate's pair.
+            params = (end_ns, start_ns, end_ns, start_ns, end_ns, start_ns)
         rows = self._conn.execute(
             f"""
             SELECT NS.string AS name,
                    COUNT(*) AS calls,
-                   SUM(R.end - R.start) AS total_ns,
-                   MAX(R.end - R.start) AS max_ns
+                   SUM{dur} AS total_ns,
+                   MAX{dur} AS max_ns
             FROM rocpd_region R
             INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
             INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid
@@ -515,16 +522,19 @@ class RocpdProfile:
     ) -> list[MarkerAgg]:
         if not self.capabilities.has_markers:
             return []
+        # Overlap + clip (see mpi_op_aggregates).
         window = ""
+        dur = "(R.end - R.start)"
         params: tuple[Any, ...] = ()
         if start_ns is not None and end_ns is not None:
-            window = "AND R.start >= ? AND R.end <= ?"
-            params = (start_ns, end_ns)
+            window = "AND R.start < ? AND R.end > ?"
+            dur = "(MIN(R.end, ?) - MAX(R.start, ?))"
+            params = (end_ns, start_ns, end_ns, start_ns)
         rows = self._conn.execute(
             f"""
             SELECT NS.string AS name,
                    COUNT(*) AS calls,
-                   SUM(R.end - R.start) AS total_ns
+                   SUM{dur} AS total_ns
             FROM rocpd_region R
             INNER JOIN rocpd_event E ON E.id = R.event_id AND E.guid = R.guid
             INNER JOIN rocpd_string NS ON NS.id = R.name_id AND NS.guid = R.guid

@@ -141,10 +141,15 @@ class DeviceInfo(BaseModel):
 class PhaseSummary(BaseModel):
     """Metrics for a single execution phase within a profile.
 
-    Note: ``total_gpu_idle_s`` counts only inter-kernel gaps within the phase
-    window (kernel-end to next-kernel-start). Idle time before the first kernel
-    or after the last kernel in the phase is not included — it contributes to
-    the denominator of ``gpu_utilization_pct`` but not to ``total_gpu_idle_s``.
+    Note: ``total_gpu_idle_s`` counts only gaps *between* kernel execution
+    intervals within the phase window. Idle time before the first kernel or
+    after the last kernel in the phase is not included — it contributes to the
+    denominator of ``gpu_utilization_pct`` but not to ``total_gpu_idle_s``.
+
+    Events straddling a phase boundary are attributed to every phase they
+    overlap: time totals are clipped to the window (so per-phase times sum to
+    the profile total), while the breakdown tables report unclipped per-event
+    durations, which describe the event rather than the window.
     """
 
     name: str
