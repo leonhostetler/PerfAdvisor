@@ -32,10 +32,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from perf_advisor.agent.logger import LLMLogger
 from perf_advisor.agent.tools import dispatch, tool_schemas
 from perf_advisor.analysis.metrics import compute_profile_summary
-from perf_advisor.analysis.models import DeviceInfo, ProfileSummary
+from perf_advisor.analysis.models import DeviceInfo, Hypothesis, ProfileSummary
 from perf_advisor.ingestion import open_profile
 from perf_advisor.ingestion.base import Format, Profile, ProfileCapabilities
 
@@ -255,9 +257,7 @@ def _format_capabilities_section(caps: ProfileCapabilities) -> str:
     if absent:
         lines.append("Absent: " + ", ".join(absent))
     if not caps.has_mpi:
-        lines.append(
-            "Do not generate MPI-related hypotheses — MPI data is not in this profile."
-        )
+        lines.append("Do not generate MPI-related hypotheses — MPI data is not in this profile.")
     if not caps.has_markers:
         lines.append(
             "Phase detection based on markers is unavailable — no marker ranges in this profile."
@@ -390,12 +390,38 @@ Output ONLY a JSON array of hypothesis objects — no prose, no markdown fences.
 """
 
 
+def _validate_hypotheses(raw: list[Any]) -> list[dict[str, Any]]:
+    """Validate raw LLM hypothesis dicts through the Hypothesis model.
+
+    Near-miss enum spellings are canonicalised rather than rejected (see
+    Hypothesis._coerce_enums), so model output is normalised instead of
+    discarded.  Entries that are not JSON objects at all are dropped, since
+    there is nothing meaningful to salvage from them.
+    """
+    validated: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            validated.append(Hypothesis.model_validate(item).model_dump())
+        except ValidationError:
+            # Should be unreachable: every enum field has a default and the
+            # before-validator coerces unknown values. Keep the raw dict rather
+            # than lose an otherwise usable hypothesis.
+            validated.append(item)
+    return validated
+
+
 def _extract_hypotheses(text: str) -> list[dict[str, Any]]:
-    """Extract a JSON array of hypotheses from a text response.
+    """Extract and validate a JSON array of hypotheses from a text response.
 
     Scans left-to-right through candidate '[' positions rather than using
     rfind('['), which fails when string values inside the array contain '['
     (e.g. AMD/ROCm kernel names like 'kernel_a [clone .kd]').
+
+    The extracted array is passed through the Hypothesis model so that
+    downstream consumers (rendering, the eval scorer, saved JSON) see
+    canonical enum values rather than whatever spelling the model emitted.
     """
     text = text.strip()
     end = text.rfind("]") + 1
@@ -409,7 +435,7 @@ def _extract_hypotheses(text: str) -> list[dict[str, Any]]:
         try:
             result = json.loads(text[start:end])
             if isinstance(result, list):
-                return result
+                return _validate_hypotheses(result)
         except json.JSONDecodeError:
             pass
         pos = start + 1
@@ -964,9 +990,7 @@ def _run_openai(
     # count against the output budget, so give reasoning models more headroom.
     # `reasoning_effort` (from --reasoning-effort) overrides the medium default.
     reasoning = (
-        {"effort": reasoning_effort or "medium"}
-        if _is_openai_reasoning_model(model)
-        else None
+        {"effort": reasoning_effort or "medium"} if _is_openai_reasoning_model(model) else None
     )
     max_output_tokens = 8192 if reasoning is not None else 4096
     input_tokens = 0

@@ -6,7 +6,10 @@ All times are in seconds, all sizes in bytes unless noted.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import re
+from typing import Literal, get_args
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class KernelSummary(BaseModel):
@@ -415,6 +418,166 @@ class ComparisonReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+BottleneckType = Literal[
+    "compute_bound",
+    "memory_bound",
+    "mpi_latency",
+    "mpi_imbalance",
+    "cpu_launch_overhead",
+    "synchronization",
+    "io",
+    "other",
+]
+
+ExpectedImpact = Literal["high", "medium", "low"]
+
+ActionCategory = Literal[
+    "runtime_config",
+    "launch_config",
+    "code_optimization",
+    "algorithm",
+]
+
+Confidence = Literal["high", "medium", "low"]
+
+# Common near-misses the models emit instead of the canonical enum values.
+# Applied after lowercasing and normalising separators to underscores.
+_BOTTLENECK_ALIASES: dict[str, str] = {
+    "compute": "compute_bound",
+    "computebound": "compute_bound",
+    "memory": "memory_bound",
+    "memorybound": "memory_bound",
+    "bandwidth_bound": "memory_bound",
+    "mpi": "mpi_latency",
+    "mpi_communication": "mpi_latency",
+    "communication": "mpi_latency",
+    "mpi_load_imbalance": "mpi_imbalance",
+    "load_imbalance": "mpi_imbalance",
+    "imbalance": "mpi_imbalance",
+    "launch_overhead": "cpu_launch_overhead",
+    "kernel_launch_overhead": "cpu_launch_overhead",
+    "cpu_overhead": "cpu_launch_overhead",
+    "sync": "synchronization",
+    "synchronisation": "synchronization",
+    "i_o": "io",
+    "disk": "io",
+}
+
+_ACTION_ALIASES: dict[str, str] = {
+    "config": "runtime_config",
+    "runtime": "runtime_config",
+    "env": "runtime_config",
+    "environment": "runtime_config",
+    "launch": "launch_config",
+    "occupancy": "launch_config",
+    "code": "code_optimization",
+    "kernel_optimization": "code_optimization",
+    "optimization": "code_optimization",
+    "algorithmic": "algorithm",
+}
+
+_IMPACT_ALIASES: dict[str, str] = {
+    "very_high": "high",
+    "critical": "high",
+    "moderate": "medium",
+    "med": "medium",
+    "minor": "low",
+    "negligible": "low",
+}
+
+
+def _canonicalize(value: object, aliases: dict[str, str], valid: frozenset[str]) -> str | None:
+    """Normalise a free-form LLM string to a canonical enum value.
+
+    Returns None when the value cannot be mapped, so the caller can decide
+    whether to substitute a default or leave the field unset.
+    """
+    if not isinstance(value, str):
+        return None
+    key = re.sub(r"[\s\-/]+", "_", value.strip().lower()).strip("_")
+    if key in valid:
+        return key
+    if key in aliases:
+        return aliases[key]
+    return None
+
+
+class Hypothesis(BaseModel):
+    """A single ranked performance hypothesis produced by the agent.
+
+    Field values arriving from the LLM are free-form text, so the validators
+    below canonicalise near-miss spellings (``memory-bound`` → ``memory_bound``)
+    rather than rejecting them.  Values that cannot be mapped fall back to a
+    safe default and are recorded in ``coercion_notes`` so a run is never
+    silently scored against an unrecognised label.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    bottleneck_type: BottleneckType = "other"
+    phase: str = "whole_profile"
+    description: str = ""
+    evidence: str = ""
+    suggestion: str = ""
+    expected_impact: ExpectedImpact = "medium"
+    action_category: ActionCategory | None = None
+    confidence: Confidence = "low"
+    runtime_fraction_pct: float | None = None
+    estimated_speedup_pct_lower: float | None = None
+    estimated_speedup_pct_upper: float | None = None
+    coercion_notes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Fields whose raw LLM value could not be mapped to a canonical enum "
+            "value and were replaced by a default. Empty on a clean parse."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_enums(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        notes: list[str] = []
+
+        for field, aliases, valid, default in (
+            (
+                "bottleneck_type",
+                _BOTTLENECK_ALIASES,
+                frozenset(get_args(BottleneckType)),
+                "other",
+            ),
+            ("expected_impact", _IMPACT_ALIASES, frozenset(get_args(ExpectedImpact)), "medium"),
+            ("action_category", _ACTION_ALIASES, frozenset(get_args(ActionCategory)), None),
+            ("confidence", _IMPACT_ALIASES, frozenset(get_args(Confidence)), "low"),
+        ):
+            raw = out.get(field)
+            if raw is None:
+                continue
+            mapped = _canonicalize(raw, aliases, valid)
+            if mapped is None:
+                notes.append(f"{field}={raw!r} unrecognised, defaulted to {default!r}")
+                out[field] = default
+            else:
+                out[field] = mapped
+
+        # runtime_fraction_pct is a percentage; clamp rather than reject so a
+        # slightly out-of-range model estimate does not discard the hypothesis.
+        rf = out.get("runtime_fraction_pct")
+        if isinstance(rf, (int, float)) and not isinstance(rf, bool):
+            if not 0.0 <= float(rf) <= 100.0:
+                notes.append(f"runtime_fraction_pct={rf!r} out of range, clamped to [0, 100]")
+                out["runtime_fraction_pct"] = max(0.0, min(100.0, float(rf)))
+        elif rf is not None:
+            notes.append(f"runtime_fraction_pct={rf!r} not numeric, dropped")
+            out["runtime_fraction_pct"] = None
+
+        if notes:
+            out["coercion_notes"] = list(out.get("coercion_notes") or []) + notes
+        return out
+
+
 class HypothesisReport(BaseModel):
     """Structured output of a single PerfAdvisor analyze run.
 
@@ -430,8 +593,9 @@ class HypothesisReport(BaseModel):
     hypotheses: list[dict] = Field(
         default_factory=list,
         description=(
-            "Ranked list of hypothesis dicts as returned by the agent. "
+            "Ranked list of validated hypothesis dicts (see the Hypothesis model). "
             "Each dict has: bottleneck_type, phase, description, evidence, "
-            "suggestion, expected_impact, action_category."
+            "suggestion, expected_impact, action_category, confidence, "
+            "runtime_fraction_pct, estimated_speedup_pct_lower/upper."
         ),
     )

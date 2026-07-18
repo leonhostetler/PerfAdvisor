@@ -65,6 +65,15 @@ The agent is given the `ProfileSummary` and a set of tools it can call to query 
 - `estimated_speedup_pct_lower` — lower-bound speedup from 50% mitigation of the bottleneck (Amdahl's law); `null` if `runtime_fraction_pct` is `null`
 - `estimated_speedup_pct_upper` — upper-bound speedup from full elimination of the bottleneck; `null` if `runtime_fraction_pct` is `null`
 - `confidence` — quality of evidence: `high` (directly visible timing in profile), `medium` (inferred from derived metrics), `low` (plausible but not directly confirmed)
+- `coercion_notes` — list of fields whose raw model output could not be mapped to a canonical value and were replaced by a default; empty on a clean parse
+
+**Validation.** Model output is parsed through the `Hypothesis` Pydantic model before it reaches
+rendering, the saved JSON, or the eval scorer. Near-miss spellings are canonicalised rather than
+rejected (`memory-bound` → `memory_bound`, `load imbalance` → `mpi_imbalance`, case and whitespace
+normalised). A value that cannot be mapped falls back to a safe default (`bottleneck_type` →
+`other`) and is recorded in `coercion_notes`, so an unrecognised label is visible instead of
+silently scoring as a miss. Unknown extra fields the model adds are preserved. `runtime_fraction_pct`
+is clamped to `[0, 100]`.
 
 **Tools available to the agent** (all read-only SQL queries against the local profile):
 
