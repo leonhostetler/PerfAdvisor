@@ -138,16 +138,23 @@ def _extract_report(text: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _call_anthropic(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
+def _call_anthropic(
+    prompt: str, model: str, system_prompt: str, reasoning_effort: str | None = None
+) -> tuple[str, int, int]:
     import anthropic
 
     client = anthropic.Anthropic()
-    response = client.messages.create(
+    kwargs: dict[str, Any] = dict(
         model=model,
         max_tokens=4096,
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
     )
+    if reasoning_effort:
+        # extra_body (version-stable) rather than a typed keyword: older anthropic
+        # SDKs don't expose output_config as a named messages.create() parameter.
+        kwargs["extra_body"] = {"output_config": {"effort": reasoning_effort}}
+    response = client.messages.create(**kwargs)
     text = ""
     for block in response.content:
         if hasattr(block, "text"):
@@ -163,7 +170,19 @@ def _openai_is_reasoning_model(model: str) -> bool:
     return m.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
-def _call_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
+# Gemini's thinking_level caps at "high"; xhigh/max clamp down (mirrors loop.py).
+_GEMINI_THINKING_LEVEL = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _call_openai(
+    prompt: str, model: str, system_prompt: str, reasoning_effort: str | None = None
+) -> tuple[str, int, int]:
     try:
         from openai import OpenAI
     except ImportError:
@@ -179,7 +198,7 @@ def _call_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, int,
         max_output_tokens=8192 if reasoning else 4096,
     )
     if reasoning:
-        kwargs["reasoning"] = {"effort": "medium"}
+        kwargs["reasoning"] = {"effort": reasoning_effort or "medium"}
     response = client.responses.create(**kwargs)
     text = response.output_text or ""
     inp = response.usage.input_tokens if response.usage else 0
@@ -187,7 +206,9 @@ def _call_openai(prompt: str, model: str, system_prompt: str) -> tuple[str, int,
     return text, inp, out
 
 
-def _call_gemini(prompt: str, model: str, system_prompt: str) -> tuple[str, int, int]:
+def _call_gemini(
+    prompt: str, model: str, system_prompt: str, reasoning_effort: str | None = None
+) -> tuple[str, int, int]:
     try:
         from google import genai
         from google.genai import types as genai_types
@@ -197,9 +218,12 @@ def _call_gemini(prompt: str, model: str, system_prompt: str) -> tuple[str, int,
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY environment variable is not set")
     client = genai.Client(api_key=api_key)
-    config = genai_types.GenerateContentConfig(
-        system_instruction=system_prompt,
-    )
+    _config_kwargs: dict[str, Any] = {"system_instruction": system_prompt}
+    if reasoning_effort:
+        _config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+            thinking_level=_GEMINI_THINKING_LEVEL[reasoning_effort]
+        )
+    config = genai_types.GenerateContentConfig(**_config_kwargs)
     response = client.models.generate_content(
         model=model,
         contents=prompt,
@@ -256,6 +280,7 @@ def run_compare(
     model: str | None = None,
     verbose: bool = True,
     grounded: bool = True,
+    reasoning_effort: str | None = None,
     token_usage: dict[str, Any] | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
@@ -300,11 +325,11 @@ def run_compare(
 
     cost_usd: float | None = None
     if resolved_provider == "anthropic":
-        text, inp, out = _call_anthropic(prompt, resolved_model, system_prompt)
+        text, inp, out = _call_anthropic(prompt, resolved_model, system_prompt, reasoning_effort)
     elif resolved_provider == "openai":
-        text, inp, out = _call_openai(prompt, resolved_model, system_prompt)
+        text, inp, out = _call_openai(prompt, resolved_model, system_prompt, reasoning_effort)
     elif resolved_provider == "gemini":
-        text, inp, out = _call_gemini(prompt, resolved_model, system_prompt)
+        text, inp, out = _call_gemini(prompt, resolved_model, system_prompt, reasoning_effort)
     else:
         text, inp, out, cost_usd = _call_claude_code(f"{system_prompt}\n\n{prompt}")
 

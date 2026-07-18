@@ -64,6 +64,18 @@ _FINAL_FORCED_PROMPT = (
 
 _KNOWN_PROVIDERS = ("anthropic", "openai", "gemini")
 
+# Unified --reasoning-effort levels. All three providers accept low/medium/high
+# natively; OpenAI and Anthropic also accept xhigh/max. Gemini's thinking_level
+# tops out at "high", so xhigh/max are clamped down for that backend.
+REASONING_EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+_GEMINI_THINKING_LEVEL = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
 # Maps provider name -> (importable module, install hint).
 # Providers not listed here (e.g. anthropic, claude_code) are always available.
 _PROVIDER_PACKAGES: dict[str, tuple[str, str]] = {
@@ -584,6 +596,7 @@ def _run_api(
     summary: ProfileSummary | None = None,
     cross_rank_summary=None,
     grounded: bool = True,
+    reasoning_effort: str | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
@@ -597,6 +610,18 @@ def _run_api(
             "Export it before running: export ANTHROPIC_API_KEY=sk-ant-..."
         )
     client = anthropic.Anthropic()
+    # --reasoning-effort maps to Anthropic's output_config.effort. Sent via
+    # extra_body (the SDK's version-stable escape hatch) rather than a typed
+    # keyword, because older anthropic SDKs do not expose `output_config` as a
+    # named parameter to messages.create(). Note: Opus 4.8 already defaults to
+    # "high"; effort is applied without forcing adaptive thinking so the
+    # (pre-seeded, tool-using) default request path is unchanged when the flag
+    # is absent.
+    _effort_kwargs: dict[str, Any] = (
+        {"extra_body": {"output_config": {"effort": reasoning_effort}}}
+        if reasoning_effort
+        else {}
+    )
     schemas = tool_schemas()
     messages: list[dict] = (
         _preseed_messages(profile, summary, cross_rank_summary) if summary is not None else []
@@ -665,6 +690,7 @@ def _run_api(
             system=_system,
             tools=schemas,
             messages=messages,
+            **_effort_kwargs,
         )
         if logger:
             logger.write_response(
@@ -787,6 +813,7 @@ def _run_api(
         max_tokens=4096,
         system=_system,
         messages=messages,
+        **_effort_kwargs,
     )
     if logger:
         logger.write_response(
@@ -889,6 +916,7 @@ def _run_openai(
     summary: ProfileSummary | None = None,
     cross_rank_summary=None,
     grounded: bool = True,
+    reasoning_effort: str | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
@@ -923,7 +951,12 @@ def _run_openai(
     # gpt-5.x / o-series reasoning models accept (and benefit from) `reasoning`;
     # older chat models reject it, so it is omitted for them. Reasoning tokens
     # count against the output budget, so give reasoning models more headroom.
-    reasoning = {"effort": "medium"} if _is_openai_reasoning_model(model) else None
+    # `reasoning_effort` (from --reasoning-effort) overrides the medium default.
+    reasoning = (
+        {"effort": reasoning_effort or "medium"}
+        if _is_openai_reasoning_model(model)
+        else None
+    )
     max_output_tokens = 8192 if reasoning is not None else 4096
     input_tokens = 0
     output_tokens = 0
@@ -954,7 +987,10 @@ def _run_openai(
 
     for turn in range(1, max_turns + 1):
         if logger:
-            logger.write_request(turn, {"input": input_items, "tools": openai_tools})
+            logger.write_request(
+                turn,
+                {"instructions": system_prompt, "input": input_items, "tools": openai_tools},
+            )
         response = _create(input_items)
 
         # Append the model's output items (reasoning + message + function_call,
@@ -1048,7 +1084,11 @@ def _run_openai(
         if logger:
             logger.write_request(
                 _forced_turn,
-                {"input": input_items, "(forced_output_no_tools)": True},
+                {
+                    "instructions": system_prompt,
+                    "input": input_items,
+                    "(forced_output_no_tools)": True,
+                },
             )
         response_forced = _create(input_items, tool_choice="none")
         if logger:
@@ -1089,6 +1129,7 @@ def _run_gemini(
     summary: ProfileSummary | None = None,
     cross_rank_summary=None,
     grounded: bool = True,
+    reasoning_effort: str | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
@@ -1156,6 +1197,13 @@ def _run_gemini(
     # The cache has a 600 s TTL — ample for any analysis run — and expires automatically.
     # Falls back to injecting the summary into the first user message if creation fails
     # (e.g. token minimum not met, model does not support caching).
+    # --reasoning-effort maps to Gemini's thinking_level (which replaced the
+    # integer thinking_budget). Gemini caps at "high", so xhigh/max clamp down.
+    _thinking_config = (
+        genai_types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL[reasoning_effort])
+        if reasoning_effort
+        else None
+    )
     _cached_content = None
     _cache_creation_tokens = 0
     if _summary_text is not None:
@@ -1181,13 +1229,17 @@ def _run_gemini(
 
     if _cached_content is not None:
         # Cache created: reference it by name; summary is already inside the cache.
-        config = genai_types.GenerateContentConfig(cached_content=_cached_content.name)
+        config = genai_types.GenerateContentConfig(
+            cached_content=_cached_content.name,
+            thinking_config=_thinking_config,
+        )
         init_msg = "Begin analysis."
     else:
         # Fallback: no cache — put system + tools in config, summary in first message.
         config = genai_types.GenerateContentConfig(
             system_instruction=_system_prompt_text,
             tools=[genai_types.Tool(function_declarations=declarations)],
+            thinking_config=_thinking_config,
         )
         init_msg = _summary_text if _summary_text is not None else "Begin analysis."
 
@@ -1465,6 +1517,7 @@ def run_agent(
     cross_rank_summary=None,
     token_usage: dict[str, int | None] | None = None,
     grounded: bool = True,
+    reasoning_effort: str | None = None,
     log: Callable[[str], None] = print,
     logger: LLMLogger | None = None,
 ) -> list[dict[str, Any]]:
@@ -1502,6 +1555,7 @@ def run_agent(
                 summary=summary,
                 cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
+                reasoning_effort=reasoning_effort,
                 log=log,
                 logger=logger,
             )
@@ -1514,6 +1568,7 @@ def run_agent(
                 summary=summary,
                 cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
+                reasoning_effort=reasoning_effort,
                 log=log,
                 logger=logger,
             )
@@ -1526,6 +1581,7 @@ def run_agent(
                 summary=summary,
                 cross_rank_summary=cross_rank_summary,
                 grounded=grounded,
+                reasoning_effort=reasoning_effort,
                 log=log,
                 logger=logger,
             )

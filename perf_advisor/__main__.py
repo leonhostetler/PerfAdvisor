@@ -16,7 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from perf_advisor.agent.logger import LLMLogger
-from perf_advisor.agent.loop import MAX_TURNS, WARN_TURNS_BEFORE_LIMIT
+from perf_advisor.agent.loop import MAX_TURNS, REASONING_EFFORT_CHOICES, WARN_TURNS_BEFORE_LIMIT
 
 console = Console(record=True)
 
@@ -26,6 +26,32 @@ def _print_capability_notes(fmt, caps) -> None:
 
     for note in capability_notes(fmt, caps):
         console.print(f"[cyan]ℹ[/cyan] {note.message}", highlight=False)
+
+
+def _reasoning_effort_display(provider: str, model: str, effort: str | None) -> str | None:
+    """Human-readable reasoning-effort description for the run banner.
+
+    Returns None for backends with no effort knob (claude_code subprocess).
+    When `effort` is None, reports the provider's own default; the "(… default)"
+    labels track each vendor's API default, not a value PerfAdvisor injects.
+    """
+    if provider == "claude_code":
+        return None
+    if provider == "openai":
+        from perf_advisor.agent.loop import _is_openai_reasoning_model
+
+        if not _is_openai_reasoning_model(model):
+            return "n/a (non-reasoning model)"
+        return effort if effort else "medium (OpenAI default)"
+    if provider == "anthropic":
+        return effort if effort else "high (Anthropic default)"
+    if provider == "gemini":
+        if not effort:
+            return "medium (Gemini default)"
+        if effort in ("xhigh", "max"):
+            return f"high (requested {effort}, clamped — Gemini's max is high)"
+        return effort
+    return effort
 
 
 def _warn_wal_truncation(profile, path: str) -> None:
@@ -221,6 +247,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             f"Using AI provider = [cyan]{resolved_provider}[/cyan],"
             f" model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
         )
+        _effort_str = _reasoning_effort_display(
+            resolved_provider, resolved_model, args.reasoning_effort
+        )
+        if _effort_str is not None:
+            console.print(f"Reasoning effort = [cyan]{_effort_str}[/cyan]")
 
     missing = check_provider_available(resolved_provider)
     if missing:
@@ -656,6 +687,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 max_turns=args.max_turns,
                 token_usage=token_usage,
                 grounded=not args.allow_app_knowledge,
+                reasoning_effort=args.reasoning_effort,
                 log=log,
                 logger=_logger,
             )
@@ -855,6 +887,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
             f"Using AI provider = [cyan]{resolved_provider}[/cyan], "
             f"model = [cyan]{resolved_model}[/cyan] (selected based on {reason})"
         )
+        _effort_str = _reasoning_effort_display(
+            resolved_provider, resolved_model, args.reasoning_effort
+        )
+        if _effort_str is not None:
+            console.print(f"Reasoning effort = [cyan]{_effort_str}[/cyan]")
 
     missing = check_provider_available(resolved_provider)
     if missing:
@@ -1015,6 +1052,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 model=args.model,
                 verbose=not args.quiet,
                 grounded=not args.allow_app_knowledge,
+                reasoning_effort=args.reasoning_effort,
                 token_usage=token_usage,
                 log=log,
                 logger=_logger,
@@ -1194,6 +1232,11 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
         f"Hypothesis model: [cyan]{resolved_model}[/cyan]"
         f" ({resolved_provider}, selected based on {reason})"
     )
+    _effort_str = _reasoning_effort_display(
+        resolved_provider, resolved_model, args.reasoning_effort
+    )
+    if _effort_str is not None:
+        console.print(f"Reasoning effort: [cyan]{_effort_str}[/cyan]")
 
     # ── Resolve judge model ──────────────────────────────────────────────────
     judge_model_arg = args.judge_model or "claude-haiku-4-5-20251001"
@@ -1503,6 +1546,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                     model=args.model,
                     max_turns=args.max_turns,
                     grounded=not args.allow_app_knowledge,
+                    reasoning_effort=args.reasoning_effort,
                     log=lambda msg: console.print(f"  {msg}", markup=False, highlight=False),
                     logger=_logger,
                 )
@@ -1666,6 +1710,18 @@ def main() -> None:
         ),
     )
     p_analyze.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORT_CHOICES,
+        default=None,
+        help=(
+            "Reasoning/thinking effort for the model. Maps to each provider's native "
+            "control: OpenAI reasoning.effort, Anthropic output_config.effort, Gemini "
+            "thinking_level (xhigh/max clamp to 'high'). Higher effort = more tool use "
+            "and deeper analysis at higher cost/latency. Default: provider's own default "
+            "(OpenAI/Gemini medium, Anthropic high)."
+        ),
+    )
+    p_analyze.add_argument(
         "--allow-app-knowledge",
         action="store_true",
         help=(
@@ -1746,6 +1802,16 @@ def main() -> None:
         ),
     )
     p_compare.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORT_CHOICES,
+        default=None,
+        help=(
+            "Reasoning/thinking effort for the comparison model. Maps to each provider's "
+            "native control (OpenAI reasoning.effort, Anthropic output_config.effort, Gemini "
+            "thinking_level; xhigh/max clamp to 'high' on Gemini). Default: provider's own."
+        ),
+    )
+    p_compare.add_argument(
         "--allow-app-knowledge",
         action="store_true",
         help=(
@@ -1823,6 +1889,17 @@ def main() -> None:
         help=(
             "Model for hypothesis generation. Same format as 'analyze --model'. "
             "Defaults: claude-opus-4-8 (anthropic), gpt-5.6 (openai)."
+        ),
+    )
+    p_evaluate.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORT_CHOICES,
+        default=None,
+        help=(
+            "Reasoning/thinking effort for the hypothesis-generation model (not the judge). "
+            "Maps to each provider's native control (OpenAI reasoning.effort, Anthropic "
+            "output_config.effort, Gemini thinking_level; xhigh/max clamp to 'high' on Gemini). "
+            "Default: provider's own."
         ),
     )
     p_evaluate.add_argument(

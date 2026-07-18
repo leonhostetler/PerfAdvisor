@@ -362,6 +362,25 @@ perf-advisor analyze profile.sqlite --model gemini   # uses gemini-3.5-flash (de
 
 If no API key is set and `claude` is on your PATH, the agent falls back to a single `claude -p` call with the full `ProfileSummary` as a text prompt. This uses the Claude Code CLI's own authentication. No extra setup required, but this mode does not support multi-turn tool calls.
 
+### Reasoning effort
+
+`--reasoning-effort {low,medium,high,xhigh,max}` controls how hard the model thinks. Higher effort generally means more tool calls and deeper exploration (e.g. targeted `sql_query` follow-ups) at higher cost and latency. It is available on `analyze`, `compare`, and `evaluate` (on `evaluate` it applies to the hypothesis-generation model, not the judge).
+
+```bash
+perf-advisor analyze profile.sqlite --model openai:gpt-5.6 --reasoning-effort high
+perf-advisor analyze profile.sqlite --model gemini:gemini-3.5-flash --reasoning-effort max
+```
+
+The flag maps to each provider's native control, and when omitted each provider applies **its own** default (nothing is injected by PerfAdvisor):
+
+| Provider  | Native parameter          | Values accepted                     | Default when omitted |
+|-----------|---------------------------|-------------------------------------|----------------------|
+| OpenAI    | `reasoning.effort`        | low, medium, high, xhigh, max       | medium               |
+| Anthropic | `output_config.effort`    | low, medium, high, xhigh, max       | high                 |
+| Gemini    | `thinking_level`          | low, medium, high (`xhigh`/`max` → `high`) | medium        |
+
+Notes: for non-reasoning OpenAI models (e.g. `gpt-4o`) the flag is ignored. Gemini's `thinking_level` tops out at `high`, so `xhigh`/`max` are clamped down. The effective effort is printed in the run banner.
+
 ---
 
 ## Token expenditure
