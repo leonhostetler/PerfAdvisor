@@ -5,9 +5,9 @@ Observed schema of the AMD ROCm `rocpd` SQLite format produced by
 `rocprof_integration_plan.md`. Source artefacts:
 
 - `_rocpd_schema_observed.sql` — full `.schema` dump from a real file.
-- Empirical probes against the 8-rank fixture
-  `/home/ads.leonhost/Downloads/rocprof/test6_rocprofv3/rocpd_out/rank_*_results.db`
-  (clean `--sys-trace` capture, ~4.2 GB / rank).
+- Empirical probes against the 8-rank `rank_*_results.db` fixture (clean
+  `--sys-trace` capture, ~4.2 GB / rank), located via the
+  `PERF_ADVISOR_ROCPD_FIXTURE_DIR` environment variable (see `tests/conftest.py`).
 - Earlier `test5_rocprofv3/` fixture is **superseded** — that run was
   killed by SLURM (`--signal=SIGTERM@60` + 30 min wall) ~5m42s into the
   rocpd SQL write phase (slurm-4512453.out lines 604–668), truncating

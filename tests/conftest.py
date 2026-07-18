@@ -16,6 +16,7 @@ Real-profile fixtures (local-only, skipped in CI when paths are absent):
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -1205,29 +1206,42 @@ def synthetic_rocpd_profile(synthetic_rocpd_path):
 # Real-profile fixtures (local only — skipped when paths are absent)
 # ---------------------------------------------------------------------------
 
-_REAL_ROCPD_RANK0 = Path(
-    "/home/ads.leonhost/Downloads/rocprof/test6_rocprofv3/rocpd_out/rank_663530_results.db"
-)
-_REAL_ROCPD_DIR = _REAL_ROCPD_RANK0.parent
+# Real rocpd fixtures live outside the repo (multi-GB per rank) and are located
+# via an environment variable so no machine-specific absolute path is committed.
+# Point PERF_ADVISOR_ROCPD_FIXTURE_DIR at a directory of rank_*_results.db files
+# captured with: rocprofv3 --sys-trace --output-format rocpd
+_ROCPD_FIXTURE_ENV = "PERF_ADVISOR_ROCPD_FIXTURE_DIR"
 
 
-@pytest.fixture(scope="session")
-def real_rocpd_path() -> Path:
-    """Path to rank-0 test6 rocpd DB.  Skipped in CI when file is absent."""
-    if not _REAL_ROCPD_RANK0.exists():
-        pytest.skip(
-            f"Real rocpd fixture not found at {_REAL_ROCPD_RANK0}. "
-            "Re-capture with: rocprofv3 --sys-trace --output-format rocpd"
-        )
-    return _REAL_ROCPD_RANK0
+def _real_rocpd_dir() -> Path | None:
+    """Resolve the real rocpd fixture directory from the environment, if set."""
+    raw = os.environ.get(_ROCPD_FIXTURE_ENV)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_dir() else None
 
 
 @pytest.fixture(scope="session")
 def real_rocpd_dir() -> Path:
-    """Directory with all 8-rank test6 rocpd DBs.  Skipped in CI when absent."""
-    if not _REAL_ROCPD_DIR.exists():
+    """Directory with all per-rank rocpd DBs.  Skipped when the env var is unset."""
+    directory = _real_rocpd_dir()
+    if directory is None:
         pytest.skip(
-            f"Real rocpd fixture directory not found at {_REAL_ROCPD_DIR}. "
-            "Re-capture with: rocprofv3 --sys-trace --output-format rocpd"
+            f"Real rocpd fixture not available. Set {_ROCPD_FIXTURE_ENV} to a "
+            "directory of rank_*_results.db files (rocprofv3 --sys-trace "
+            "--output-format rocpd)."
         )
-    return _REAL_ROCPD_DIR
+    return directory
+
+
+@pytest.fixture(scope="session")
+def real_rocpd_path(real_rocpd_dir: Path) -> Path:
+    """Path to the lowest-numbered (rank-0) rocpd DB.  Skipped when env var unset."""
+    ranks = sorted(real_rocpd_dir.glob("rank_*_results.db"))
+    if not ranks:
+        pytest.skip(
+            f"No rank_*_results.db files found under {real_rocpd_dir} "
+            f"(from {_ROCPD_FIXTURE_ENV})."
+        )
+    return ranks[0]
