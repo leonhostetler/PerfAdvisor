@@ -144,16 +144,23 @@ def _call_anthropic(
     import anthropic
 
     client = anthropic.Anthropic()
+    # --reasoning-effort enables adaptive thinking + output_config.effort, sent via
+    # extra_body (version-stable) since older anthropic SDKs don't expose these as
+    # typed keywords. This is a single-shot call with no tools/pre-seeding, so there
+    # are no thinking-block round-trip concerns. Thinking shares the output budget,
+    # so raise max_tokens when it is on. The first non-text block (the thinking
+    # summary) is skipped by the .text extraction below.
     kwargs: dict[str, Any] = dict(
         model=model,
-        max_tokens=4096,
+        max_tokens=8192 if reasoning_effort else 4096,
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
     )
     if reasoning_effort:
-        # extra_body (version-stable) rather than a typed keyword: older anthropic
-        # SDKs don't expose output_config as a named messages.create() parameter.
-        kwargs["extra_body"] = {"output_config": {"effort": reasoning_effort}}
+        kwargs["extra_body"] = {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": reasoning_effort},
+        }
     response = client.messages.create(**kwargs)
     text = ""
     for block in response.content:

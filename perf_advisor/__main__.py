@@ -44,7 +44,7 @@ def _reasoning_effort_display(provider: str, model: str, effort: str | None) -> 
             return "n/a (non-reasoning model)"
         return effort if effort else "medium (OpenAI default)"
     if provider == "anthropic":
-        return effort if effort else "high (Anthropic default)"
+        return f"{effort} (with adaptive thinking)" if effort else "high (Anthropic default)"
     if provider == "gemini":
         if not effort:
             return "medium (Gemini default)"

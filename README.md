@@ -373,13 +373,18 @@ perf-advisor analyze profile.sqlite --model gemini:gemini-3.5-flash --reasoning-
 
 The flag maps to each provider's native control, and when omitted each provider applies **its own** default (nothing is injected by PerfAdvisor):
 
-| Provider  | Native parameter          | Values accepted                     | Default when omitted |
-|-----------|---------------------------|-------------------------------------|----------------------|
-| OpenAI    | `reasoning.effort`        | low, medium, high, xhigh, max       | medium               |
-| Anthropic | `output_config.effort`    | low, medium, high, xhigh, max       | high                 |
-| Gemini    | `thinking_level`          | low, medium, high (`xhigh`/`max` → `high`) | medium        |
+| Provider  | Native parameter                          | Values accepted                     | Default when omitted |
+|-----------|-------------------------------------------|-------------------------------------|----------------------|
+| OpenAI    | `reasoning.effort`                        | low, medium, high, xhigh, max       | medium               |
+| Anthropic | adaptive thinking + `output_config.effort` | low, medium, high, xhigh, max      | high (no thinking)   |
+| Gemini    | `thinking_level`                          | low, medium, high (`xhigh`/`max` → `high`) | medium        |
 
-Notes: for non-reasoning OpenAI models (e.g. `gpt-4o`) the flag is ignored. Gemini's `thinking_level` tops out at `high`, so `xhigh`/`max` are clamped down. The effective effort is printed in the run banner.
+Notes:
+
+- **Anthropic:** passing `--reasoning-effort` turns on **adaptive thinking** (effort is the thinking-depth dial) in addition to setting `output_config.effort`, and raises the per-turn output budget to leave room for thinking tokens. Without the flag, the Anthropic path runs with no explicit thinking and inherits Anthropic's own `high` effort default — so the flag's main effect on Anthropic is engaging thinking, not raising the effort number.
+- For non-reasoning OpenAI models (e.g. `gpt-4o`) the flag is ignored.
+- Gemini's `thinking_level` tops out at `high`, so `xhigh`/`max` are clamped down.
+- The effective effort is printed in the run banner (e.g. `Reasoning effort = high (with adaptive thinking)`).
 
 ---
 

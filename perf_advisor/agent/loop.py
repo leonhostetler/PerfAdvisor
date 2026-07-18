@@ -435,6 +435,9 @@ def _serialize_anthropic_content(content: list) -> list[dict]:
         block_type = getattr(block, "type", "unknown")
         if block_type == "text":
             result.append({"type": "text", "text": block.text})
+        elif block_type == "thinking":
+            # Adaptive-thinking summary (present when --reasoning-effort is set).
+            result.append({"type": "thinking", "thinking": getattr(block, "thinking", "")})
         elif block_type == "tool_use":
             result.append(
                 {
@@ -610,18 +613,26 @@ def _run_api(
             "Export it before running: export ANTHROPIC_API_KEY=sk-ant-..."
         )
     client = anthropic.Anthropic()
-    # --reasoning-effort maps to Anthropic's output_config.effort. Sent via
-    # extra_body (the SDK's version-stable escape hatch) rather than a typed
-    # keyword, because older anthropic SDKs do not expose `output_config` as a
-    # named parameter to messages.create(). Note: Opus 4.8 already defaults to
-    # "high"; effort is applied without forcing adaptive thinking so the
-    # (pre-seeded, tool-using) default request path is unchanged when the flag
-    # is absent.
+    # --reasoning-effort turns on adaptive thinking (effort is the thinking-depth
+    # dial, so the two are paired) and sets output_config.effort. Both go through
+    # extra_body — the SDK's version-stable escape hatch — because older anthropic
+    # SDKs don't expose `output_config` (or newer thinking modes) as typed keywords.
+    # When the flag is absent, nothing is added: the default request path keeps its
+    # current behavior (no explicit thinking; Anthropic's own "high" effort default).
+    # With thinking on, reasoning tokens share the output budget, so max_tokens is
+    # raised. Model-generated thinking blocks round-trip via the raw response.content
+    # appended to `messages` each turn.
     _effort_kwargs: dict[str, Any] = (
-        {"extra_body": {"output_config": {"effort": reasoning_effort}}}
+        {
+            "extra_body": {
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": reasoning_effort},
+            }
+        }
         if reasoning_effort
         else {}
     )
+    _max_tokens = 8192 if reasoning_effort else 4096
     schemas = tool_schemas()
     messages: list[dict] = (
         _preseed_messages(profile, summary, cross_rank_summary) if summary is not None else []
@@ -686,7 +697,7 @@ def _run_api(
             )
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=_max_tokens,
             system=_system,
             tools=schemas,
             messages=messages,
@@ -810,7 +821,7 @@ def _run_api(
         )
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=_max_tokens,
         system=_system,
         messages=messages,
         **_effort_kwargs,
