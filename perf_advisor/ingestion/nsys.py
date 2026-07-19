@@ -57,6 +57,7 @@ class NsysProfile:
         self._memcpy_events_cache: list | None = None
         self._marker_ranges_cache: list | None = None
         self._mpi_ranges_cache: list | None = None
+        self._launch_overhead_cache: dict[str, tuple[float, float]] | None = None
 
     # ------------------------------------------------------------------
     # Schema introspection
@@ -559,7 +560,15 @@ class NsysProfile:
         Measures CPU-to-GPU enqueue latency: the time from when the CPU issued the
         launch API call to when the kernel actually started executing on the GPU.
         Returns an empty dict if RUNTIME is absent or lacks correlationId.
+
+        Cached: this is a join over the full kernel and runtime tables, and the
+        agent's tools call it on every top_kernels / phase_summary invocation.
         """
+        if self._launch_overhead_cache is None:
+            self._launch_overhead_cache = self._fetch_launch_overhead()
+        return self._launch_overhead_cache
+
+    def _fetch_launch_overhead(self) -> dict[str, tuple[float, float]]:
         if not self.has_table("CUPTI_ACTIVITY_KIND_RUNTIME"):
             return {}
         runtime_cols = set(self.columns("CUPTI_ACTIVITY_KIND_RUNTIME"))
@@ -575,6 +584,7 @@ class NsysProfile:
         rows = self.query(f"""
             SELECT
                 {name_expr}                                              AS name,
+                COUNT(*)                                                 AS launches,
                 AVG(CAST(k.start - rt.start AS REAL)) / 1000.0         AS avg_launch_us,
                 MAX(k.start - rt.start) / 1000.0                        AS max_launch_us
             FROM CUPTI_ACTIVITY_KIND_KERNEL k
@@ -586,14 +596,27 @@ class NsysProfile:
         """)
         from perf_advisor.analysis._utils import _normalize_demangled
 
-        return {
-            _normalize_demangled(r["name"]): (
-                round(float(r["avg_launch_us"]), 2),
-                round(float(r["max_launch_us"]), 2),
-            )
-            for r in rows
-            if r["avg_launch_us"] is not None and float(r["avg_launch_us"]) >= 0
-        }
+        # SQL groups by string id, but callers key on the *normalised* demangled
+        # name, and distinct ids can normalise to the same key. Combine those
+        # groups properly (launch-count-weighted mean, max of maxima) instead of
+        # letting the last row silently win.
+        acc: dict[str, tuple[float, float, int]] = {}
+        for r in rows:
+            if r["avg_launch_us"] is None or float(r["avg_launch_us"]) < 0:
+                continue
+            key = _normalize_demangled(r["name"])
+            avg_us = float(r["avg_launch_us"])
+            max_us = float(r["max_launch_us"])
+            launches = int(r["launches"])
+            if key in acc:
+                prev_avg, prev_max, prev_n = acc[key]
+                total_n = prev_n + launches
+                avg_us = (prev_avg * prev_n + avg_us * launches) / total_n
+                max_us = max(prev_max, max_us)
+                launches = total_n
+            acc[key] = (avg_us, max_us, launches)
+
+        return {k: (round(avg, 2), round(mx, 2)) for k, (avg, mx, _) in acc.items()}
 
     def device_info(self):
         """Query TARGET_INFO_GPU for hardware properties."""

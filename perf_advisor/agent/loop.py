@@ -815,7 +815,7 @@ def _run_api(
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            result_json = dispatch(profile, block.name, block.input)
+            result_json = dispatch(profile, block.name, block.input, summary=summary)
             if verbose:
                 log(f"[local] {block.name} → {_trunc(result_json)}")
             tool_results.append(
@@ -1115,7 +1115,7 @@ def _run_openai(
 
         # Execute the requested tool calls and feed results back.
         for fc in function_calls:
-            result_json = dispatch(profile, fc.name, json.loads(fc.arguments))
+            result_json = dispatch(profile, fc.name, json.loads(fc.arguments), summary=summary)
             if verbose:
                 log(f"[local] {fc.name} → {_trunc(result_json)}")
             input_items.append(
@@ -1406,7 +1406,7 @@ def _run_gemini(
         parts = []
         parts_data: list[dict] = []
         for fc in function_calls:
-            result_json = dispatch(profile, fc.name, dict(fc.args or {}))
+            result_json = dispatch(profile, fc.name, dict(fc.args or {}), summary=summary)
             if verbose:
                 log(f"[local] {fc.name} → {_trunc(result_json)}")
             parts_data.append(

@@ -33,6 +33,7 @@ from perf_advisor.analysis.metrics import (
     compute_streams,
     compute_top_kernels,
 )
+from perf_advisor.analysis.models import ProfileSummary
 from perf_advisor.ingestion import Format
 from perf_advisor.ingestion.base import Profile
 
@@ -174,12 +175,33 @@ def tool_stream_summary(profile: Profile, args: dict[str, Any]) -> dict:
     return {"streams": [s.model_dump() for s in streams]}
 
 
-def tool_phase_summary(profile: Profile, args: dict[str, Any]) -> dict:
-    """Return the profile segmented into sequential execution phases."""
+# Must match the CLI's --max-phases default. A lower value here silently
+# produced a *different* segmentation than the pre-seeded one when the agent
+# called phase_summary itself.
+_DEFAULT_MAX_PHASES = 10
+
+
+def tool_phase_summary(
+    profile: Profile, args: dict[str, Any], summary: ProfileSummary | None = None
+) -> dict:
+    """Return the profile segmented into sequential execution phases.
+
+    Phase detection is the most expensive computation in the pipeline, and the
+    result is already pre-seeded into the conversation. When the agent calls
+    this tool anyway without asking for a different phase count, return the
+    pre-computed phases rather than re-running detection — that avoids both the
+    cost and the risk of handing back a segmentation inconsistent with the one
+    already in context.
+    """
     from perf_advisor.analysis.metrics import compute_phase_summary
     from perf_advisor.analysis.phases import detect_phases
 
-    max_phases = int(args.get("max_phases", 6))
+    requested = args.get("max_phases")
+    if summary is not None and summary.phases:
+        if requested is None or int(requested) == len(summary.phases):
+            return {"phases": [p.model_dump() for p in summary.phases]}
+
+    max_phases = int(requested) if requested is not None else _DEFAULT_MAX_PHASES
     phases = detect_phases(profile, max_phases=max_phases)
     if not phases:
         return {"phases": []}
@@ -554,12 +576,25 @@ TOOL_REGISTRY: dict[str, tuple[Any, dict]] = {
 }
 
 
-def dispatch(profile: Profile, tool_name: str, tool_input: dict) -> str:
-    """Dispatch a tool call from the agent loop and return a JSON string result."""
+def dispatch(
+    profile: Profile,
+    tool_name: str,
+    tool_input: dict,
+    summary: ProfileSummary | None = None,
+) -> str:
+    """Dispatch a tool call from the agent loop and return a JSON string result.
+
+    ``summary`` is the pre-seeded ProfileSummary for this run, when available.
+    Only phase_summary uses it (to return the already-computed segmentation
+    instead of re-running detection); other tools take (profile, args).
+    """
     if tool_name not in TOOL_REGISTRY:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     fn, _ = TOOL_REGISTRY[tool_name]
-    result = fn(profile, tool_input)
+    if tool_name == "phase_summary":
+        result = tool_phase_summary(profile, tool_input, summary=summary)
+    else:
+        result = fn(profile, tool_input)
     return json.dumps(result, default=str)
 
 
