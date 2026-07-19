@@ -99,6 +99,25 @@ def compute_top_kernels(
     return _aggregate_kernel_summaries(evts, total_gpu_s, limit, device_info, launch_overhead)
 
 
+def _population_variance(values: list[int], mean: float) -> float:
+    """Population variance via a two-pass sum of squared deviations.
+
+    The previous form, ``sum(x*x)/n - mean**2``, subtracts two large nearly
+    equal quantities. In ns units on long kernels the summands reach ~1e18 and
+    the result loses several digits — enough that it could go negative, which
+    was masked by a ``max(0.0, ...)`` clamp. Accumulating deviations from the
+    mean keeps the summands small, so no clamp is needed and the result is
+    non-negative by construction.
+
+    Two-pass is used rather than Welford because the mean is already computed
+    and the values are materialised; it is both simpler and more accurate.
+    """
+    n = len(values)
+    if n < 2:
+        return 0.0
+    return sum((v - mean) ** 2 for v in values) / n
+
+
 def _aggregate_kernel_summaries(
     evts: list[KernelRow],
     total_gpu_s: float,
@@ -119,9 +138,8 @@ def _aggregate_kernel_summaries(
         durations = [e.duration_ns for e in grp]
         total_ns = sum(durations)
         avg_ns = total_ns / n
-        sum_sq = sum(d * d for d in durations)
-        variance = (sum_sq / n - avg_ns**2) if n > 1 else 0.0
-        std_dev_ms = math.sqrt(max(0.0, variance)) / 1e6
+        variance = _population_variance(durations, avg_ns)
+        std_dev_ms = math.sqrt(variance) / 1e6
         avg_ms = avg_ns / 1e6
         cv = round(std_dev_ms / avg_ms, 3) if avg_ms > 0 else 0.0
 
