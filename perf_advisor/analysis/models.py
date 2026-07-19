@@ -37,11 +37,15 @@ class KernelSummary(BaseModel):
     )
     avg_registers_per_thread: int = 0
     avg_shared_mem_bytes: int = 0
-    estimated_occupancy: float | None = Field(
+    wave_fill_ratio: float | None = Field(
         default=None,
         description=(
-            "Estimated wave occupancy (0–1):"
-            " avg launch threads / (device units × max threads per unit)"
+            "How much of one full device wave the launch geometry fills (0–1): "
+            "avg launch threads / (device units × max threads per unit), capped at 1.0. "
+            "This is NOT occupancy: it ignores register and shared-memory limits, and "
+            "any kernel launching more than one wave saturates at 1.0. A low value means "
+            "the launch is too small to fill the device; a value of 1.0 says only that "
+            "the grid is at least one wave, not that achieved occupancy is high."
         ),
     )
     avg_launch_overhead_us: float | None = Field(

@@ -646,7 +646,7 @@ class RocpdProfile:
 
         Maps AMD CUs → DeviceInfo.sm_count and max_waves_per_cu × wave_front_size
         → DeviceInfo.max_threads_per_sm so downstream analysis treats CUs the
-        same as NVIDIA SMs for occupancy estimation.
+        same as NVIDIA SMs for wave-fill estimation.
         """
         from perf_advisor.analysis.models import DeviceInfo  # lazy to avoid circular import
 

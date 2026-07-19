@@ -133,11 +133,11 @@ def test_rocpd_kernel_short_name_type(synthetic_rocpd_profile):
     assert all(k.short_name is None or isinstance(k.short_name, str) for k in kernels)
 
 
-def test_rocpd_kernel_occupancy_none(synthetic_rocpd_profile):
-    # rocpd KernelRow lacks thread-count fields; occupancy cannot be estimated
+def test_rocpd_kernel_wave_fill_ratio_none(synthetic_rocpd_profile):
+    # rocpd KernelRow lacks thread-count fields; wave fill cannot be estimated
     device_info = compute_device_info(synthetic_rocpd_profile)
     kernels = compute_top_kernels(synthetic_rocpd_profile, device_info=device_info)
-    assert all(k.estimated_occupancy is None for k in kernels)
+    assert all(k.wave_fill_ratio is None for k in kernels)
 
 
 def test_rocpd_memcpy_kinds_count(synthetic_rocpd_profile):

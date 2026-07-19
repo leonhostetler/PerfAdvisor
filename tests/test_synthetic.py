@@ -188,9 +188,9 @@ def test_synthetic_device_info(synthetic_profile):
 def test_synthetic_occupancy_computed(synthetic_profile):
     device_info = compute_device_info(synthetic_profile)
     kernels = compute_top_kernels(synthetic_profile, device_info=device_info)
-    # All kernels should have estimated_occupancy set
-    assert all(k.estimated_occupancy is not None for k in kernels)
-    assert all(0.0 < k.estimated_occupancy <= 1.0 for k in kernels)
+    # All kernels should have wave_fill_ratio set
+    assert all(k.wave_fill_ratio is not None for k in kernels)
+    assert all(0.0 < k.wave_fill_ratio <= 1.0 for k in kernels)
 
 
 def test_synthetic_bandwidth_pct_computed(synthetic_profile):

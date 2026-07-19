@@ -16,9 +16,10 @@ Known format-specific None fields (by design, not defects):
     - l2_cache_MiB: None for rocpd
   KernelSummary level:
     - short_name: optional for rocpd (from extdata truncated_kernel_name or fallback parsing)
-    - estimated_occupancy: None for rocpd (no thread-count fields on KernelRow)
+    - wave_fill_ratio: None for rocpd (no thread-count fields on KernelRow)
     - avg_launch_overhead_us / max_launch_overhead_us: None for rocpd (no CPU-GPU correlation)
 """
+
 from __future__ import annotations
 
 import pytest
@@ -326,9 +327,9 @@ def test_rocpd_kernel_short_name_type(rocpd_summary):
             assert isinstance(k.short_name, str)
 
 
-def test_rocpd_kernel_estimated_occupancy_is_none(rocpd_summary):
+def test_rocpd_kernel_wave_fill_ratio_is_none(rocpd_summary):
     for k in rocpd_summary.top_kernels:
-        assert k.estimated_occupancy is None
+        assert k.wave_fill_ratio is None
 
 
 def test_rocpd_kernel_launch_overhead_is_none(rocpd_summary):

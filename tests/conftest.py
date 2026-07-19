@@ -1241,7 +1241,6 @@ def real_rocpd_path(real_rocpd_dir: Path) -> Path:
     ranks = sorted(real_rocpd_dir.glob("rank_*_results.db"))
     if not ranks:
         pytest.skip(
-            f"No rank_*_results.db files found under {real_rocpd_dir} "
-            f"(from {_ROCPD_FIXTURE_ENV})."
+            f"No rank_*_results.db files found under {real_rocpd_dir} (from {_ROCPD_FIXTURE_ENV})."
         )
     return ranks[0]

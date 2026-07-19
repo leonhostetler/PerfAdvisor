@@ -18,29 +18,20 @@ def _make_nsys_empty_tables(path) -> None:
     conn.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
     conn.execute("INSERT INTO StringIds VALUES (1, 'placeholder')")
     conn.execute(
-        "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-        "(start INTEGER, end INTEGER, shortName INTEGER)"
+        "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER, shortName INTEGER)"
     )
     conn.execute(
         "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY "
         "(start INTEGER, end INTEGER, bytes INTEGER, copyKind INTEGER)"
     )
     conn.execute(
-        "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME "
-        "(start INTEGER, end INTEGER, nameId INTEGER)"
+        "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (start INTEGER, end INTEGER, nameId INTEGER)"
     )
     conn.execute(
-        "CREATE TABLE NVTX_EVENTS "
-        "(start INTEGER, end INTEGER, text TEXT, eventType INTEGER)"
+        "CREATE TABLE NVTX_EVENTS (start INTEGER, end INTEGER, text TEXT, eventType INTEGER)"
     )
-    conn.execute(
-        "CREATE TABLE MPI_COLLECTIVES_EVENTS "
-        "(start INTEGER, end INTEGER, textId INTEGER)"
-    )
-    conn.execute(
-        "CREATE TABLE MPI_P2P_EVENTS "
-        "(start INTEGER, end INTEGER, textId INTEGER)"
-    )
+    conn.execute("CREATE TABLE MPI_COLLECTIVES_EVENTS (start INTEGER, end INTEGER, textId INTEGER)")
+    conn.execute("CREATE TABLE MPI_P2P_EVENTS (start INTEGER, end INTEGER, textId INTEGER)")
     conn.commit()
     conn.close()
 
@@ -50,13 +41,10 @@ def _make_rocpd_empty_tables(path) -> None:
     conn = sqlite3.connect(str(path))
     conn.execute("CREATE TABLE rocpd_metadata (tag TEXT, value TEXT)")
     conn.execute("INSERT INTO rocpd_metadata VALUES ('schema_version', '3')")
-    conn.execute(
-        "CREATE TABLE rocpd_string (id INTEGER, guid TEXT, string TEXT)"
-    )
+    conn.execute("CREATE TABLE rocpd_string (id INTEGER, guid TEXT, string TEXT)")
     conn.execute("INSERT INTO rocpd_string VALUES (1, 'test', 'placeholder')")
     conn.execute(
-        "CREATE TABLE rocpd_kernel_dispatch "
-        "(id INTEGER, guid TEXT, start INTEGER, end INTEGER)"
+        "CREATE TABLE rocpd_kernel_dispatch (id INTEGER, guid TEXT, start INTEGER, end INTEGER)"
     )
     conn.execute(
         "CREATE TABLE rocpd_memory_copy "
@@ -96,12 +84,8 @@ def test_nsys_populated_tables_still_yield_true(tmp_path):
     path = tmp_path / "populated.sqlite"
     _make_nsys_empty_tables(path)
     conn = sqlite3.connect(str(path))
-    conn.execute(
-        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (1000, 2000, 1)"
-    )
-    conn.execute(
-        "INSERT INTO MPI_COLLECTIVES_EVENTS VALUES (500, 600, 1)"
-    )
+    conn.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (1000, 2000, 1)")
+    conn.execute("INSERT INTO MPI_COLLECTIVES_EVENTS VALUES (500, 600, 1)")
     conn.commit()
     conn.close()
     with NsysProfile(path) as p:

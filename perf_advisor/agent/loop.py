@@ -212,6 +212,34 @@ Only standard SQLite functions — no PERCENTILE_CONT, MEDIAN, STDDEV. All times
 Not all tables are present in every profile. Use get_table_schema before writing SQL.\
 """
 
+_METRIC_GLOSSARY = """\
+## Metric definitions
+
+Several fields are easy to misread. Use these definitions exactly:
+
+  - gpu_kernel_s: total kernel *work* — the sum of individual kernel durations. Kernels running
+        concurrently on different streams each contribute in full, so this can exceed the
+        wall-clock span. Do not treat it as elapsed time.
+  - gpu_busy_s: wall-clock time with at least one kernel running (overlaps merged). This is
+        elapsed time and is bounded by profile_span_s.
+  - kernel_concurrency_factor: gpu_kernel_s / gpu_busy_s. 1.0 means kernels never overlapped;
+        higher values mean concurrent execution. A value near 1.0 on a multi-stream workload
+        is itself a finding — the streams are not actually overlapping.
+  - gpu_utilization_pct: gpu_busy_s / profile_span_s × 100. Never exceeds 100.
+  - wave_fill_ratio: how much of ONE full device wave the launch geometry fills (0–1). This is
+        NOT occupancy — it ignores register and shared-memory limits, and any kernel launching
+        more than one wave saturates at 1.0. A low value means the grid is too small to fill the
+        device. A value of 1.0 says only that the grid is at least one wave; it does NOT mean
+        achieved occupancy is high, so never claim good or bad occupancy from this field alone.
+  - total_gpu_idle_s: sum of gaps *between* kernel execution intervals. Idle before the first
+        kernel or after the last is excluded.
+  - cv: coefficient of variation of a kernel's duration (std_dev / avg). High cv means the same
+        kernel varies a lot run to run — often load imbalance or contention.
+  - Per-phase time totals are clipped to the phase window, but per-phase breakdown tables list
+        every event overlapping the window with its full duration, so a long event can appear in
+        more than one phase's table.\
+"""
+
 _SYSTEM_PROMPT_VENDOR_NEUTRAL = (
     "You are an expert GPU performance engineer analyzing a GPU profile.\n"
     "\n"
@@ -219,6 +247,8 @@ _SYSTEM_PROMPT_VENDOR_NEUTRAL = (
     "list of actionable hypotheses.\n"
     "\n"
     f"{_HYPOTHESIS_SCHEMA}\n"
+    "\n"
+    f"{_METRIC_GLOSSARY}\n"
     "\n"
     "The profile_summary and phase_summary results have already been pre-loaded for you as the\n"
     "first tool-result exchange in this conversation — do not call those tools again.\n"
@@ -372,6 +402,8 @@ You are an expert GPU performance engineer. Analyze the following GPU profile su
 and produce a ranked list of actionable performance hypotheses.
 
 {_HYPOTHESIS_SCHEMA}
+
+{_METRIC_GLOSSARY}
 {_UNTRUSTED_DATA_NOTE}
 {grounding_section}{device_section}{cap_section}
 The summary includes a 'phases' field that partitions the profile into sequential, non-overlapping

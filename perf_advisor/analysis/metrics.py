@@ -130,9 +130,17 @@ def _aggregate_kernel_summaries(
         threads_vals = [e.total_threads for e in grp if e.total_threads is not None]
         avg_total_threads = sum(threads_vals) / len(threads_vals) if threads_vals else 0.0
 
-        occupancy = None
+        # Fraction of one full device wave the launch geometry fills. Deliberately
+        # not called occupancy: it ignores register and shared-memory limits (the
+        # usual occupancy limiters) and saturates at 1.0 for any multi-wave grid.
+        # True occupancy would need the per-SM register file size and max blocks
+        # per SM with compute-capability-specific allocation granularity, none of
+        # which the profile's device metadata provides.
+        wave_fill_ratio = None
         if sm_count and max_threads_per_sm and avg_total_threads > 0:
-            occupancy = round(min(1.0, avg_total_threads / (sm_count * max_threads_per_sm)), 3)
+            wave_fill_ratio = round(
+                min(1.0, avg_total_threads / (sm_count * max_threads_per_sm)), 3
+            )
 
         short_name = grp[0].short_name
         short = short_name if short_name and short_name != norm_name else None
@@ -154,7 +162,7 @@ def _aggregate_kernel_summaries(
                 cv=cv,
                 avg_registers_per_thread=int(round(avg_registers)),
                 avg_shared_mem_bytes=int(round(avg_shared)),
-                estimated_occupancy=occupancy,
+                wave_fill_ratio=wave_fill_ratio,
                 avg_launch_overhead_us=oh[0] if oh else None,
                 max_launch_overhead_us=oh[1] if oh else None,
             )
@@ -504,7 +512,7 @@ def compute_phase_summary(
     """Compute full metrics for a single PhaseWindow.
 
     Pass ``mpi_ops`` to supply pre-computed MPI data (avoids an extra scan).
-    Pass ``device_info`` (from compute_device_info) to enable occupancy metrics.
+    Pass ``device_info`` (from compute_device_info) to enable wave-fill metrics.
     Pass ``launch_overhead`` (from profile.launch_overhead()) to annotate kernels.
     """
     all_kernel = profile.kernel_events()
