@@ -126,13 +126,11 @@ Each hypothesis object must have these fields:
   - runtime_fraction_pct: fraction (0–100) of this phase's wall-clock time attributable to this
            bottleneck. Compute directly from profile data where possible (e.g.
            MPI_Barrier total_s / phase duration_s × 100). Use null if not computable.
-  - estimated_speedup_pct_lower: lower-bound speedup from partial (50%) mitigation of this
-           bottleneck, expressed as percent phase-time reduction. Formula:
-           (1 / (1 − 0.5 × F) − 1) × 100 where F = runtime_fraction_pct / 100. Null if
-           runtime_fraction_pct is null.
-  - estimated_speedup_pct_upper: upper-bound speedup if the bottleneck is fully eliminated (%).
-           Formula: (1 / (1 − F) − 1) × 100 where F = runtime_fraction_pct / 100. Null if
-           runtime_fraction_pct is null.
+           Take care to get this right: the reported speedup bounds are derived from it
+           by Amdahl's law, so an inflated fraction produces an inflated speedup claim.
+           Do not emit estimated_speedup_pct_lower or estimated_speedup_pct_upper — those
+           are computed from runtime_fraction_pct automatically and any values you supply
+           are discarded.
   - confidence: quality of evidence supporting this hypothesis:
       high   — directly visible in timeline data (explicit timing, kernel duration in profile)
       medium — inferred from derived metrics (gap histogram, utilization ratio, phase aggregates)

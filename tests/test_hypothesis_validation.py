@@ -109,3 +109,63 @@ def test_missing_fields_get_safe_defaults():
     assert out[0]["bottleneck_type"] == "other"
     assert out[0]["confidence"] == "low"
     assert out[0]["action_category"] is None
+
+
+# --- Amdahl speedup bounds -------------------------------------------------
+
+
+def test_speedup_bounds_are_derived_not_trusted():
+    """Model-supplied bounds are discarded and recomputed from the fraction."""
+    h = Hypothesis.model_validate(
+        {
+            "runtime_fraction_pct": 50.0,
+            "estimated_speedup_pct_lower": 999.0,  # nonsense from the model
+            "estimated_speedup_pct_upper": 999.0,
+        }
+    )
+    # F=0.5: lower = 1/(1-0.25)-1 = 33.3%, upper = 1/(1-0.5)-1 = 100%
+    assert h.estimated_speedup_pct_lower == 33.3
+    assert h.estimated_speedup_pct_upper == 100.0
+
+
+def test_speedup_bounds_known_values():
+    h = Hypothesis.model_validate({"runtime_fraction_pct": 20.0})
+    # F=0.2: lower = 1/0.9-1 = 11.1%, upper = 1/0.8-1 = 25%
+    assert h.estimated_speedup_pct_lower == 11.1
+    assert h.estimated_speedup_pct_upper == 25.0
+
+
+def test_zero_fraction_gives_zero_speedup():
+    h = Hypothesis.model_validate({"runtime_fraction_pct": 0.0})
+    assert h.estimated_speedup_pct_lower == 0.0
+    assert h.estimated_speedup_pct_upper == 0.0
+
+
+def test_null_fraction_nulls_both_bounds():
+    h = Hypothesis.model_validate(
+        {"estimated_speedup_pct_lower": 50.0, "estimated_speedup_pct_upper": 80.0}
+    )
+    assert h.runtime_fraction_pct is None
+    assert h.estimated_speedup_pct_lower is None
+    assert h.estimated_speedup_pct_upper is None
+
+
+def test_full_fraction_gives_unbounded_upper():
+    """F=1 means eliminating the bottleneck leaves zero runtime: no finite bound."""
+    h = Hypothesis.model_validate({"runtime_fraction_pct": 100.0})
+    assert h.estimated_speedup_pct_upper is None
+    assert h.estimated_speedup_pct_lower == 100.0
+    assert any("unbounded" in n for n in h.coercion_notes)
+
+
+def test_upper_bound_always_at_least_lower_bound():
+    for pct in (1.0, 10.0, 33.3, 50.0, 75.0, 99.0):
+        h = Hypothesis.model_validate({"runtime_fraction_pct": pct})
+        assert h.estimated_speedup_pct_upper >= h.estimated_speedup_pct_lower
+
+
+def test_bounds_derived_after_clamping():
+    """An out-of-range fraction is clamped first, then bounds follow the clamp."""
+    h = Hypothesis.model_validate({"runtime_fraction_pct": -10.0})
+    assert h.runtime_fraction_pct == 0.0
+    assert h.estimated_speedup_pct_upper == 0.0

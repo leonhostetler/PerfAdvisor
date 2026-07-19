@@ -511,6 +511,10 @@ _ACTION_ALIASES: dict[str, str] = {
     "algorithmic": "algorithm",
 }
 
+# Above this fraction the full-elimination Amdahl bound diverges; report null
+# rather than an arbitrarily large finite number.
+_AMDAHL_MAX_FRACTION = 0.999
+
 _IMPACT_ALIASES: dict[str, str] = {
     "very_high": "high",
     "critical": "high",
@@ -611,6 +615,38 @@ class Hypothesis(BaseModel):
         if notes:
             out["coercion_notes"] = list(out.get("coercion_notes") or []) + notes
         return out
+
+    @model_validator(mode="after")
+    def _derive_speedup_bounds(self) -> Hypothesis:
+        """Recompute the Amdahl bounds from runtime_fraction_pct.
+
+        Both bounds are pure functions of F, so they are derived here rather
+        than trusted from the model — LLM arithmetic is the weakest link in an
+        otherwise deterministic calculation, and a wrong bound here reads as a
+        precise, profile-grounded number.
+
+        lower = partial (50%) mitigation, upper = full elimination:
+            lower = (1 / (1 - 0.5F) - 1) x 100
+            upper = (1 / (1 - F)       - 1) x 100
+        """
+        if self.runtime_fraction_pct is None:
+            self.estimated_speedup_pct_lower = None
+            self.estimated_speedup_pct_upper = None
+            return self
+
+        f = self.runtime_fraction_pct / 100.0
+        self.estimated_speedup_pct_lower = round((1.0 / (1.0 - 0.5 * f) - 1.0) * 100.0, 1)
+        if f >= _AMDAHL_MAX_FRACTION:
+            # F -> 1 sends the full-elimination bound to infinity; reporting a
+            # finite number there would be meaningless precision.
+            self.estimated_speedup_pct_upper = None
+            self.coercion_notes = self.coercion_notes + [
+                f"runtime_fraction_pct={self.runtime_fraction_pct} leaves no residual runtime; "
+                "upper speedup bound is unbounded and was set to null"
+            ]
+        else:
+            self.estimated_speedup_pct_upper = round((1.0 / (1.0 - f) - 1.0) * 100.0, 1)
+        return self
 
 
 class HypothesisReport(BaseModel):
