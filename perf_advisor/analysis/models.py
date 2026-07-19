@@ -238,13 +238,17 @@ class ProfileSummary(BaseModel):
     # CPU–GPU overlap (absent if runtime API tracing was not captured)
     cpu_sync_blocked_s: float | None = Field(
         default=None,
-        description="Total CPU time spent in GPU sync calls (*Synchronize) during the profile",
+        description=(
+            "Wall-clock time the host was blocked in GPU sync calls (*Synchronize). "
+            "Concurrent calls across host threads are merged, not summed, so this is "
+            "bounded by profile_span_s"
+        ),
     )
     cpu_sync_blocked_pct: float | None = Field(
         default=None,
         description=(
-            "cpu_sync_blocked_s as a fraction of total GPU kernel time (0–100);"
-            " high value means GPU is being serialized by CPU sync barriers"
+            "cpu_sync_blocked_s as a percentage of profile_span_s (0–100); a high value "
+            "means the host spent much of the run stalled waiting on the GPU"
         ),
     )
 

@@ -42,7 +42,7 @@ The pipeline has two distinct stages:
 - **Memory transfer summary** — by direction (H2D/D2H/D2D), with effective bandwidth vs. peak
 - **MPI breakdown** — per-operation total and call count (collectives, P2P, wait)
 - **GPU idle histogram** — bucketed gap distribution (`<10µs` through `>100ms`)
-- **CPU–GPU overlap** — time the CPU spent blocked in `*Synchronize` calls
+- **CPU–GPU overlap** — wall-clock time the host spent blocked in `*Synchronize` calls, reported as `cpu_sync_blocked_s` with `cpu_sync_blocked_pct` relative to the profile span. Concurrent calls across host threads are merged rather than summed, so the figure is bounded by the wall clock (nsys only; rocpd does not expose the equivalent host-side timing)
 - **Stream utilization** — per-CUDA-stream GPU time and percentage
 - **Marker ranges** — NVTX annotations (NVIDIA) or rocTX ranges (AMD), if present
 - **Hardware properties** — SM/CU count, peak memory bandwidth, total HBM, L2 cache size, thread/register/shared-memory limits, and clock rate from device metadata tables; injected into the agent's system prompt so the model can reason about hardware constraints (e.g. whether a kernel is approaching the memory bandwidth ceiling for this specific GPU)

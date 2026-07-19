@@ -78,8 +78,8 @@ def compute_gpu_sync_time(profile: Profile) -> float:
     return profile.gpu_sync_time_s()
 
 
-def compute_cpu_sync_time(profile: Profile, kernel_s: float) -> tuple[float, float]:
-    return profile.cpu_sync_blocked_s(kernel_s)
+def compute_cpu_sync_time(profile: Profile, span_s: float) -> tuple[float, float]:
+    return profile.cpu_sync_blocked_s(span_s)
 
 
 def _compute_launch_overhead(profile: Profile) -> dict[str, tuple[float, float]]:
@@ -607,7 +607,7 @@ def compute_profile_summary(
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
     loh = profile.launch_overhead()
-    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(kernel_s)
+    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(span_s)
 
     t_phase = time.perf_counter()
     if _phase_state is not None:
@@ -693,7 +693,7 @@ def compute_profile_summary_and_state(
     sync_s = compute_gpu_sync_time(profile)
     total_idle_s, gap_histogram = compute_gap_histogram(profile)
     loh = profile.launch_overhead()
-    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(kernel_s)
+    cpu_sync_s, cpu_sync_pct = profile.cpu_sync_blocked_s(span_s)
 
     t_phase = time.perf_counter()
     state, selected_k, cost_curve = compute_phase_state_and_cost_curve(

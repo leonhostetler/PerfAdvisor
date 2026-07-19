@@ -638,7 +638,7 @@ class RocpdProfile:
     def launch_overhead(self) -> dict[str, tuple[float, float]]:
         return {}
 
-    def cpu_sync_blocked_s(self, kernel_s: float) -> tuple[float | None, float | None]:
+    def cpu_sync_blocked_s(self, span_s: float) -> tuple[float | None, float | None]:
         return None, None
 
     def device_info(self) -> DeviceInfo:

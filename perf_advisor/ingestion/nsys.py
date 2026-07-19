@@ -667,8 +667,14 @@ class NsysProfile:
             clock_rate_MHz=clock_MHz,
         )
 
-    def cpu_sync_blocked_s(self, kernel_s: float) -> tuple[float | None, float | None]:
-        """Return (total_sync_s, pct_of_gpu_kernel_time) for synchronization API calls.
+    def cpu_sync_blocked_s(self, span_s: float) -> tuple[float | None, float | None]:
+        """Return (wall_clock_sync_s, pct_of_profile_span) for synchronization API calls.
+
+        Intervals are merged rather than summed: a multi-threaded host can have
+        several threads blocked in *Synchronize concurrently, and summing their
+        durations can report more blocked time than the profile's wall clock.
+        The merged figure answers the actionable question — how much of the run
+        was the host stalled waiting on the GPU — and is bounded by the span.
 
         Returns (None, None) if RUNTIME is not present or lacks nameId.
         """
@@ -677,16 +683,19 @@ class NsysProfile:
         if "nameId" not in set(self.columns("CUPTI_ACTIVITY_KIND_RUNTIME")):
             return None, None
         rows = self.query("""
-            SELECT COALESCE(SUM(rt.end - rt.start), 0) / 1e9 AS sync_s
+            SELECT rt.start, rt.end
             FROM CUPTI_ACTIVITY_KIND_RUNTIME rt
             JOIN StringIds s ON rt.nameId = s.id
             WHERE s.value LIKE '%Synchronize%'
               AND rt.end IS NOT NULL
+              AND rt.end > rt.start
         """)
-        if not rows or rows[0]["sync_s"] is None:
+        if not rows:
             return None, None
-        sync_s = round(float(rows[0]["sync_s"]), 3)
-        pct = round(100.0 * sync_s / kernel_s, 1) if kernel_s > 0 else None
+        from perf_advisor.analysis._utils import busy_time_ns
+
+        sync_s = round(busy_time_ns((r["start"], r["end"]) for r in rows) / 1e9, 3)
+        pct = round(100.0 * sync_s / span_s, 1) if span_s > 0 else None
         return sync_s, pct
 
     # ------------------------------------------------------------------
