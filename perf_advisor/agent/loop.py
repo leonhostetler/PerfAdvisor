@@ -637,6 +637,13 @@ def _preseed_messages(
         )
 
     # Cache marker goes on the last result so the whole pre-seed block is cached.
+    # Left on the default 5m TTL rather than 1h: this prefix is profile-specific, so
+    # it gets no cross-run reuse, and the only thing 1h would buy is surviving a turn
+    # that runs longer than 5 minutes (possible — tool calls query multi-GB SQLite).
+    # That trade only pays off if such a turn is more likely than not: 1h costs
+    # +0.75× on the write, an expiry costs ~1.15× to re-establish. If profiling shows
+    # slow turns are common, revisit. The tools + system checkpoint on the system
+    # block is 1h, so even a stalled turn keeps that portion cached.
     tool_results[-1]["cache_control"] = {"type": "ephemeral"}
 
     return [
@@ -700,28 +707,42 @@ def _run_api(
         profile_format=profile.format,
         capabilities=profile.capabilities,
     )
-    # When pre-seeding is active, the single permanent cache marker lives on the
-    # last pre-seed tool result (set in _preseed_messages).  That checkpoint covers
-    # tools + system + preseed in one unit, leaving 3 of the 4 allowed markers for
-    # the 2-slot sliding window plus one in reserve.
-    # When pre-seeding is absent (summary is None), fall back to marking the system
-    # prompt directly so at least the static system text is cached.
-    _system_cache = {"type": "ephemeral"} if summary is None else None
-    _system_block: dict = {"type": "text", "text": _system_text}
-    if _system_cache is not None:
-        _system_block["cache_control"] = _system_cache
+    # The system block always carries a marker.  Render order is tools → system →
+    # messages, so this checkpoint covers tools + system: a profile-independent
+    # prefix shared by every run, including the parallel workers the eval harness
+    # fans out (see __main__.py). The pre-seed marker below covers the same bytes
+    # plus the profile-specific summary, so within a single run this checkpoint is
+    # redundant; its value is cross-run reuse.
+    #
+    # 1h TTL: this prefix is read across every turn of every profile in a sweep, so
+    # it clears the 3-read break-even for the 2× write premium (vs 1.25× at 5m) many
+    # times over. The per-turn markers below stay on the 5m default — consecutive
+    # turns are close together and only need 2 reads to pay off.
+    #
+    # Size caveat: tools + system is ~4.4K estimated tokens against a 4096-token
+    # minimum cacheable prefix on Opus 4.8 (the highest per-model floor). That is a
+    # thin margin on a chars/token heuristic. A prefix under the minimum makes the
+    # marker a silent no-op — no error, no charge, just cache_creation_input_tokens
+    # of 0 — so this is safe either way, but confirm with count_tokens before
+    # relying on the saving.
+    _system_block: dict = {
+        "type": "text",
+        "text": _system_text,
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
     _system = [_system_block]
     input_tokens = 0
     output_tokens = 0
     cache_creation_tokens = 0
     cache_read_tokens = 0
-    # Anthropic allows at most 4 cache_control blocks per request.
-    # We use 1 permanent marker (on the last pre-seed tool result, which implicitly
-    # covers tools + system + preseed) and keep the 2 most-recent per-turn user
-    # messages marked, giving true sliding cache:
-    #   turn N reads everything through turn N-1 from cache (0.10×)
-    #   turn N writes only the new increment to cache (1.25×)
-    # The fourth marker slot is left free for future use.
+    # Anthropic allows at most 4 cache_control blocks per request. The full budget:
+    #   1. system block (tools + system; cross-run, 1h TTL) — set above
+    #   2. last pre-seed tool result (tools + system + preseed; per-profile)
+    #   3-4. the 2 most-recent per-turn user messages, giving true sliding cache:
+    #        turn N reads everything through turn N-1 from cache (0.10×)
+    #        turn N writes only the new increment to cache (1.25×)
+    # That is exactly 4 with pre-seeding on, 3 without — no slot in reserve, so any
+    # new checkpoint has to displace one of these.
     # When a third per-turn message is about to be added, the oldest is stripped.
     _cache_prev: dict | None = None  # turn N-1 (keep marker)
     _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)

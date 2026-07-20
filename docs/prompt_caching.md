@@ -6,6 +6,8 @@ PerfAdvisor's agent loop replays the full conversation history on every API call
 
 Prompt caching addresses this: the static prefix is written to a provider-managed cache on the first call and re-read at a fraction of the normal input cost on all subsequent calls. For a typical 18-turn run with a 12,000-token prefix, this reduces billable input tokens by approximately 75–80%.
 
+Caching also spans runs, not just turns. The `evaluate` subcommand fans profiles out across a `ProcessPoolExecutor`; every one of those workers sends an identical tool-schema and system-prompt prefix, so that portion is checkpointed separately from any profile-specific content (see the Anthropic section below).
+
 Pre-seeding (injecting the pre-computed `profile_summary` and `phase_summary` results as fake tool turns before the first API call) is a complementary optimization that saves 2–3 API round-trips. Caching makes pre-seeding even more cost-effective: the pre-seed block is written to cache once and read cheaply on every subsequent turn.
 
 ---
@@ -18,20 +20,26 @@ Anthropic's API supports explicit prompt caching via `cache_control: {"type": "e
 
 ### What we implemented
 
-We use a **sliding cache window** that occupies three of the four marker slots (`_run_api` in `agent/loop.py`); the fourth is left in reserve:
+We use a **sliding cache window** plus two fixed checkpoints, occupying all four marker slots (`_run_api` in `agent/loop.py`):
 
-1. **Permanent pre-seed marker** (`_preseed_messages`): The last tool result in the pre-seed block receives a permanent `cache_control: {"type": "ephemeral"}`. This covers the full static prefix — system prompt, tool schemas, and pre-seeded profile summary — as a single cache unit. It is set once and never moved.
+1. **Cross-run system marker**: The system content block carries `cache_control: {"type": "ephemeral", "ttl": "1h"}`. Render order is `tools` → `system` → `messages`, so this checkpoint covers **tools + system** — a prefix that does not depend on which profile is being analysed. Every run shares it, including the parallel workers the eval harness fans out via `ProcessPoolExecutor`. The 1h TTL is justified here because the prefix is read across every turn of every profile in a sweep, comfortably clearing the three-read break-even for the 2× write premium.
 
-   When pre-seeding is disabled (no summary provided), the marker falls back to the system prompt content block directly.
+   Caveat: tools + system is ~4.4K estimated tokens against Opus 4.8's 4096-token minimum cacheable prefix (the highest per-model floor). That is a thin margin on a chars/token heuristic. A prefix below the minimum makes the marker a silent no-op — no error and no charge, just `cache_creation_input_tokens: 0` — so the marker is safe either way, but the saving should be confirmed with `count_tokens` before being relied on.
 
-2. **Sliding per-turn markers**: Two additional "floating" markers track the two most recently added user messages. After each tool-call round-trip:
+2. **Permanent pre-seed marker** (`_preseed_messages`): The last tool result in the pre-seed block receives a permanent `cache_control: {"type": "ephemeral"}` on the default 5-minute TTL. This covers the full static prefix — system prompt, tool schemas, and pre-seeded profile summary — as a single cache unit. It is set once and never moved. Within a single run it supersedes checkpoint 1; checkpoint 1's value is cross-run reuse.
+
+   It stays at 5m rather than 1h because the prefix is profile-specific (no cross-run reuse), so 1h would only buy protection against a turn exceeding five minutes. That trade needs such a turn to be more likely than not: 1h costs +0.75× on the write, an expiry costs ~1.15× to re-establish.
+
+   When pre-seeding is disabled (no summary provided), this marker is absent and only three slots are used.
+
+3. **Sliding per-turn markers**: Two additional "floating" markers track the two most recently added user messages, on the default 5-minute TTL — consecutive turns are close together and need only two reads to pay off. After each tool-call round-trip:
    - The newest user message (current tool results) receives a `cache_control` marker.
    - The previous floating marker is retained.
-   - When adding the new marker would exceed the three-floating-marker budget (4 total minus the permanent one), the oldest floating marker is stripped from its message content.
+   - When adding the new marker would exceed the two-floating-marker budget (4 total minus the system and pre-seed markers), the oldest floating marker is stripped from its message content.
 
    On turn N, the entire context through turn N−1 is served from cache; only the new tool-result exchange is billed as cache-creation input.
 
-3. **Token accounting**: `cache_creation_input_tokens` and `cache_read_input_tokens` are read from each response's `usage` object and accumulated across turns. The CLI reports them in the post-run token summary alongside a computed cost-equivalent token count.
+4. **Token accounting**: `cache_creation_input_tokens` and `cache_read_input_tokens` are read from each response's `usage` object and accumulated across turns. The CLI reports them in the post-run token summary alongside a computed cost-equivalent token count.
 
 ### Savings
 
@@ -55,7 +63,7 @@ No explicit markers are needed. The multi-turn agent loop (`_run_openai`) gets a
 - The system prompt is prepended as the first `{"role": "system"}` message on every turn, making the long static prefix eligible for prefix caching.
 - Pre-seeding uses OpenAI's `tool_calls` / `role:"tool"` message format, keeping the prefix structurally stable across turns.
 
-The verbose output reads `prompt_tokens_details.cached_tokens` from each response and reports it alongside the total context size per turn.
+The verbose output reads `usage.input_tokens_details.cached_tokens` from each response and reports it alongside the total context size per turn. (Under the older Chat Completions API this field was `prompt_tokens_details.cached_tokens`; the Responses API migration renamed it.)
 
 The `compare` subcommand's OpenAI backend (`_call_openai` in `agent/compare.py`) sends a single-turn request with no pre-seeding; prefix caching provides no benefit there.
 
