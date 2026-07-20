@@ -20,26 +20,33 @@ Anthropic's API supports explicit prompt caching via `cache_control: {"type": "e
 
 ### What we implemented
 
-We use a **sliding cache window** plus two fixed checkpoints, occupying all four marker slots (`_run_api` in `agent/loop.py`):
+We use a **sliding cache window** plus one fixed checkpoint, occupying three of the four marker slots (`_run_api` in `agent/loop.py`). Every marker uses the default 5-minute TTL.
 
-1. **Cross-run system marker**: The system content block carries `cache_control: {"type": "ephemeral", "ttl": "1h"}`. Render order is `tools` → `system` → `messages`, so this checkpoint covers **tools + system** — a prefix that does not depend on which profile is being analysed. Every run shares it, including the parallel workers the eval harness fans out via `ProcessPoolExecutor`. The 1h TTL is justified here because the prefix is read across every turn of every profile in a sweep, comfortably clearing the three-read break-even for the 2× write premium.
+1. **Permanent pre-seed marker** (`_preseed_messages`): The last tool result in the pre-seed block receives a permanent `cache_control: {"type": "ephemeral"}`. Render order is `tools` → `system` → `messages`, so this single checkpoint covers the full static prefix — tool schemas, system prompt, and pre-seeded profile summary — as one cache unit. It is set once and never moved.
 
-   Caveat: tools + system is ~4.4K estimated tokens against Opus 4.8's 4096-token minimum cacheable prefix (the highest per-model floor). That is a thin margin on a chars/token heuristic. A prefix below the minimum makes the marker a silent no-op — no error and no charge, just `cache_creation_input_tokens: 0` — so the marker is safe either way, but the saving should be confirmed with `count_tokens` before being relied on.
+   When pre-seeding is disabled (no summary provided), the marker moves to the system content block instead, so tools + system are still cached from the first call.
 
-2. **Permanent pre-seed marker** (`_preseed_messages`): The last tool result in the pre-seed block receives a permanent `cache_control: {"type": "ephemeral"}` on the default 5-minute TTL. This covers the full static prefix — system prompt, tool schemas, and pre-seeded profile summary — as a single cache unit. It is set once and never moved. Within a single run it supersedes checkpoint 1; checkpoint 1's value is cross-run reuse.
-
-   It stays at 5m rather than 1h because the prefix is profile-specific (no cross-run reuse), so 1h would only buy protection against a turn exceeding five minutes. That trade needs such a turn to be more likely than not: 1h costs +0.75× on the write, an expiry costs ~1.15× to re-establish.
-
-   When pre-seeding is disabled (no summary provided), this marker is absent and only three slots are used.
-
-3. **Sliding per-turn markers**: Two additional "floating" markers track the two most recently added user messages, on the default 5-minute TTL — consecutive turns are close together and need only two reads to pay off. After each tool-call round-trip:
+2. **Sliding per-turn markers**: Two additional "floating" markers track the two most recently added user messages. After each tool-call round-trip:
    - The newest user message (current tool results) receives a `cache_control` marker.
    - The previous floating marker is retained.
-   - When adding the new marker would exceed the two-floating-marker budget (4 total minus the system and pre-seed markers), the oldest floating marker is stripped from its message content.
+   - When adding the new marker would exceed the two-floating-marker budget, the oldest floating marker is stripped from its message content.
 
    On turn N, the entire context through turn N−1 is served from cache; only the new tool-result exchange is billed as cache-creation input.
 
-4. **Token accounting**: `cache_creation_input_tokens` and `cache_read_input_tokens` are read from each response's `usage` object and accumulated across turns. The CLI reports them in the post-run token summary alongside a computed cost-equivalent token count.
+3. **Token accounting**: `cache_creation_input_tokens` and `cache_read_input_tokens` are read from each response's `usage` object and accumulated across turns. The CLI reports them in the post-run token summary alongside a computed cost-equivalent token count.
+
+### Why not the 1-hour TTL
+
+Anthropic offers an extended 1-hour TTL, billed at **2×** the input rate on write against 1.25× for the 5-minute default. An earlier version of the code placed a 1h marker on the system block to buy cross-run reuse of the tools + system prefix across an evaluation sweep. It was removed deliberately.
+
+The reasoning: **a cache read refreshes the TTL**, so as long as consecutive turns are less than five minutes apart, the 5-minute markers stay warm on their own for the whole session. Within a single run the 1h TTL therefore bought nothing except insurance against one turn stalling past five minutes — while charging the extra 0.75× write premium up front on every run. A user who analyses each profile once paid that premium and never earned it back; the premium is only recovered by a second run on the same prefix within the hour.
+
+PerfAdvisor optimises for the single-run user. A sweep re-writing this prefix once per profile is the accepted cost.
+
+Two further caveats made the trade worse than it first appeared, and are worth knowing if it is ever revisited:
+
+- **The prefix is not as reusable as it looks.** `_build_system_prompt` splices `device_info` and `capabilities` into the system text and branches on profile format for the SQL schema reference, so the "stable" prefix varies with GPU model, capture flags, and NVIDIA vs AMD. Cross-run reuse only holds within a homogeneous sweep.
+- **The saving may be zero, silently.** Tools + system is ~4.4K estimated tokens against Opus 4.8's 4096-token minimum cacheable prefix — a thin margin on a chars/token heuristic. A prefix below the minimum makes the marker a no-op with no error and no charge, just `cache_creation_input_tokens: 0`. Confirm with `count_tokens` before relying on any figure here.
 
 ### Savings
 

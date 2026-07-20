@@ -637,13 +637,15 @@ def _preseed_messages(
         )
 
     # Cache marker goes on the last result so the whole pre-seed block is cached.
-    # Left on the default 5m TTL rather than 1h: this prefix is profile-specific, so
-    # it gets no cross-run reuse, and the only thing 1h would buy is surviving a turn
-    # that runs longer than 5 minutes (possible — tool calls query multi-GB SQLite).
-    # That trade only pays off if such a turn is more likely than not: 1h costs
-    # +0.75× on the write, an expiry costs ~1.15× to re-establish. If profiling shows
-    # slow turns are common, revisit. The tools + system checkpoint on the system
-    # block is 1h, so even a stalled turn keeps that portion cached.
+    # Render order is tools → system → messages, so this single checkpoint covers
+    # the tool schemas and system prompt as well.
+    #
+    # Default 5m TTL, not 1h: a cache read refreshes the TTL, so consecutive turns
+    # keep this warm on their own. 1h would only buy surviving a turn that runs
+    # longer than 5 minutes (possible — tool calls query multi-GB SQLite), and that
+    # trade only pays off if such a turn is more likely than not: 1h costs +0.75× on
+    # every write, an expiry costs ~1.15× to re-establish once. If profiling shows
+    # slow turns are common, revisit.
     tool_results[-1]["cache_control"] = {"type": "ephemeral"}
 
     return [
@@ -707,42 +709,33 @@ def _run_api(
         profile_format=profile.format,
         capabilities=profile.capabilities,
     )
-    # The system block always carries a marker.  Render order is tools → system →
-    # messages, so this checkpoint covers tools + system: a profile-independent
-    # prefix shared by every run, including the parallel workers the eval harness
-    # fans out (see __main__.py). The pre-seed marker below covers the same bytes
-    # plus the profile-specific summary, so within a single run this checkpoint is
-    # redundant; its value is cross-run reuse.
+    # Render order is tools → system → messages, so a marker here would cover
+    # tools + system. With pre-seeding on, the pre-seed marker below covers those
+    # same bytes plus the profile summary, making a second checkpoint here purely
+    # redundant within a run — so it is only set when there is no pre-seed.
     #
-    # 1h TTL: this prefix is read across every turn of every profile in a sweep, so
-    # it clears the 3-read break-even for the 2× write premium (vs 1.25× at 5m) many
-    # times over. The per-turn markers below stay on the 5m default — consecutive
-    # turns are close together and only need 2 reads to pay off.
-    #
-    # Size caveat: tools + system is ~4.4K estimated tokens against a 4096-token
-    # minimum cacheable prefix on Opus 4.8 (the highest per-model floor). That is a
-    # thin margin on a chars/token heuristic. A prefix under the minimum makes the
-    # marker a silent no-op — no error, no charge, just cache_creation_input_tokens
-    # of 0 — so this is safe either way, but confirm with count_tokens before
-    # relying on the saving.
-    _system_block: dict = {
-        "type": "text",
-        "text": _system_text,
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-    }
+    # An earlier version carried a 1h TTL here to buy cross-run reuse across an
+    # eval sweep. That was removed deliberately: the 1h TTL costs a 2x write
+    # premium against 1.25x at 5m, and a cache read refreshes the TTL, so within a
+    # single session the 5m markers below stay warm on their own. A user who
+    # analyses each profile once therefore paid the premium and never earned it
+    # back. Optimising for that user is the priority; a sweep re-writing this
+    # prefix per profile is the accepted cost.
+    _system_block: dict = {"type": "text", "text": _system_text}
+    if not messages:
+        _system_block["cache_control"] = {"type": "ephemeral"}
     _system = [_system_block]
     input_tokens = 0
     output_tokens = 0
     cache_creation_tokens = 0
     cache_read_tokens = 0
-    # Anthropic allows at most 4 cache_control blocks per request. The full budget:
-    #   1. system block (tools + system; cross-run, 1h TTL) — set above
-    #   2. last pre-seed tool result (tools + system + preseed; per-profile)
-    #   3-4. the 2 most-recent per-turn user messages, giving true sliding cache:
+    # Anthropic allows at most 4 cache_control blocks per request. The budget:
+    #   1. last pre-seed tool result (tools + system + preseed), or the system
+    #      block when there is no pre-seed — set above
+    #   2-3. the 2 most-recent per-turn user messages, giving true sliding cache:
     #        turn N reads everything through turn N-1 from cache (0.10×)
     #        turn N writes only the new increment to cache (1.25×)
-    # That is exactly 4 with pre-seeding on, 3 without — no slot in reserve, so any
-    # new checkpoint has to displace one of these.
+    # That is 3 of 4 either way, leaving one slot in reserve.
     # When a third per-turn message is about to be added, the oldest is stripped.
     _cache_prev: dict | None = None  # turn N-1 (keep marker)
     _cache_pprev: dict | None = None  # turn N-2 (strip marker on next advance)
