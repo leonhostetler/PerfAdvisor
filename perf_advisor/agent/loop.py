@@ -583,6 +583,23 @@ def _is_openai_reasoning_model(model: str) -> bool:
     return m.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
+def _is_thinking_unsupported_error(exc: Exception) -> bool:
+    """True when an API error is specifically a rejection of a thinking/reasoning
+    control by a model that does not support it — e.g. Anthropic's "adaptive
+    thinking is not supported on this model" or Gemini's "Thinking level is not
+    supported for this model".
+
+    We do not maintain a static list of which models support thinking: support is
+    fixed at a model's release and the vendor API is the authoritative source, so
+    ``--reasoning-effort`` is sent optimistically and this predicate decides when a
+    failed request should be retried without it. The match is deliberately narrow —
+    it requires both a "not supported" phrase and a thinking/reasoning keyword — so
+    that unrelated 400s (unknown model name, auth, malformed request) still
+    propagate instead of being silently swallowed and retried."""
+    msg = str(getattr(exc, "message", "") or exc).lower()
+    return "not supported" in msg and ("thinking" in msg or "reasoning" in msg)
+
+
 # ---------------------------------------------------------------------------
 # Anthropic backend
 # ---------------------------------------------------------------------------
@@ -765,14 +782,35 @@ def _run_api(
                 turn,
                 {"system": _system, "tools": schemas, "messages": messages},
             )
-        response = client.messages.create(
-            model=model,
-            max_tokens=_max_tokens,
-            system=_system,
-            tools=schemas,
-            messages=messages,
-            **_effort_kwargs,
-        )
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=_max_tokens,
+                system=_system,
+                tools=schemas,
+                messages=messages,
+                **_effort_kwargs,
+            )
+        except anthropic.BadRequestError as exc:
+            # The model does not support adaptive thinking. Warn once, drop the
+            # thinking kwargs, and retry. Clearing _effort_kwargs also disables it
+            # for every remaining turn, so the probe costs one round-trip per run,
+            # not one per turn. Any other 400 propagates unchanged.
+            if _effort_kwargs and _is_thinking_unsupported_error(exc):
+                log(
+                    f"[warn] --reasoning-effort ignored: {model} does not support "
+                    "adaptive thinking; continuing without it"
+                )
+                _effort_kwargs = {}
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=_max_tokens,
+                    system=_system,
+                    tools=schemas,
+                    messages=messages,
+                )
+            else:
+                raise
         if logger:
             logger.write_response(
                 turn,
@@ -1306,23 +1344,31 @@ def _run_gemini(
         except Exception:
             _cached_content = None
 
-    if _cached_content is not None:
-        # Cache created: reference it by name; summary is already inside the cache.
-        config = genai_types.GenerateContentConfig(
-            cached_content=_cached_content.name,
-            thinking_config=_thinking_config,
-        )
-        init_msg = "Begin analysis."
-    else:
-        # Fallback: no cache — put system + tools in config, summary in first message.
-        config = genai_types.GenerateContentConfig(
-            system_instruction=_system_prompt_text,
-            tools=[genai_types.Tool(function_declarations=declarations)],
-            thinking_config=_thinking_config,
-        )
-        init_msg = _summary_text if _summary_text is not None else "Begin analysis."
+    def _make_gemini_chat(thinking_config: Any):
+        """Build the chat with a given thinking_config. Factored out so the first
+        send can be retried with thinking disabled if the model rejects it —
+        thinking_level is baked into the chat's config, so a rebuild is required."""
+        if _cached_content is not None:
+            # Cache created: reference it by name; summary is already in the cache.
+            cfg = genai_types.GenerateContentConfig(
+                cached_content=_cached_content.name,
+                thinking_config=thinking_config,
+            )
+        else:
+            # Fallback: no cache — system + tools in config, summary in first message.
+            cfg = genai_types.GenerateContentConfig(
+                system_instruction=_system_prompt_text,
+                tools=[genai_types.Tool(function_declarations=declarations)],
+                thinking_config=thinking_config,
+            )
+        return client.chats.create(model=model, config=cfg)
 
-    chat = client.chats.create(model=model, config=config)
+    init_msg = (
+        "Begin analysis."
+        if _cached_content is not None or _summary_text is None
+        else _summary_text
+    )
+    chat = _make_gemini_chat(_thinking_config)
     input_tokens = 0
     output_tokens = 0
     cache_read_tokens = 0
@@ -1375,7 +1421,23 @@ def _run_gemini(
                 "message": init_msg,
             },
         )
-    response = chat.send_message(init_msg)
+    try:
+        response = chat.send_message(init_msg)
+    except Exception as exc:
+        # The model does not support thinking_level. Warn once, rebuild the chat
+        # without it, and retry. This is the first send, so no conversation state
+        # is lost; and thinking-supporting models never reach this branch, so the
+        # probe costs one round-trip per run at most. Other errors propagate.
+        if _thinking_config is not None and _is_thinking_unsupported_error(exc):
+            log(
+                f"[warn] --reasoning-effort ignored: {model} does not support "
+                "thinking_level; continuing without it"
+            )
+            _thinking_config = None
+            chat = _make_gemini_chat(None)
+            response = chat.send_message(init_msg)
+        else:
+            raise
     _add_gemini_usage(response)
     if logger:
         logger.write_response(_log_turn, _gemini_response_payload(response))

@@ -398,6 +398,7 @@ Notes:
 - For non-reasoning OpenAI models (e.g. `gpt-4o`) the flag is ignored.
 - Gemini's `thinking_level` tops out at `high`, so `xhigh`/`max` are clamped down.
 - The effective effort is printed in the run banner (e.g. `Reasoning effort = high (with adaptive thinking)`).
+- **Unsupported models degrade gracefully.** PerfAdvisor does not keep a list of which Anthropic/Gemini models support thinking — support is fixed at a model's release and the vendor API is authoritative — so `--reasoning-effort` is sent optimistically. If a model rejects it (e.g. *"adaptive thinking is not supported on this model"*, *"Thinking level is not supported for this model"*), PerfAdvisor prints a `[warn] --reasoning-effort ignored: …` line and retries the request without thinking rather than failing. In `analyze`/`evaluate` this probe costs at most one extra request per run; the flag is then dropped for the remaining turns.
 
 ---
 

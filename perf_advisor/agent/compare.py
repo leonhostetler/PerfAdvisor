@@ -161,7 +161,22 @@ def _call_anthropic(
             "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": reasoning_effort},
         }
-    response = client.messages.create(**kwargs)
+    try:
+        response = client.messages.create(**kwargs)
+    except anthropic.BadRequestError as exc:
+        # Model does not support adaptive thinking: warn, drop it, retry. Any
+        # other 400 propagates. See _is_thinking_unsupported_error in loop.py.
+        from perf_advisor.agent.loop import _is_thinking_unsupported_error
+
+        if "extra_body" in kwargs and _is_thinking_unsupported_error(exc):
+            print(
+                f"[warn] --reasoning-effort ignored: {model} does not support "
+                "adaptive thinking; continuing without it"
+            )
+            kwargs.pop("extra_body")
+            response = client.messages.create(**kwargs)
+        else:
+            raise
     text = ""
     for block in response.content:
         if hasattr(block, "text"):
@@ -230,12 +245,30 @@ def _call_gemini(
         _config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
             thinking_level=_GEMINI_THINKING_LEVEL[reasoning_effort]
         )
-    config = genai_types.GenerateContentConfig(**_config_kwargs)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=config,
-    )
+
+    def _generate(config_kwargs: dict[str, Any]):
+        return client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(**config_kwargs),
+        )
+
+    try:
+        response = _generate(_config_kwargs)
+    except Exception as exc:
+        # Model does not support thinking_level: warn, drop it, retry. Other
+        # errors propagate. See _is_thinking_unsupported_error in loop.py.
+        from perf_advisor.agent.loop import _is_thinking_unsupported_error
+
+        if "thinking_config" in _config_kwargs and _is_thinking_unsupported_error(exc):
+            print(
+                f"[warn] --reasoning-effort ignored: {model} does not support "
+                "thinking_level; continuing without it"
+            )
+            _config_kwargs.pop("thinking_config")
+            response = _generate(_config_kwargs)
+        else:
+            raise
     text = response.text or ""
     um = getattr(response, "usage_metadata", None)
     inp = getattr(um, "prompt_token_count", 0) or 0 if um else 0

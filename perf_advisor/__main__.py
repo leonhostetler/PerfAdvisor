@@ -1737,7 +1737,8 @@ def main() -> None:
             "control: OpenAI reasoning.effort, Anthropic output_config.effort, Gemini "
             "thinking_level (xhigh/max clamp to 'high'). Higher effort = more tool use "
             "and deeper analysis at higher cost/latency. Default: provider's own default "
-            "(OpenAI/Gemini medium, Anthropic high)."
+            "(OpenAI/Gemini medium, Anthropic high). Ignored with a warning on models "
+            "that do not support thinking (the request is retried without it)."
         ),
     )
     p_analyze.add_argument(
@@ -1827,7 +1828,8 @@ def main() -> None:
         help=(
             "Reasoning/thinking effort for the comparison model. Maps to each provider's "
             "native control (OpenAI reasoning.effort, Anthropic output_config.effort, Gemini "
-            "thinking_level; xhigh/max clamp to 'high' on Gemini). Default: provider's own."
+            "thinking_level; xhigh/max clamp to 'high' on Gemini). Default: provider's own. "
+            "Ignored with a warning on models that do not support thinking."
         ),
     )
     p_compare.add_argument(
@@ -1918,7 +1920,7 @@ def main() -> None:
             "Reasoning/thinking effort for the hypothesis-generation model (not the judge). "
             "Maps to each provider's native control (OpenAI reasoning.effort, Anthropic "
             "output_config.effort, Gemini thinking_level; xhigh/max clamp to 'high' on Gemini). "
-            "Default: provider's own."
+            "Default: provider's own. Ignored with a warning on models without thinking support."
         ),
     )
     p_evaluate.add_argument(
