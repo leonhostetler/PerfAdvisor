@@ -14,6 +14,7 @@ run_books/
 *_ABcarveout_tests/
 changelog.txt
 todo_list.md
+session_*.log
 
 # Python
 __pycache__/
@@ -41,6 +42,9 @@ bench/cuda/profiles/
 bench/hip/profiles/
 eval_*_transcript.txt
 eval_*.json
+
+# SLURM logs
+bench/*/slurm*.out
 
 # Environment / secrets
 .env

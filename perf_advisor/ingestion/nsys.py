@@ -618,16 +618,34 @@ class NsysProfile:
 
         return {k: (round(avg, 2), round(mx, 2)) for k, (avg, mx, _) in acc.items()}
 
+    def _hostname(self) -> str | None:
+        """Capture host from TARGET_INFO_SYSTEM_ENV, or None if unrecorded.
+
+        nsys writes this automatically; no capture flag is required. It is the
+        only reliable way to tell an intra-node MPI exchange from one crossing
+        the network, so it is read even when the GPU metadata table is absent.
+        """
+        if not self.has_table("TARGET_INFO_SYSTEM_ENV"):
+            return None
+        rows = self.query(
+            "SELECT value FROM TARGET_INFO_SYSTEM_ENV WHERE name = 'Hostname' LIMIT 1"
+        )
+        if not rows:
+            return None
+        value = rows[0]["value"]
+        return str(value) if value else None
+
     def device_info(self):
-        """Query TARGET_INFO_GPU for hardware properties."""
+        """Query TARGET_INFO_GPU for hardware properties, plus the capture host."""
         from perf_advisor.analysis.models import DeviceInfo
 
+        hostname = self._hostname()
         if not self.has_table("TARGET_INFO_GPU"):
-            return DeviceInfo()
+            return DeviceInfo(hostname=hostname)
         cols = set(self.columns("TARGET_INFO_GPU"))
         rows = self.query("SELECT * FROM TARGET_INFO_GPU LIMIT 1")
         if not rows:
-            return DeviceInfo()
+            return DeviceInfo(hostname=hostname)
         r = rows[0]
 
         def _int(col: str) -> int | None:
@@ -676,6 +694,7 @@ class NsysProfile:
 
         return DeviceInfo(
             vendor="nvidia",
+            hostname=hostname,
             name=r["name"] if "name" in cols and r["name"] else None,
             compute_capability=compute_cap,
             sm_count=sm_count,

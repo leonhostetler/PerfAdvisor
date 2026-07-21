@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A m1647_g
+#SBATCH -A <YOUR_ACCOUNT>
 #SBATCH -J bench_8gpu
 #SBATCH -q debug
 #SBATCH -t 00:10:00
@@ -14,8 +14,11 @@
 #SBATCH --mem=0
 
 # Run #14: inter-node MPI scenario (8 ranks, 4 GPUs × 2 nodes).
-# Run #16 (GPU-Direct RDMA, optimized baseline) was removed — it has no visible
+# There is deliberately no GPU-Direct RDMA counterpart here. It has no visible
 # deficiency in Nsight Systems and serves only as a reference, not a bad run.
+# The scenario implementing it (scen_n / gpu_direct_rdma) was deleted from both
+# binaries 2026-07-20, having been captured by no sbatch script on either
+# platform. See bench/README.md § Run Reference.
 #
 # --distribution=cyclic interleaves ranks across nodes:
 #   rank 0 → node 0, rank 1 → node 1, rank 2 → node 0, rank 3 → node 1, …
@@ -54,12 +57,28 @@ profile_mpi() {
     echo ""; echo "━━━ ${id} (n=${nranks}) ━━━"; date
     srun -n "${nranks}" \
         nsys profile -t cuda,osrt,mpi --mpi-impl=mpich \
+            -c cudaProfilerApi --capture-range-end=stop \
             -o "${PROFILES}/${id}.%q{SLURM_PROCID}" \
         "${BIN}" "$@" \
             --ground-truth "${PROFILES}/${id}.json" \
-        && echo "[ok] profiles written: ${PROFILES}/${id}.{0..$(( nranks - 1 ))}.nsys-rep" \
         || echo "[WARN] ${id} exited non-zero — continuing"
+
+    # Outcome check per rank: nsys exits 0 even when the report conversion fails.
+    local missing=0 rank
     for rank in $(seq 0 $(( nranks - 1 ))); do
+        [[ -s "${PROFILES}/${id}.${rank}.nsys-rep" ]] || missing=$(( missing + 1 ))
+    done
+    if (( missing > 0 )); then
+        echo "[FAIL] ${id}: ${missing}/${nranks} rank(s) produced no .nsys-rep" >&2
+        compgen -G "${PROFILES}/${id}.*.qdstrm" >/dev/null && \
+            echo "       .qdstrm files are present — report conversion failed (see the" \
+                 "filesystem note at the top of this script)" >&2
+    else
+        echo "[ok] profiles written: ${PROFILES}/${id}.{0..$(( nranks - 1 ))}.nsys-rep"
+    fi
+
+    for rank in $(seq 0 $(( nranks - 1 ))); do
+        [[ -s "${PROFILES}/${id}.${rank}.nsys-rep" ]] || continue
         nsys export --type sqlite \
             -o "${PROFILES}/${id}.${rank}.sqlite" \
             "${PROFILES}/${id}.${rank}.nsys-rep" \
@@ -69,9 +88,14 @@ profile_mpi() {
 }
 
 # ── Run #14: inter-node halo exchange baseline — host-staged ring sendrecv ────
+# --interior-mb sizes the halo-independent interior domain so the (unrealized)
+# interior/exchange overlap is worth recommending: it must land at 15-35% of the
+# exchange time. The interior kernel is bandwidth-bound at --interior-iters 64, so
+# interior time scales linearly with --interior-mb; 512 targets ~25% (64 gave ~3%,
+# measured 2026-07-20). Verify the ratio at re-capture and retune mb if out of band.
 profile_mpi test_08 8 \
     --scenario scen_l \
-    --transfer-size-mb 64 --reps 50
+    --transfer-size-mb 64 --reps 50 --interior-mb 512 --interior-iters 64
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"

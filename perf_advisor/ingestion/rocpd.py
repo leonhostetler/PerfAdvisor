@@ -641,8 +641,21 @@ class RocpdProfile:
     def cpu_sync_blocked_s(self, span_s: float) -> tuple[float | None, float | None]:
         return None, None
 
+    def _hostname(self) -> str | None:
+        """Capture host from rocpd_info_node, or None if unrecorded.
+
+        See NsysProfile._hostname — same purpose, different metadata table.
+        """
+        if not self.has_table("rocpd_info_node"):
+            return None
+        rows = self.query("SELECT hostname FROM rocpd_info_node WHERE hostname IS NOT NULL LIMIT 1")
+        if not rows:
+            return None
+        value = rows[0]["hostname"]
+        return str(value) if value else None
+
     def device_info(self) -> DeviceInfo:
-        """Return hardware info for the first GPU agent.
+        """Return hardware info for the first GPU agent, plus the capture host.
 
         Maps AMD CUs → DeviceInfo.sm_count and max_waves_per_cu × wave_front_size
         → DeviceInfo.max_threads_per_sm so downstream analysis treats CUs the
@@ -650,8 +663,9 @@ class RocpdProfile:
         """
         from perf_advisor.analysis.models import DeviceInfo  # lazy to avoid circular import
 
+        hostname = self._hostname()
         if not self.has_table("rocpd_info_agent"):
-            return DeviceInfo()
+            return DeviceInfo(hostname=hostname)
         rows = self.query("""
             SELECT product_name, model_name, vendor_name, type, extdata
             FROM rocpd_info_agent
@@ -659,7 +673,7 @@ class RocpdProfile:
             LIMIT 1
         """)
         if not rows:
-            return DeviceInfo()
+            return DeviceInfo(hostname=hostname)
         r = rows[0]
         try:
             ext: dict = json.loads(r["extdata"] or "{}")
@@ -680,6 +694,7 @@ class RocpdProfile:
         gpu_name = r["product_name"] or r["model_name"]
         return DeviceInfo(
             vendor="amd",
+            hostname=hostname,
             name=gpu_name,
             compute_capability=None,
             sm_count=cu_count,

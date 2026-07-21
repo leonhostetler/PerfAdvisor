@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A m1647_g
+#SBATCH -A <YOUR_ACCOUNT>
 #SBATCH -J bench_4gpu
 #SBATCH -q debug
 #SBATCH -t 00:10:00
@@ -15,9 +15,12 @@
 # Runs #11–#13: intra-node multi-GPU scenarios (1 node, 4 GPUs, 4 MPI ranks).
 # Run #11: intra-node P2P host-staged ring (D2H → MPI_Sendrecv → H2D).
 # Runs #12–#13: MPI collectives (4 ranks, one GPU each via map_gpu:0,1,2,3).
-# Note: run #10 (scen_h, intra-node GPU-Direct NVLink) is omitted — true NVLink
-# between separate MPI processes requires CUDA IPC, which fails when each rank
-# owns a different physical GPU (--gpus-per-task=1); GTL has no working fallback.
+# There is no optimal-path / direct-transfer run here. scen_h (intra-node
+# GPU-Direct NVLink) was never capturable on Perlmutter -- true NVLink between
+# separate MPI processes requires CUDA IPC, which fails when each rank owns a
+# different physical GPU (--gpus-per-task=1) and GTL has no working fallback --
+# and the scenario was removed from both binaries 2026-07-20 once its AMD
+# counterpart (HIP test_10) was retired too. See todo_list.md.
 
 module reset
 module load cudatoolkit
@@ -49,12 +52,28 @@ profile_mpi() {
     echo ""; echo "━━━ ${id} (n=${nranks}) ━━━"; date
     srun -n "${nranks}" \
         nsys profile -t cuda,osrt,mpi --mpi-impl=mpich \
+            -c cudaProfilerApi --capture-range-end=stop \
             -o "${PROFILES}/${id}.%q{SLURM_PROCID}" \
         "${BIN}" "$@" \
             --ground-truth "${PROFILES}/${id}.json" \
-        && echo "[ok] profiles written: ${PROFILES}/${id}.{0..$(( nranks - 1 ))}.nsys-rep" \
         || echo "[WARN] ${id} exited non-zero — continuing"
+
+    # Outcome check per rank: nsys exits 0 even when the report conversion fails.
+    local missing=0 rank
     for rank in $(seq 0 $(( nranks - 1 ))); do
+        [[ -s "${PROFILES}/${id}.${rank}.nsys-rep" ]] || missing=$(( missing + 1 ))
+    done
+    if (( missing > 0 )); then
+        echo "[FAIL] ${id}: ${missing}/${nranks} rank(s) produced no .nsys-rep" >&2
+        compgen -G "${PROFILES}/${id}.*.qdstrm" >/dev/null && \
+            echo "       .qdstrm files are present — report conversion failed (see the" \
+                 "filesystem note at the top of this script)" >&2
+    else
+        echo "[ok] profiles written: ${PROFILES}/${id}.{0..$(( nranks - 1 ))}.nsys-rep"
+    fi
+
+    for rank in $(seq 0 $(( nranks - 1 ))); do
+        [[ -s "${PROFILES}/${id}.${rank}.nsys-rep" ]] || continue
         nsys export --type sqlite \
             -o "${PROFILES}/${id}.${rank}.sqlite" \
             "${PROFILES}/${id}.${rank}.nsys-rep" \
@@ -71,7 +90,7 @@ profile_mpi test_05 4 \
 # ── Run #12: MPI load imbalance — GPU compute imbalance → barrier stall (4 ranks)
 profile_mpi test_06 4 \
     --scenario scen_j \
-    --n 16777216 --work-iters 16 --reps 20
+    --n 16777216 --work-iters 64 --reps 20
 
 # ── Run #13: host-staged collective — D2H → MPI_Allreduce → H2D (4 ranks) ────
 profile_mpi test_07 4 \

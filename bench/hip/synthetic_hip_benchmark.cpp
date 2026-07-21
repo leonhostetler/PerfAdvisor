@@ -6,10 +6,10 @@ Identical scenario coverage, opaque IDs, and ground-truth JSON format as the
 CUDA version; kernel code and scenario logic are unchanged.
 
 ━━━ Evaluation note ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Scenario names passed to --scenario are intentionally opaque (scen_a … scen_n)
+  Scenario names passed to --scenario are intentionally opaque (scen_a … scen_l)
   so the process command line captured by rocprof-sys gives no hint of the
   bottleneck being tested.  ROCTX annotations have been omitted for the same
-  reason.  Kernel names (kernel_a … kernel_e) are similarly neutral.
+  reason.  Kernel names (kernel_a … kernel_d) are similarly neutral.
   See the sbatch submission scripts for the mapping of opaque IDs to bottleneck
   descriptions; comments in this file explain each kernel and scenario in full.
 
@@ -17,21 +17,12 @@ CUDA version; kernel code and scenario logic are unchanged.
   scen_a  tiny_kernels       kernel-launch overhead (many short-lived kernels)
   scen_b  transfer_bound     PCIe-dominated (H2D + compute + D2H, low work)
   scen_c  overlap_missing    same as transfer_bound but streams serialized
-  scen_d  memory_bandwidth   HBM bandwidth (stride=1) or uncoalesced (stride>1)
-  scen_e  compute_bound      SFU-saturated transcendental loop
   scen_f  sync_stall         CPU stalled on hipStreamSynchronize after every launch
-  scen_g  low_occupancy      excessive LDS limits wavefronts-per-CU
-  scen_h  p2p_xgmi           ROCm-aware MPI: direct GPU→GPU via xGMI (optimal)
   scen_i  p2p_staged         forced host staging for GPU→GPU (suboptimal)
   scen_j  mpi_barrier_stall  load imbalance → ranks stall at MPI_Barrier
   scen_k  mpi_allreduce      host-staged collective (D2H → MPI_Allreduce → H2D)
   scen_l  mpi_halo_exchange  ring sendrecv with host staging (baseline)
-  scen_m  host_staged_mpi    explicit D2H → MPI_Sendrecv → H2D
-  scen_n  gpu_direct_rdma    MPI_Sendrecv with device pointers (ROCm-aware MPI)
 
-━━━ Notes on memory_bandwidth (scen_d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  stride=1  → sequential access, exercises peak HBM bandwidth
-  stride>1  → strided/uncoalesced access, thrashes L2 cache — distinct sub-type
 
 ━━━ Build ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   See bench/build_hip.sh (preferred) or Makefile for targets:
@@ -39,32 +30,33 @@ CUDA version; kernel code and scenario logic are unchanged.
     make hip_mpi  # multi-rank build (-DUSE_MPI)
 
 ━━━ Example profile commands (rocprof-sys-sample → rocpd) ━━━━━━━━━━━━━━━━━━
-  Source bench/rocprof-sys-settings.sh before running to set ROCPROFSYS_*
-  env vars (enables rocpd output, one file per rank).
+  The ROCPROFSYS_* env vars (rocpd output, one file per rank, ROCm domains, MPI
+  region tracing) are exported inline at the top of each submit_*_hip.sbatch.
 
   # Single-GPU
   ROCPROFSYS_USE_ROCPD=true rocprof-sys-sample -o run_a -- \
     ./synthetic_hip_benchmark_mpi --scenario scen_a --launch-count 10000
-  ROCPROFSYS_USE_ROCPD=true rocprof-sys-sample -o run_e -- \
-    ./synthetic_hip_benchmark_mpi --scenario scen_e --work-iters 512
 
   # P2P / xGMI (2+ GPUs intra-node, ROCm-aware MPI)
-  ROCPROFSYS_USE_ROCPD=true ROCPROFSYS_OUTPUT_PREFIX="rank_%pid%_" \
-  srun -n 2 rocprof-sys-sample -- \
-    ./synthetic_hip_benchmark_mpi --scenario scen_h \
-      --transfer-size-mb 512 --rocm-aware-mpi 1
 
   # Multi-rank (Frontier-style: 8 ranks, 8 GPUs per node)
   ROCPROFSYS_USE_ROCPD=true ROCPROFSYS_OUTPUT_PREFIX="rank_%pid%_" \
   srun -n 8 rocprof-sys-sample -- \
-    ./synthetic_hip_benchmark_mpi --scenario scen_j --stagger-us 500
-  ROCPROFSYS_USE_ROCPD=true ROCPROFSYS_OUTPUT_PREFIX="rank_%pid%_" \
-  srun -n 8 rocprof-sys-sample -- \
-    ./synthetic_hip_benchmark_mpi --scenario scen_n \
-      --transfer-size-mb 64 --rocm-aware-mpi 1
+    ./synthetic_hip_benchmark_mpi --scenario scen_j
 */
 
 #include <hip/hip_runtime.h>
+
+// roctxProfilerPause/Resume let the harness keep setup, allocation and warmup
+// out of the captured region. Guarded because the header only exists from
+// recent ROCm (present in 7.2.0 on Frontier); without it the CaptureScope
+// below is a no-op and the profile is exactly what it was before.
+#if defined(__has_include)
+#  if __has_include(<rocprofiler-sdk-roctx/roctx.h>)
+#    include <rocprofiler-sdk-roctx/roctx.h>
+#    define BENCH_HAVE_ROCTX_PROFILER_CONTROL 1
+#  endif
+#endif
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -98,7 +90,51 @@ CUDA version; kernel code and scenario logic are unchanged.
     }                                                                             \
   } while (0)
 
+
+// Deliberately discard a hipError_t from a cleanup path.
+//
+// Destructors and teardown cannot act on a failure: they must not throw, and a
+// free or destroy failing after the measurement is already taken changes nothing
+// about the result. The explicit cast documents that and silences [[nodiscard]],
+// which hipcc enforces on hipError_t (nvcc currently does not — the two sources are
+// kept identical regardless).
+//
+// Use HIP_CHECK for anything whose failure could affect the profile.
+#define HIP_DISCARD(call) static_cast<void>(call)
+
 namespace {
+
+// ---------------------------------------------------------------------------
+// Capture scoping
+//
+// Same intent as the CUDA build: keep setup, allocation, MPI initialisation and
+// warmup out of the captured region so the trace covers only the timed rep loop.
+//
+// The mechanism differs by platform, which is forced rather than incidental.
+// Nsight Systems starts collection on an API call; rocprof-sys collects from
+// process start and offers only time-based windowing (--trace-wait /
+// --trace-duration), which cannot be sized safely in advance. So here the ROCTx
+// pause/resume API is used instead: collection is paused before setup and
+// resumed around the timed loop.
+//
+// roctxProfilerPause/Resume return non-zero to signal failure *or lack of
+// support*, so whether rocprof-sys honoured the request is reported at runtime
+// rather than guessed. If unsupported, the calls are inert and the profile is
+// exactly what it was before.
+// ---------------------------------------------------------------------------
+#ifdef BENCH_HAVE_ROCTX_PROFILER_CONTROL
+// Zero means "all threads in the current process" per the ROCTx contract.
+inline bool profiler_pause()  { return roctxProfilerPause(0) == 0; }
+inline bool profiler_resume() { return roctxProfilerResume(0) == 0; }
+#else
+inline bool profiler_pause()  { return false; }
+inline bool profiler_resume() { return false; }
+#endif
+
+struct CaptureScope {
+  CaptureScope()  { profiler_resume(); }
+  ~CaptureScope() { profiler_pause(); }
+};
 
 // ---------------------------------------------------------------------------
 // MPI context
@@ -160,19 +196,13 @@ enum class Scenario {
   TinyKernels,
   TransferBound,
   OverlapMissing,
-  MemoryBandwidth,
-  ComputeBound,
   SyncStall,
-  LowOccupancy,
-  // Intra-node P2P (single-process, 2+ GPUs)
-  P2pXgmi,
+  // Intra-node P2P (multi-rank MPI, 1 GPU per rank, all ranks on one node)
   P2pStaged,
   // Multi-rank MPI
   MpiBarrierStall,
   MpiAllreduce,
   MpiHaloExchange,
-  HostStagedMpi,
-  GpuDirectRdma,
 };
 
 static std::string to_string(Scenario s) {
@@ -180,17 +210,11 @@ static std::string to_string(Scenario s) {
     case Scenario::TinyKernels:     return "tiny_kernels";
     case Scenario::TransferBound:   return "transfer_bound";
     case Scenario::OverlapMissing:  return "overlap_missing";
-    case Scenario::MemoryBandwidth: return "memory_bandwidth";
-    case Scenario::ComputeBound:    return "compute_bound";
     case Scenario::SyncStall:       return "sync_stall";
-    case Scenario::LowOccupancy:    return "low_occupancy";
-    case Scenario::P2pXgmi:         return "p2p_xgmi";
     case Scenario::P2pStaged:       return "p2p_staged";
     case Scenario::MpiBarrierStall: return "mpi_barrier_stall";
     case Scenario::MpiAllreduce:    return "mpi_allreduce";
     case Scenario::MpiHaloExchange: return "mpi_halo_exchange";
-    case Scenario::HostStagedMpi:   return "host_staged_mpi";
-    case Scenario::GpuDirectRdma:   return "gpu_direct_rdma";
   }
   return "unknown";
 }
@@ -199,29 +223,20 @@ static Scenario parse_scenario(const std::string &s) {
   if (s == "scen_a") return Scenario::TinyKernels;
   if (s == "scen_b") return Scenario::TransferBound;
   if (s == "scen_c") return Scenario::OverlapMissing;
-  if (s == "scen_d") return Scenario::MemoryBandwidth;
-  if (s == "scen_e") return Scenario::ComputeBound;
   if (s == "scen_f") return Scenario::SyncStall;
-  if (s == "scen_g") return Scenario::LowOccupancy;
-  if (s == "scen_h") return Scenario::P2pXgmi;
   if (s == "scen_i") return Scenario::P2pStaged;
   if (s == "scen_j") return Scenario::MpiBarrierStall;
   if (s == "scen_k") return Scenario::MpiAllreduce;
   if (s == "scen_l") return Scenario::MpiHaloExchange;
-  if (s == "scen_m") return Scenario::HostStagedMpi;
-  if (s == "scen_n") return Scenario::GpuDirectRdma;
   throw std::runtime_error("Unknown scenario: " + s);
 }
 
 static bool requires_mpi(Scenario s) {
   switch (s) {
-    case Scenario::P2pXgmi:
     case Scenario::P2pStaged:
     case Scenario::MpiBarrierStall:
     case Scenario::MpiAllreduce:
     case Scenario::MpiHaloExchange:
-    case Scenario::HostStagedMpi:
-    case Scenario::GpuDirectRdma:
       return true;
     default:
       return false;
@@ -254,19 +269,16 @@ struct Config {
   bool pinned            = true;
   bool use_default_stream = false;
 
-  // memory_bandwidth
-  int stride = 1;
-
-  // low_occupancy
-  int smem_kb = 48;
-
   // P2P
-  int peer_device       = 1;
   int transfer_size_mb  = 64;
+  // Interior domain for scen_l: work independent of the halo, so the exchange
+  // latency is coverable. 0 disables it — scen_i runs without one, since a P2P
+  // buffer exchange between GPUs has no domain interior to speak of.
+  int interior_mb       = 0;   // interior domain size (MB); 0 = no interior
+  int interior_iters    = 64;  // arithmetic per interior element; tunes its cost
 
   // MPI
   bool rocm_aware_mpi = false;
-  int  stagger_us     = 500;
 
   bool csv = false;
   bool validate = false;
@@ -278,9 +290,9 @@ static void print_usage(const char *prog) {
     << "Usage: " << prog << " [options]\n\n"
     << "Scenarios (opaque IDs; see source and sbatch scripts for bottleneck descriptions):\n"
     << "  --scenario <id>     One of the IDs listed below\n\n"
-    << "  Single-GPU: scen_a scen_b scen_c scen_d scen_e scen_f scen_g\n"
-    << "  Intra-node P2P (2+ GPUs, no MPI): scen_h scen_i\n"
-    << "  Multi-rank (USE_MPI): scen_j scen_k scen_l scen_m scen_n\n\n"
+    << "  Single-GPU: scen_a scen_b scen_c scen_f\n"
+    << "  Intra-node P2P (USE_MPI, 1 GPU per rank): scen_i\n"
+    << "  Multi-rank (USE_MPI): scen_j scen_k scen_l\n\n"
     << "General knobs:\n"
     << "  --device INT           primary HIP device (auto-set from MPI local_rank)\n"
     << "  --reps INT\n"
@@ -302,15 +314,13 @@ static void print_usage(const char *prog) {
     << "  --pinned 0|1\n"
     << "  --use-default-stream 0|1\n\n"
     << "Memory scenario:\n"
-    << "  --stride INT           1=coalesced, >1=strided/uncoalesced\n\n"
     << "Low-occupancy:\n"
-    << "  --smem-kb INT          LDS per workgroup in KB (default 48)\n\n"
     << "P2P knobs:\n"
-    << "  --peer-device INT      second GPU for scen_h/scen_i (default 1)\n"
-    << "  --transfer-size-mb INT buffer size for P2P / MPI halo (default 64)\n\n"
+    << "  --transfer-size-mb INT buffer size for P2P / MPI halo (default 64)\n"
+    << "  --interior-mb INT      interior domain for scen_l (default 0 = none)\n"
+    << "  --interior-iters INT   arithmetic per interior element (default 64)\n\n"
     << "MPI knobs:\n"
-    << "  --rocm-aware-mpi 0|1   assert ROCm-aware MPI (required for scen_h, scen_n)\n"
-    << "  --stagger-us INT       per-rank CPU stagger for scen_j (default 500)\n";
+    << "  --rocm-aware-mpi 0|1   assert ROCm-aware MPI\n";
 }
 
 static bool parse_bool(const std::string &s) {
@@ -344,12 +354,10 @@ static Config parse_args(int argc, char **argv) {
     else if (arg == "--sync-every")       cfg.sync_every     = std::stoi(next(arg));
     else if (arg == "--pinned")           cfg.pinned         = parse_bool(next(arg));
     else if (arg == "--use-default-stream") cfg.use_default_stream = parse_bool(next(arg));
-    else if (arg == "--stride")           cfg.stride         = std::stoi(next(arg));
-    else if (arg == "--smem-kb")          cfg.smem_kb        = std::stoi(next(arg));
-    else if (arg == "--peer-device")      cfg.peer_device    = std::stoi(next(arg));
     else if (arg == "--transfer-size-mb") cfg.transfer_size_mb = std::stoi(next(arg));
+    else if (arg == "--interior-mb")      cfg.interior_mb    = std::stoi(next(arg));
+    else if (arg == "--interior-iters")   cfg.interior_iters = std::stoi(next(arg));
     else if (arg == "--rocm-aware-mpi")   cfg.rocm_aware_mpi = parse_bool(next(arg));
-    else if (arg == "--stagger-us")       cfg.stagger_us     = std::stoi(next(arg));
     else if (arg == "--csv")              cfg.csv            = true;
     else if (arg == "--validate")         cfg.validate       = true;
     else if (arg == "--ground-truth")     cfg.ground_truth_path = next(arg);
@@ -358,15 +366,20 @@ static Config parse_args(int argc, char **argv) {
 
   if (cfg.threads <= 0 || cfg.n == 0 || cfg.reps <= 0 || cfg.warmup < 0 ||
       cfg.launch_count <= 0 || cfg.nstreams <= 0 || cfg.chunks <= 0 ||
-      cfg.stride <= 0 || cfg.smem_kb <= 0 || cfg.transfer_size_mb <= 0) {
+      cfg.transfer_size_mb <= 0 || cfg.interior_iters <= 0) {
     throw std::runtime_error("Invalid non-positive command-line value.");
+  }
+  // interior_mb may legitimately be 0 (no interior domain), but a negative value
+  // would cast to a huge size_t and request an absurd allocation.
+  if (cfg.interior_mb < 0) {
+    throw std::runtime_error("--interior-mb must be >= 0.");
   }
   return cfg;
 }
 
 // ---------------------------------------------------------------------------
 // Kernels
-// Neutral names (kernel_a … kernel_e) prevent the profile from leaking any
+// Neutral names (kernel_a … kernel_d) prevent the profile from leaking any
 // hint about the bottleneck being tested.  Kernel code is identical to the
 // CUDA version; HIP supports the same device intrinsics and launch syntax.
 // ---------------------------------------------------------------------------
@@ -394,23 +407,6 @@ __global__ void kernel_b(float *x, const float *y, std::size_t n, int work_iters
   }
 }
 
-// kernel_c: stride=1 → sequential HBM access (bandwidth-bound);
-//           stride>1 → strided/uncoalesced access (L2-thrashing).
-__global__ void kernel_c(const float *a, const float *b, float *c,
-                         std::size_t n, int stride, int work_iters) {
-  const std::size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) *
-                          static_cast<std::size_t>(stride);
-  if (idx < n) {
-    float x = a[idx], y = b[idx];
-#pragma unroll 1
-    for (int it = 0; it < work_iters; ++it) {
-      x = x + 1.0001f * y;
-      y = y + 0.9999f * x;
-    }
-    c[idx] = x + y;
-  }
-}
-
 // kernel_d: SFU-heavy (__sinf/__cosf) — bottleneck is SFU/VALU saturation.
 // MI250X: transcendental instructions go through the VALU special-function
 // path; __sinf/__cosf map to v_sin_f32/v_cos_f32 on GFX9.
@@ -429,22 +425,6 @@ __global__ void kernel_d(const float *a, const float *b, float *c,
   }
 }
 
-// kernel_e: dynamic LDS per workgroup limits resident wavefronts per CU →
-// artificially low CU occupancy.
-// smem_bytes must be >= blockDim.x * sizeof(float).
-__global__ void kernel_e(const float *__restrict__ a,
-                         float *__restrict__ b,
-                         std::size_t n, int work_iters) {
-  extern __shared__ float smem[];
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  smem[threadIdx.x] = (i < n) ? a[i] : 0.0f;
-  __syncthreads();
-  float v = smem[threadIdx.x];
-#pragma unroll 1
-  for (int it = 0; it < work_iters; ++it) v = fmaf(v, 1.000031f, smem[0]);
-  if (i < n) b[i] = v;
-}
-
 // ---------------------------------------------------------------------------
 // Host helpers
 // ---------------------------------------------------------------------------
@@ -458,7 +438,8 @@ static void fill_host_vectors(std::vector<float> &a, std::vector<float> &b) {
 
 struct DeviceArrays {
   float *a = nullptr, *b = nullptr, *c = nullptr;
-  ~DeviceArrays() { hipFree(a); hipFree(b); hipFree(c); }
+  ~DeviceArrays() { HIP_DISCARD(hipFree(a)); HIP_DISCARD(hipFree(b));
+                    HIP_DISCARD(hipFree(c)); }
 };
 
 struct HostBuffer {
@@ -478,7 +459,7 @@ struct HostBuffer {
   }
   void release() {
     if (!ptr) return;
-    if (pinned) hipHostFree(ptr); else std::free(ptr);
+    if (pinned) HIP_DISCARD(hipHostFree(ptr)); else std::free(ptr);
     ptr = nullptr; count = 0; pinned = false;
   }
   ~HostBuffer() { release(); }
@@ -495,7 +476,8 @@ struct RunResult { double total_ms = 0.0, avg_ms = 0.0; };
 struct EventPair {
   hipEvent_t start, stop;
   EventPair()  { HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop)); }
-  ~EventPair() { hipEventDestroy(start); hipEventDestroy(stop); }
+  ~EventPair() { HIP_DISCARD(hipEventDestroy(start));
+                 HIP_DISCARD(hipEventDestroy(stop)); }
   void record_start() { HIP_CHECK(hipEventRecord(start, nullptr)); }
   void record_stop()  { HIP_CHECK(hipEventRecord(stop, nullptr)); HIP_CHECK(hipEventSynchronize(stop)); }
   double ms(bool timed) const { return timed ? elapsed_ms(start, stop) : 0.0; }
@@ -530,7 +512,10 @@ static RunResult run_tiny_kernels(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
   if (cfg.validate) {
     HIP_CHECK(hipMemcpy(h.data(), dev.a, cfg.n * sizeof(float), hipMemcpyDeviceToHost));
@@ -560,7 +545,10 @@ static RunResult run_sync_stall(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
@@ -619,161 +607,59 @@ static RunResult run_transfer_bound(const Config &cfg, const MpiCtx &mpi, bool s
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
   if (cfg.validate) {
     float sum = 0.0f;
     for (std::size_t i = 0; i < std::min<std::size_t>(cfg.n, 1024); ++i) sum += h_out.ptr[i];
     if (!std::isfinite(sum)) throw std::runtime_error("Validation failed: transfer/overlap");
   }
-  for (auto s : streams) if (s) hipStreamDestroy(s);
+  for (auto s : streams) if (s) HIP_DISCARD(hipStreamDestroy(s));
   return {total, total / cfg.reps};
 }
-
-static RunResult run_memory_bandwidth(const Config &cfg, const MpiCtx &mpi) {
-  std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
-  fill_host_vectors(h_a, h_b);
-
-  DeviceArrays dev;
-  HIP_CHECK(hipMalloc(&dev.a, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMalloc(&dev.b, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMalloc(&dev.c, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(dev.b, h_b.data(), cfg.n * sizeof(float), hipMemcpyHostToDevice));
-
-  const std::size_t logical_n = (cfg.n + static_cast<std::size_t>(cfg.stride) - 1) /
-                                static_cast<std::size_t>(cfg.stride);
-  const int blocks = std::max(1, static_cast<int>((logical_n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_c<<<blocks, cfg.threads>>>(dev.a, dev.b, dev.c, cfg.n, cfg.stride, cfg.work_iters);
-    HIP_CHECK(hipGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    HIP_CHECK(hipMemcpy(h_c.data(), dev.c, cfg.n * sizeof(float), hipMemcpyDeviceToHost));
-    if (!std::isfinite(h_c[0])) throw std::runtime_error("Validation failed: memory_bandwidth");
-  }
-  return {total, total / cfg.reps};
-}
-
-static RunResult run_compute_bound(const Config &cfg, const MpiCtx &mpi) {
-  std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
-  fill_host_vectors(h_a, h_b);
-
-  DeviceArrays dev;
-  HIP_CHECK(hipMalloc(&dev.a, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMalloc(&dev.b, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMalloc(&dev.c, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(dev.b, h_b.data(), cfg.n * sizeof(float), hipMemcpyHostToDevice));
-  const int blocks = std::max(1, static_cast<int>((cfg.n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_d<<<blocks, cfg.threads>>>(dev.a, dev.b, dev.c, cfg.n, cfg.work_iters);
-    HIP_CHECK(hipGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    HIP_CHECK(hipMemcpy(h_c.data(), dev.c, cfg.n * sizeof(float), hipMemcpyDeviceToHost));
-    if (!std::isfinite(h_c[0])) throw std::runtime_error("Validation failed: compute_bound");
-  }
-  return {total, total / cfg.reps};
-}
-
-static RunResult run_low_occupancy(const Config &cfg, const MpiCtx &mpi) {
-  const std::size_t smem_bytes = std::max(
-      static_cast<std::size_t>(cfg.smem_kb) * 1024,
-      static_cast<std::size_t>(cfg.threads) * sizeof(float));
-
-  hipDeviceProp_t prop{};
-  HIP_CHECK(hipGetDeviceProperties(&prop, cfg.device));
-  // sharedMemPerBlockOptin is the maximum LDS per workgroup when the kernel
-  // opts in via hipFuncSetAttribute (64 KB on MI250X / gfx90a).
-  if (smem_bytes > prop.sharedMemPerBlockOptin)
-    throw std::runtime_error("--smem-kb exceeds device opt-in limit (" +
-                             std::to_string(prop.sharedMemPerBlockOptin / 1024) + " KB)");
-
-  HIP_CHECK(hipFuncSetAttribute((const void*)kernel_e,
-                                hipFuncAttributeMaxDynamicSharedMemorySize,
-                                static_cast<int>(smem_bytes)));
-
-  std::vector<float> h_a(cfg.n), h_b(cfg.n, 0.0f);
-  for (std::size_t i = 0; i < cfg.n; ++i)
-    h_a[i] = 0.001f * static_cast<float>((i % 251) + 1);
-
-  DeviceArrays dev;
-  HIP_CHECK(hipMalloc(&dev.a, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMalloc(&dev.b, cfg.n * sizeof(float)));
-  HIP_CHECK(hipMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), hipMemcpyHostToDevice));
-  const int blocks = std::max(1, static_cast<int>((cfg.n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_e<<<blocks, cfg.threads, smem_bytes>>>(dev.a, dev.b, cfg.n, cfg.work_iters);
-    HIP_CHECK(hipGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    HIP_CHECK(hipMemcpy(h_b.data(), dev.b, cfg.n * sizeof(float), hipMemcpyDeviceToHost));
-    if (!std::isfinite(h_b[0])) throw std::runtime_error("Validation failed: low_occupancy");
-  }
-  return {total, total / cfg.reps};
-}
-
-// Forward declaration — defined in the multi-rank MPI section below.
-static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
-                                        bool device_ptrs);
 
 // ---------------------------------------------------------------------------
 // Scenario runners — intra-node P2P (multi-rank)
 // ---------------------------------------------------------------------------
 
-// scen_h (p2p_xgmi) — ROCm-aware MPI ring intra-node, N ranks, all symmetric
+// Intra-node P2P — no runner here by design.
 //
-// All N ranks participate in a ring: rank r sends to (r+1)%N and receives from
-// (r-1+N)%N using MPI_Sendrecv with device pointers (--rocm-aware-mpi 1).
-// When all ranks are on the same node, Cray MPICH GTL routes transfers via
-// xGMI/Infinity Fabric directly between GPU memories — no host staging.
-// Identical code path to scen_n (GpuDirectRdma); the topology difference
-// (intra vs inter-node) produces distinct profile signatures.
-static RunResult run_p2p_xgmi(const Config &cfg, const MpiCtx &mpi) {
-  if (!cfg.rocm_aware_mpi)
-    throw std::runtime_error(
-        "scen_h (p2p_xgmi) requires --rocm-aware-mpi 1. "
-        "Ensure MPICH_GPU_SUPPORT_ENABLED=1 and the binary is linked with "
-        "the ROCm GTL (PE_MPICH_GTL_DIR_amd_gfx90a / PE_MPICH_GTL_LIBS_amd_gfx90a).");
-  return run_halo_exchange_impl(cfg, mpi, true);
-}
+// scen_h (p2p_xgmi) once occupied this slot: a ROCm-aware MPI ring on device
+// pointers, routed over xGMI with no host staging. It injected no deficiency
+// and existed as a false-positive control — the one profile with nothing wrong
+// with it, which is the only unconfounded way to see an advisor inventing a
+// bottleneck to have something to report. Removed 2026-07-20 together with its
+// inter-node twin scen_n (gpu_direct_rdma): the benchmark suite measures whether
+// injected bottlenecks are found, and a run with no bottleneck was excluded from
+// every aggregate the summary reports, so it cost a capture slot and returned
+// nothing readable.
+//
+// Consequence, recorded so it is not rediscovered by surprise: the eval now
+// measures recall only. Nothing in either suite measures whether the advisor
+// over-reports, because every remaining profile contains a real deficiency and
+// its false-positive count is adjudicated through `also_true`. If precision ever
+// needs measuring, this is the shape of the thing to bring back — see
+// todo_list.md and bench/README.md § Run Reference.
 
 // ---------------------------------------------------------------------------
 // Scenario runners — multi-rank MPI
 // ---------------------------------------------------------------------------
 
-// scen_j (mpi_barrier_stall)
+// scen_j (mpi_barrier_stall) — GPU compute load imbalance
+//
+// Each rank k runs work_iters*(k+1) SFU-heavy iterations of kernel_d over its
+// own private arrays — higher-ranked ranks take proportionally longer. All ranks
+// then hit MPI_Barrier, so the faster ranks idle there: a load-imbalance
+// signature whose cause (the per-rank kernel-duration spread) is visible in the
+// trace. The imbalance is GPU compute only — there is deliberately no CPU-side
+// stagger. An earlier --stagger-us knob added a rank-proportional host sleep that
+// dominated the GPU spread (~2x) and, being a `nanosleep`, was diagnosable as a
+// CPU stall rather than the GPU imbalance this scenario is named for; it was
+// removed 2026-07-20 so the scenario has one mechanism. The ranks share no data
+// across the barrier, which is what the third expected fix keys on.
 static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
   std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
   fill_host_vectors(h_a, h_b);
@@ -796,10 +682,6 @@ static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
-    if (cfg.stagger_us > 0) {
-      std::this_thread::sleep_for(
-          std::chrono::microseconds(static_cast<long long>(mpi.rank) * cfg.stagger_us));
-    }
 
 #ifdef USE_MPI
     MPI_Barrier(MPI_COMM_WORLD);
@@ -811,7 +693,10 @@ static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
@@ -859,18 +744,24 @@ static RunResult run_mpi_allreduce(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
-// Shared implementation for scen_l (mpi_halo_exchange), scen_m (host_staged_mpi),
-// and scen_n (gpu_direct_rdma).
+// Shared implementation for scen_i (p2p_staged) and scen_l (mpi_halo_exchange).
+//
+// The device_ptrs=true branch has no caller since scen_h was removed 2026-07-20.
+// Kept because it is the entire difference between the staged and direct paths:
+// re-adding an optimal-path control means calling this with true, nothing more.
 //
 // device_ptrs=false: host-staged path — D2H → MPI_Sendrecv → H2D
 // device_ptrs=true:  ROCm-Direct path — MPI_Sendrecv with device pointers
 //                    (requires ROCm-aware MPI; pass --rocm-aware-mpi 1)
 static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
-                                        bool device_ptrs) {
+                                        bool device_ptrs, int interior_mb) {
   const std::size_t halo_n     = static_cast<std::size_t>(cfg.transfer_size_mb) * 1024 * 1024
                                   / sizeof(float);
   const std::size_t halo_bytes = halo_n * sizeof(float);
@@ -882,6 +773,16 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
   HIP_CHECK(hipMalloc(&d_send, halo_bytes));
   HIP_CHECK(hipMalloc(&d_recv, halo_bytes));
   HIP_CHECK(hipMemset(d_send, 1, halo_bytes));
+
+  const std::size_t interior_n =
+      static_cast<std::size_t>(interior_mb) * 1024 * 1024 / sizeof(float);
+  float *d_int_a = nullptr, *d_int_b = nullptr;
+  if (interior_n) {
+    HIP_CHECK(hipMalloc(&d_int_a, interior_n * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_int_b, interior_n * sizeof(float)));
+    HIP_CHECK(hipMemset(d_int_a, 1, interior_n * sizeof(float)));
+    HIP_CHECK(hipMemset(d_int_b, 1, interior_n * sizeof(float)));
+  }
 
   HostBuffer h_send, h_recv;
   if (!device_ptrs) {
@@ -911,6 +812,38 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
       HIP_CHECK(hipMemcpy(d_recv, h_recv.ptr, halo_bytes, hipMemcpyHostToDevice));
     }
 
+    // Interior update — work that does NOT depend on the halo just received, so
+    // it could have been issued before the exchange and waited on afterwards.
+    // It deliberately is not: that unrealized overlap is what the scenario's
+    // second expected fix (MPI_Irecv/Isend + interior kernel + MPI_Waitall)
+    // addresses. Without an interior domain that fix names structure the profile
+    // does not contain, and an advisor that correctly reports "there is no
+    // interior work here" scores worse than one reciting textbook halo advice
+    // without reading the profile.
+    //
+    // Sized at roughly 20-30% of the exchange so the opportunity is real while
+    // host staging remains the dominant cost — see the gate in CLAUDE.md's
+    // known-defects table before trusting a re-capture.
+    if (interior_n) {
+      const int int_blocks =
+          std::max(1, static_cast<int>((interior_n + cfg.threads - 1) / cfg.threads));
+      kernel_b<<<int_blocks, cfg.threads>>>(d_int_a, d_int_b, interior_n,
+                                            cfg.interior_iters);
+    }
+
+    // Consume the halo just received. Without this the scenario launches no
+    // kernels at all: GPU utilisation is 0%, and every metric the advisor
+    // leads with (busy time, top kernels, phase detection by dominant kernel)
+    // reads empty, so the most salient true statement about the profile is
+    // "there is no GPU work here" rather than anything about host staging.
+    // Deliberately small — ~0.1-0.5 ms against ~6.4 ms of D2H+H2D at the
+    // default 64 MB halo — so staging still dominates by an order of
+    // magnitude and the injected bottleneck is unchanged. Runs in both
+    // branches so the staged and device-pointer paths stay comparable.
+    const int halo_blocks =
+        std::max(1, static_cast<int>((halo_n + cfg.threads - 1) / cfg.threads));
+    kernel_a<<<halo_blocks, cfg.threads>>>(d_recv, halo_n, cfg.tiny_inner_ops);
+
     HIP_CHECK(hipGetLastError());
     ev.record_stop();
     return reduce_time_max(ev.ms(timed));
@@ -918,32 +851,32 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
-  hipFree(d_send);
-  hipFree(d_recv);
+  HIP_DISCARD(hipFree(d_send));
+  HIP_DISCARD(hipFree(d_recv));
+  if (interior_n) {
+    HIP_DISCARD(hipFree(d_int_a));
+    HIP_DISCARD(hipFree(d_int_b));
+  }
   return {total, total / cfg.reps};
 }
 
 static RunResult run_mpi_halo_exchange(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
-}
-
-static RunResult run_host_staged_mpi(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
+  // Interior domain enabled: this scenario models a domain-decomposed stencil,
+  // where work independent of the halo exists and the exchange could be hidden
+  // behind it.
+  return run_halo_exchange_impl(cfg, mpi, false, cfg.interior_mb);
 }
 
 static RunResult run_p2p_staged(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
-}
-
-static RunResult run_gpu_direct_rdma(const Config &cfg, const MpiCtx &mpi) {
-  if (!cfg.rocm_aware_mpi)
-    throw std::runtime_error(
-        "scen_n (gpu_direct_rdma) requires --rocm-aware-mpi 1. "
-        "Ensure you are using a ROCm-aware MPI build (e.g. Cray MPICH with "
-        "MPICH_GPU_SUPPORT_ENABLED=1 and PE_MPICH_GTL_LIBS_amd_gfx90a set).");
-  return run_halo_exchange_impl(cfg, mpi, true);
+  // No interior domain: this scenario models GPUs on one node exchanging
+  // buffers, which has no domain interior. Passing 0 also keeps scen_i and
+  // scen_l structurally distinct — previously they were the same call.
+  return run_halo_exchange_impl(cfg, mpi, false, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -955,18 +888,11 @@ static std::string expected_bottleneck(const Config &cfg) {
     case Scenario::TinyKernels:     return "kernel_launch_overhead";
     case Scenario::TransferBound:   return "pcie_transfer_bound";
     case Scenario::OverlapMissing:  return "cpu_gpu_overlap_missing";
-    case Scenario::MemoryBandwidth:
-      return (cfg.stride > 1) ? "uncoalesced_memory_access" : "memory_bandwidth_bound";
-    case Scenario::ComputeBound:    return "compute_bound_sfu";
     case Scenario::SyncStall:       return "cpu_sync_stall";
-    case Scenario::LowOccupancy:    return "low_cu_occupancy";
-    case Scenario::P2pXgmi:         return "p2p_direct_transfer";
     case Scenario::P2pStaged:       return "unnecessary_host_staging_intranode";
     case Scenario::MpiBarrierStall: return "mpi_load_imbalance";
     case Scenario::MpiAllreduce:    return "host_staged_collective";
     case Scenario::MpiHaloExchange: return "host_staged_halo_exchange";
-    case Scenario::HostStagedMpi:   return "unnecessary_host_staging_internode";
-    case Scenario::GpuDirectRdma:   return "gpu_direct_transfer";
   }
   return "unknown";
 }
@@ -989,11 +915,7 @@ static void write_ground_truth(const Config &cfg, const RunResult &result,
     << "    \"launch_count\": "   << cfg.launch_count     << ",\n"
     << "    \"nstreams\": "       << cfg.nstreams         << ",\n"
     << "    \"chunks\": "         << cfg.chunks           << ",\n"
-    << "    \"stride\": "         << cfg.stride           << ",\n"
-    << "    \"smem_kb\": "        << cfg.smem_kb          << ",\n"
     << "    \"transfer_size_mb\": "<< cfg.transfer_size_mb << ",\n"
-    << "    \"peer_device\": "    << cfg.peer_device      << ",\n"
-    << "    \"stagger_us\": "     << cfg.stagger_us       << ",\n"
     << "    \"pinned\": "         << (cfg.pinned          ? "true" : "false") << ",\n"
     << "    \"rocm_aware_mpi\": " << (cfg.rocm_aware_mpi  ? "true" : "false") << "\n"
     << "  },\n"
@@ -1036,9 +958,22 @@ int main(int argc, char **argv) {
     }
     HIP_CHECK(hipSetDevice(cfg.device));
 
-    if (mpi.rank == 0)
+    // rocprof-sys collects from process start, so pause immediately: everything
+    // before the timed loop (allocation, pinned-host registration, MPI init and
+    // its one-off first-collective cost, warmup) stays out of the trace. The
+    // CUDA build needs no equivalent — nsys collects nothing until Start.
+    const bool capture_scoping = profiler_pause();
+
+    if (mpi.rank == 0) {
       std::cout << "Scenario: " << to_string(cfg.scenario)
                 << "  ranks=" << mpi.size << "\n";
+      // Reported rather than assumed: ROCTx returns non-zero for "lack of
+      // support", so the run log states whether the trace is actually scoped.
+      std::cout << "Capture scoping: "
+                << (capture_scoping ? "active (profiler honoured roctxProfilerPause)"
+                                    : "INACTIVE - full process captured, incl. setup/warmup")
+                << "\n";
+    }
     print_device_info(cfg.device, mpi.rank);
 
     if (requires_mpi(cfg.scenario) && mpi.size == 1 && mpi.rank == 0) {
@@ -1055,16 +990,8 @@ int main(int argc, char **argv) {
         result = run_transfer_bound(cfg, mpi, false); break;
       case Scenario::OverlapMissing:
         result = run_transfer_bound(cfg, mpi, true); break;
-      case Scenario::MemoryBandwidth:
-        result = run_memory_bandwidth(cfg, mpi); break;
-      case Scenario::ComputeBound:
-        result = run_compute_bound(cfg, mpi); break;
       case Scenario::SyncStall:
         result = run_sync_stall(cfg, mpi); break;
-      case Scenario::LowOccupancy:
-        result = run_low_occupancy(cfg, mpi); break;
-      case Scenario::P2pXgmi:
-        result = run_p2p_xgmi(cfg, mpi); break;
       case Scenario::P2pStaged:
         result = run_p2p_staged(cfg, mpi); break;
       case Scenario::MpiBarrierStall:
@@ -1073,10 +1000,6 @@ int main(int argc, char **argv) {
         result = run_mpi_allreduce(cfg, mpi); break;
       case Scenario::MpiHaloExchange:
         result = run_mpi_halo_exchange(cfg, mpi); break;
-      case Scenario::HostStagedMpi:
-        result = run_host_staged_mpi(cfg, mpi); break;
-      case Scenario::GpuDirectRdma:
-        result = run_gpu_direct_rdma(cfg, mpi); break;
     }
 
     if (mpi.rank == 0) {
@@ -1084,8 +1007,8 @@ int main(int argc, char **argv) {
 
       if (cfg.csv) {
         std::cout << "scenario,total_ms,avg_ms,reps,n,threads,work_iters,launch_count,"
-                     "nstreams,chunks,stride,smem_kb,"
-                     "transfer_size_mb,peer_device,stagger_us,mpi_ranks,"
+                     "nstreams,chunks,"
+                     "transfer_size_mb,mpi_ranks,"
                      "pinned,rocm_aware_mpi\n";
         std::cout << to_string(cfg.scenario) << ","
                   << std::fixed << std::setprecision(6)
@@ -1093,9 +1016,8 @@ int main(int argc, char **argv) {
                   << cfg.reps           << "," << cfg.n              << ","
                   << cfg.threads        << "," << cfg.work_iters     << ","
                   << cfg.launch_count   << "," << cfg.nstreams       << ","
-                  << cfg.chunks         << "," << cfg.stride         << ","
-                  << cfg.smem_kb        << "," << cfg.transfer_size_mb << ","
-                  << cfg.peer_device    << "," << cfg.stagger_us     << ","
+                  << cfg.chunks         << ","
+                  << cfg.transfer_size_mb << ","
                   << mpi.size           << ","
                   << (cfg.pinned         ? 1 : 0) << ","
                   << (cfg.rocm_aware_mpi ? 1 : 0) << "\n";

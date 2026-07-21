@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A m1647_g
+#SBATCH -A <YOUR_ACCOUNT>
 #SBATCH -J bench_1gpu
 #SBATCH -q debug
 #SBATCH -t 00:10:00
@@ -43,11 +43,23 @@ run() {
     echo ""; echo "━━━ ${id} ━━━"; date
     srun -n 1 \
         nsys profile -t cuda,osrt \
+            -c cudaProfilerApi --capture-range-end=stop \
             -o "${PROFILES}/${id}" \
         "${BIN}" "$@" \
             --ground-truth "${PROFILES}/${id}.json" \
-        && echo "[ok] profile written: ${PROFILES}/${id}.nsys-rep" \
         || echo "[WARN] ${id} exited non-zero — continuing"
+
+    # Outcome check: nsys exits 0 even when the report conversion fails, so verify
+    # the file rather than the exit status.
+    if [[ ! -s "${PROFILES}/${id}.nsys-rep" ]]; then
+        echo "[FAIL] ${id}: no .nsys-rep produced" >&2
+        [[ -e "${PROFILES}/${id}.qdstrm" ]] && \
+            echo "       a .qdstrm is present — report conversion failed (see the" \
+                 "filesystem note at the top of this script)" >&2
+        return 0
+    fi
+    echo "[ok] profile written: ${PROFILES}/${id}.nsys-rep"
+
     nsys export --type sqlite \
         -o "${PROFILES}/${id}.sqlite" \
         "${PROFILES}/${id}.nsys-rep" \

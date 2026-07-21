@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — compile synthetic_cuda_benchmark for Perlmutter (NERSC, A100/sm_80).
 #
-# Produces a single MPI+NVTX binary that covers all 14 benchmark scenarios.
+# Produces a single MPI binary that covers all 10 benchmark scenarios.
 # Single-process scenarios (#1–#11) run with:   srun -n 1 ./synthetic_cuda_benchmark_mpi
 # Multi-rank scenarios  (#12–#16) run with:     srun -n N ... ./synthetic_cuda_benchmark_mpi
 #

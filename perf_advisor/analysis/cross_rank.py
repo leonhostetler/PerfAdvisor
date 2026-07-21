@@ -374,12 +374,45 @@ def compute_cross_rank_summary(
         overviews.append(
             RankOverview(
                 rank_id=rid,
+                hostname=s.device_info.hostname if s.device_info else None,
                 gpu_kernel_s=s.gpu_kernel_s,
                 gpu_idle_s=s.total_gpu_idle_s,
                 mpi_wait_s=mpi_wait,
                 gpu_utilization_pct=s.gpu_utilization_pct,
             )
         )
+
+    # --- Derived node topology ---
+    # Computed here rather than left to the model: "are these ranks co-located?"
+    # is a pure function of the hostname list, and the right fix for a host-staged
+    # exchange depends on the answer (peer access / IPC for GPUs sharing a node,
+    # GPU-Direct RDMA once the hop crosses the network). Inferring it from timing
+    # instead is unreliable — a blocking MPI_Sendrecv on a ring spends most of its
+    # duration waiting for the neighbour, so the measurement tracks rank skew
+    # rather than link bandwidth and can rank an intra-node exchange as the slower
+    # of the two.
+    hosts = {
+        rid: summaries[rid].device_info.hostname if summaries[rid].device_info else None
+        for rid in rank_ids
+    }
+    if all(h for h in hosts.values()):
+        ranks_per_node: dict[str, list[int]] = {}
+        for rid in rank_ids:
+            ranks_per_node.setdefault(hosts[rid], []).append(rid)
+        num_nodes = len(ranks_per_node)
+        # Adjacent pairs only — ring and halo exchanges communicate with (r±1),
+        # so this is what decides whether the exchange crosses the network.
+        neighbor_colocated: bool | None = (
+            all(hosts[a] == hosts[b] for a, b in zip(rank_ids, rank_ids[1:], strict=False))
+            if len(rank_ids) > 1
+            else None
+        )
+    else:
+        # Partial hostnames are treated as absent: a grouping built from a subset
+        # would look authoritative while being wrong about the missing ranks.
+        ranks_per_node = {}
+        num_nodes = None
+        neighbor_colocated = None
 
     # --- Per-phase cross-rank stats ---
     n_phases = len(summaries[rank_ids[0]].phases)
@@ -466,4 +499,7 @@ def compute_cross_rank_summary(
         phase_alignment=phase_alignment,
         per_rank_overview=overviews,
         phases=phase_summaries,
+        num_nodes=num_nodes,
+        ranks_per_node=ranks_per_node,
+        neighbor_ranks_colocated=neighbor_colocated,
     )

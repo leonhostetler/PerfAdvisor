@@ -11,24 +11,35 @@
 #SBATCH --exclusive
 #SBATCH --mem=0
 
-# Runs test_05–test_07 + test_10: intra-node multi-rank scenarios
+# Runs test_05–test_07: intra-node multi-rank scenarios
 # (1 Frontier node, 4 MPI ranks, 4 GCDs from 2 MI250X GPUs).
 #
 #   test_05  scen_i  P2P host-staged ring (D2H → MPI_Sendrecv → H2D, 4 ranks)
 #   test_06  scen_j  MPI load imbalance → barrier stall (4 ranks)
-#   test_07  scen_k  host-staged collective (D2H → MPI_Allreduce → H2D, 4 ranks)
-#   test_10  scen_h  P2P xGMI direct (ROCm-aware MPI_Sendrecv with device ptrs, 4 ranks)
-#
-# Note: test_10 (scen_h / p2p_xgmi) is ENABLED here — unlike the Perlmutter
-# equivalent (submit_4gpu.sbatch) which excluded it because CUDA IPC across
-# separate physical GPUs fails with --gpus-per-task=1.  On Frontier, ROCm-aware
-# MPI routes intra-node MPI_Sendrecv with device pointers through the xGMI
-# Infinity Fabric links between GCDs; no CUDA IPC is involved.
+#   test_07  scen_k  host-staged collective (D2H → MPI_Allreduce → H2D, 4 ranks)#
+# There is no optimal-path / direct-transfer run here. test_10 (scen_h, p2p_xgmi)
+# occupied that slot until 2026-07-20: a ROCm-aware ring on device pointers over
+# xGMI, injecting no deficiency, kept as a false-positive control. It was removed
+# because a run with no bottleneck was excluded from every aggregate the eval
+# summary reports, so it cost a capture slot and a maintenance burden while
+# contributing no readable number. Consequence: the suite now measures recall
+# only -- nothing checks whether the advisor over-reports on a clean profile.
+# See todo_list.md for the conditions under which to bring it back.
 #
 # Profiler: rocprof-sys-sample → rocpd SQLite (profiles/4gpu/<id>/rank_rocpd-{N}.db, one per rank).
 
 module reset
-module load PrgEnv-amd rocm craype-accel-amd-gfx90a
+# ROCm is pinned, not left to the system default. `module reset` discards the
+# login-shell environment, so an unversioned `rocm` gives the job whatever the
+# current default is — which need not be what the binary was built against, and
+# which stopped shipping rocprof-sys-sample at some point after 2026-05.
+# Keep this in sync with build_hip.sh.
+module load PrgEnv-amd craype-accel-amd-gfx90a
+# The AMD compiler module and ROCm must be the same version. PrgEnv-amd pulls in
+# its own default amd/<ver>, so loading rocm/7.2.0 on its own conflicts with it —
+# that is why the earlier pin silently fell through to ROCm 6.2. Load both
+# together, after PrgEnv-amd, so they override the meta-module's defaults.
+module load amd/7.2.0 rocm/7.2.0
 module list
 
 # ── GPU-direct MPI ────────────────────────────────────────────────────────────
@@ -64,6 +75,53 @@ echo ""
 # profile_mpi <id> <nranks> [benchmark args...]
 #   Profiles all ranks with rocprof-sys-sample (rank_rocpd-{N}.db in
 #   profiles/4gpu/<id>/), writes ground-truth JSON (rank 0 only).
+# ── Normalise rocpd output to the CUDA layout ─────────────────────────────────
+# rocprof-sys writes <outdir>/[rank_]rocpd-<N>.db — a per-run subdirectory. The
+# CUDA suite writes flat test_NN.<rank>.sqlite beside test_NN.json. Flatten so
+# both benches share one layout and discover.py needs one convention.
+#
+# Done as a post-step rather than by reconfiguring ROCPROFSYS_OUTPUT_* because the
+# rename is deterministic shell we can reason about, and if it finds nothing the
+# original files are left untouched rather than landing somewhere unexpected.
+flatten_rocpd() {
+    local id="$1"
+    local dir="${PROFILES}/${id}"
+    [[ -d "${dir}" ]] || { echo "[WARN] ${dir} not found — nothing to flatten"; return 0; }
+
+    local -a dbs=()
+    local f
+    for f in "${dir}"/*.db; do [[ -e "${f}" ]] && dbs+=("${f}"); done
+    if (( ${#dbs[@]} == 0 )); then
+        echo "[WARN] no .db files in ${dir} — leaving as-is"
+        return 0
+    fi
+
+    local moved=0 n base
+    for f in "${dbs[@]}"; do
+        base="$(basename "${f}")"
+        n="${base##*-}"; n="${n%.db}"          # [rank_]rocpd-3.db -> 3
+        if [[ ! "${n}" =~ ^[0-9]+$ ]]; then
+            echo "[WARN] cannot parse rank from ${base} — leaving in place"
+            continue
+        fi
+        # Match the CUDA convention: bare test_NN.db for a single rank,
+        # test_NN.<rank>.db when there are several.
+        if (( ${#dbs[@]} == 1 )); then
+            mv "${f}" "${PROFILES}/${id}.db"
+        else
+            mv "${f}" "${PROFILES}/${id}.${n}.db"
+        fi
+        moved=$(( moved + 1 ))
+    done
+
+    if (( moved == ${#dbs[@]} )); then
+        rmdir "${dir}" 2>/dev/null || echo "[note] ${dir} not empty — left in place"
+        echo "[ok] flattened ${moved} rocpd file(s) into ${PROFILES}/"
+    else
+        echo "[WARN] flattened ${moved}/${#dbs[@]} — ${dir} kept"
+    fi
+}
+
 profile_mpi() {
     local id="$1"; local nranks="$2"; shift 2
     echo ""; echo "━━━ ${id} (n=${nranks}) ━━━"; date
@@ -71,7 +129,7 @@ profile_mpi() {
         rocprof-sys-sample -o "${PROFILES}/${id}" -- \
         "${BIN}" "$@" \
             --ground-truth "${PROFILES}/${id}.json" \
-        && echo "[ok] profile dir: ${PROFILES}/${id}/ (${nranks} rank rocpd files)" \
+        && flatten_rocpd "${id}" \
         || echo "[WARN] ${id} exited non-zero — continuing"
 }
 
@@ -83,19 +141,12 @@ profile_mpi test_05 4 \
 # ── Run test_06: MPI load imbalance — GPU compute skew → barrier stall ────────
 profile_mpi test_06 4 \
     --scenario scen_j \
-    --n 16777216 --work-iters 16 --reps 20
+    --n 16777216 --work-iters 64 --reps 20
 
 # ── Run test_07: host-staged collective — D2H → MPI_Allreduce → H2D ──────────
 profile_mpi test_07 4 \
     --scenario scen_k \
     --n 2097152 --work-iters 4 --reps 30
-
-# ── Run test_10: intra-node P2P xGMI direct — ROCm-aware MPI device pointers ─
-# Produces a clean profile (optimal path); compare against test_05 to show
-# the host-staging overhead in that run.
-profile_mpi test_10 4 \
-    --scenario scen_h \
-    --transfer-size-mb 64 --reps 50 --rocm-aware-mpi 1
 
 echo ""; echo "All done"; date
 scontrol show job "${SLURM_JOBID}"

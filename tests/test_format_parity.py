@@ -401,3 +401,21 @@ def test_nsys_mpi_present_true(nsys_summary):
 
 def test_nsys_mpi_ops_non_empty(nsys_summary):
     assert len(nsys_summary.mpi_ops) > 0
+
+
+def test_hostname_is_read_where_the_format_records_it(any_summary):
+    """Both backends must expose a capture host, or None — never a placeholder.
+
+    The synthetic nsys fixture has no TARGET_INFO_SYSTEM_ENV while the rocpd one
+    does populate rocpd_info_node, so the two legitimately differ here. What must
+    hold for both is the *type contract*: a real hostname string or None. A backend
+    that invented "unknown" or "" would make ranks compare equal and read as
+    co-located, which is the one wrong answer that looks like a right one.
+    """
+    hostname = any_summary.device_info.hostname
+    assert hostname is None or (isinstance(hostname, str) and hostname.strip())
+
+
+def test_rocpd_reads_the_hostname_from_the_synthetic_fixture(rocpd_summary):
+    """Guards the rocpd query itself — the fixture does carry rocpd_info_node.hostname."""
+    assert rocpd_summary.device_info.hostname

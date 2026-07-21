@@ -17,7 +17,12 @@ from perf_advisor.analysis.cross_rank import (
     parse_rank_ids,
     select_primary_rank,
 )
-from perf_advisor.analysis.models import MpiOpSummary, PhaseSummary, ProfileSummary
+from perf_advisor.analysis.models import (
+    DeviceInfo,
+    MpiOpSummary,
+    PhaseSummary,
+    ProfileSummary,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,9 +57,11 @@ def _make_summary(
     total_gpu_idle_s: float = 10.0,
     mpi_ops: list[MpiOpSummary] | None = None,
     phases: list[PhaseSummary] | None = None,
+    hostname: str | None = None,
 ) -> ProfileSummary:
     span = gpu_kernel_s + total_gpu_idle_s
     return ProfileSummary(
+        device_info=DeviceInfo(hostname=hostname),
         profile_path="/fake/rank.sqlite",
         profile_span_s=span,
         gpu_kernel_s=gpu_kernel_s,
@@ -290,3 +297,79 @@ class TestComputeCrossRankSummary:
         phase = crs.phases[0]
         assert phase.mpi_wait_slowest_rank_id in (0, 1)
         assert phase.mpi_wait_max_s == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# Node topology
+# ---------------------------------------------------------------------------
+
+
+class TestNodeTopology:
+    """Node identity is what separates an intra-node exchange from a cross-node one.
+
+    It is computed rather than left to the model because the correct fix differs by
+    the answer — peer access / IPC when the GPUs share a node, GPU-Direct RDMA once
+    the hop crosses the network — and because the alternative signal is misleading:
+    a blocking ring MPI_Sendrecv spends most of its duration waiting for the
+    neighbour, so measured MPI time tracks rank skew rather than link bandwidth and
+    can rank an intra-node exchange as the slower of the two.
+    """
+
+    def _summary_for(self, hosts: list[str | None]):
+        return {i: _make_summary(hostname=h) for i, h in enumerate(hosts)}
+
+    def test_all_ranks_on_one_host(self):
+        c = compute_cross_rank_summary(
+            self._summary_for(["nid001865"] * 4), primary_rank_id=0, phase_alignment="index_order"
+        )
+        assert c.num_nodes == 1
+        assert c.ranks_per_node == {"nid001865": [0, 1, 2, 3]}
+        assert c.neighbor_ranks_colocated is True
+        assert [r.hostname for r in c.per_rank_overview] == ["nid001865"] * 4
+
+    def test_cyclic_distribution_puts_every_neighbour_across_the_network(self):
+        """--distribution=cyclic interleaves ranks, so each ring hop crosses nodes."""
+        c = compute_cross_rank_summary(
+            self._summary_for(["nodeA", "nodeB"] * 4),
+            primary_rank_id=0,
+            phase_alignment="index_order",
+        )
+        assert c.num_nodes == 2
+        assert c.ranks_per_node == {"nodeA": [0, 2, 4, 6], "nodeB": [1, 3, 5, 7]}
+        assert c.neighbor_ranks_colocated is False
+
+    def test_block_distribution_keeps_most_neighbours_together(self):
+        """Two nodes, but contiguous — only one adjacent pair crosses."""
+        c = compute_cross_rank_summary(
+            self._summary_for(["nodeA", "nodeA", "nodeB", "nodeB"]),
+            primary_rank_id=0,
+            phase_alignment="index_order",
+        )
+        assert c.num_nodes == 2
+        assert c.neighbor_ranks_colocated is False
+
+    def test_missing_hostnames_report_unknown_not_a_guess(self):
+        """A grouping built from a subset would look authoritative and be wrong."""
+        c = compute_cross_rank_summary(
+            self._summary_for(["nodeA", None, "nodeA", "nodeA"]),
+            primary_rank_id=0,
+            phase_alignment="index_order",
+        )
+        assert c.num_nodes is None
+        assert c.ranks_per_node == {}
+        assert c.neighbor_ranks_colocated is None
+
+    def test_no_hostnames_at_all_is_unknown(self):
+        """Formats that do not record a host must not silently read as co-located."""
+        c = compute_cross_rank_summary(
+            self._summary_for([None] * 4), primary_rank_id=0, phase_alignment="index_order"
+        )
+        assert c.num_nodes is None
+        assert c.neighbor_ranks_colocated is None
+
+    def test_single_rank_has_no_neighbour_relation(self):
+        c = compute_cross_rank_summary(
+            self._summary_for(["nodeA"]), primary_rank_id=0, phase_alignment="index_order"
+        )
+        assert c.num_nodes == 1
+        assert c.neighbor_ranks_colocated is None

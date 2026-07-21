@@ -6,10 +6,10 @@ controllable, labeled bottlenecks. Intended for evaluating PerfAdvisor's
 hypothesis-generation accuracy via --ground-truth JSON output.
 
 ━━━ Evaluation note ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Scenario names passed to --scenario are intentionally opaque (scen_a … scen_n)
+  Scenario names passed to --scenario are intentionally opaque (scen_a … scen_l)
   so the process command line captured by Nsight Systems gives no hint of the
   bottleneck being tested.  NVTX annotations have been omitted for the same
-  reason.  Kernel names (kernel_a … kernel_e) are similarly neutral.
+  reason.  Kernel names (kernel_a … kernel_d) are similarly neutral.
   See the sbatch submission scripts for the mapping of opaque IDs to bottleneck
   descriptions; comments in this file explain each kernel and scenario in full.
 
@@ -17,21 +17,12 @@ hypothesis-generation accuracy via --ground-truth JSON output.
   scen_a  tiny_kernels       kernel-launch overhead (many short-lived kernels)
   scen_b  transfer_bound     PCIe-dominated (H2D + compute + D2H, low work)
   scen_c  overlap_missing    same as transfer_bound but streams serialized
-  scen_d  memory_bandwidth   HBM bandwidth (stride=1) or uncoalesced (stride>1)
-  scen_e  compute_bound      SFU-saturated transcendental loop
   scen_f  sync_stall         CPU stalled on cudaStreamSynchronize after every launch
-  scen_g  low_occupancy      excessive shared memory limits blocks-per-SM
-  scen_h  p2p_nvlink         cudaMemcpyPeer: direct GPU→GPU via NVLink (optimal)
   scen_i  p2p_staged         forced host staging for GPU→GPU (suboptimal)
   scen_j  mpi_barrier_stall  load imbalance → ranks stall at MPI_Barrier
   scen_k  mpi_allreduce      host-staged collective (D2H → MPI_Allreduce → H2D)
   scen_l  mpi_halo_exchange  ring sendrecv with host staging (baseline)
-  scen_m  host_staged_mpi    explicit D2H → MPI_Sendrecv → H2D
-  scen_n  gpu_direct_rdma    MPI_Sendrecv with device pointers (CUDA-aware MPI)
 
-━━━ Notes on memory_bandwidth (scen_d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  stride=1  → sequential access, exercises peak HBM bandwidth
-  stride>1  → strided/uncoalesced access, thrashes L2 cache — distinct sub-type
 
 ━━━ Build ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   See bench/build.sh (preferred) or Makefile for targets:
@@ -42,26 +33,19 @@ hypothesis-generation accuracy via --ground-truth JSON output.
   # Single-GPU
   nsys profile -t cuda,osrt -o run_a \
     ./synthetic_cuda_benchmark_mpi --scenario scen_a --launch-count 10000
-  nsys profile -t cuda,osrt -o run_e \
-    ./synthetic_cuda_benchmark_mpi --scenario scen_e --work-iters 512
 
   # P2P (2 GPUs, no MPI)
-  nsys profile -t cuda,osrt -o run_h \
-    ./synthetic_cuda_benchmark_mpi --scenario scen_h --transfer-size-mb 512
   nsys profile -t cuda,osrt -o run_i \
     ./synthetic_cuda_benchmark_mpi --scenario scen_i --transfer-size-mb 512
 
   # Multi-rank (Perlmutter-style: 4 ranks, 4 GPUs per node)
   mpirun -n 4 nsys profile -t cuda,osrt,mpi --mpi-impl=mpich \
     -o report.%q{PMI_RANK} \
-    ./synthetic_cuda_benchmark_mpi --scenario scen_j --stagger-us 500
-  mpirun -n 8 nsys profile -t cuda,osrt,mpi --mpi-impl=mpich \
-    -o report.%q{PMI_RANK} \
-    ./synthetic_cuda_benchmark_mpi --scenario scen_n \
-      --transfer-size-mb 64 --cuda-aware-mpi 1
+    ./synthetic_cuda_benchmark_mpi --scenario scen_j
 */
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -95,7 +79,40 @@ hypothesis-generation accuracy via --ground-truth JSON output.
     }                                                                             \
   } while (0)
 
+
+// Deliberately discard a cudaError_t from a cleanup path.
+//
+// Destructors and teardown cannot act on a failure: they must not throw, and a
+// free or destroy failing after the measurement is already taken changes nothing
+// about the result. The explicit cast documents that and silences [[nodiscard]],
+// which hipcc enforces on cudaError_t (nvcc currently does not — the two sources are
+// kept identical regardless).
+//
+// Use CUDA_CHECK for anything whose failure could affect the profile.
+#define CUDA_DISCARD(call) static_cast<void>(call)
+
 namespace {
+
+// ---------------------------------------------------------------------------
+// Capture scoping
+//
+// The profiler records the whole process, but only the timed rep loop is the
+// subject of the benchmark. Setup, device allocation, pinned-host registration,
+// MPI initialisation (including the one-off first-collective connection cost)
+// and every warmup pass would otherwise land in the trace and, on the short MPI
+// scenarios, dominate the injected bottleneck.
+//
+// Nsight Systems honours this only when launched with
+//   -c cudaProfilerApi --capture-range-end=stop
+// Without those flags the calls are ignored and the full process is captured,
+// i.e. the previous behaviour — so a missing flag degrades, it does not break.
+// '=stop' is required: the default 'stop-shutdown' kills the process at
+// cudaProfilerStop(), before the ground-truth JSON is written.
+// ---------------------------------------------------------------------------
+struct CaptureScope {
+  CaptureScope()  { cudaProfilerStart(); }
+  ~CaptureScope() { cudaProfilerStop(); }
+};
 
 // ---------------------------------------------------------------------------
 // MPI context
@@ -161,19 +178,13 @@ enum class Scenario {
   TinyKernels,
   TransferBound,
   OverlapMissing,
-  MemoryBandwidth,
-  ComputeBound,
   SyncStall,
-  LowOccupancy,
-  // Intra-node P2P (single-process, 2+ GPUs)
-  P2pNvlink,
+  // Intra-node P2P (multi-rank MPI, 1 GPU per rank, all ranks on one node)
   P2pStaged,
   // Multi-rank MPI
   MpiBarrierStall,
   MpiAllreduce,
   MpiHaloExchange,
-  HostStagedMpi,
-  GpuDirectRdma,
 };
 
 // Descriptive names used in ground-truth JSON and stdout only — not in profiles.
@@ -182,17 +193,11 @@ static std::string to_string(Scenario s) {
     case Scenario::TinyKernels:     return "tiny_kernels";
     case Scenario::TransferBound:   return "transfer_bound";
     case Scenario::OverlapMissing:  return "overlap_missing";
-    case Scenario::MemoryBandwidth: return "memory_bandwidth";
-    case Scenario::ComputeBound:    return "compute_bound";
     case Scenario::SyncStall:       return "sync_stall";
-    case Scenario::LowOccupancy:    return "low_occupancy";
-    case Scenario::P2pNvlink:       return "p2p_nvlink";
     case Scenario::P2pStaged:       return "p2p_staged";
     case Scenario::MpiBarrierStall: return "mpi_barrier_stall";
     case Scenario::MpiAllreduce:    return "mpi_allreduce";
     case Scenario::MpiHaloExchange: return "mpi_halo_exchange";
-    case Scenario::HostStagedMpi:   return "host_staged_mpi";
-    case Scenario::GpuDirectRdma:   return "gpu_direct_rdma";
   }
   return "unknown";
 }
@@ -203,29 +208,20 @@ static Scenario parse_scenario(const std::string &s) {
   if (s == "scen_a") return Scenario::TinyKernels;
   if (s == "scen_b") return Scenario::TransferBound;
   if (s == "scen_c") return Scenario::OverlapMissing;
-  if (s == "scen_d") return Scenario::MemoryBandwidth;
-  if (s == "scen_e") return Scenario::ComputeBound;
   if (s == "scen_f") return Scenario::SyncStall;
-  if (s == "scen_g") return Scenario::LowOccupancy;
-  if (s == "scen_h") return Scenario::P2pNvlink;
   if (s == "scen_i") return Scenario::P2pStaged;
   if (s == "scen_j") return Scenario::MpiBarrierStall;
   if (s == "scen_k") return Scenario::MpiAllreduce;
   if (s == "scen_l") return Scenario::MpiHaloExchange;
-  if (s == "scen_m") return Scenario::HostStagedMpi;
-  if (s == "scen_n") return Scenario::GpuDirectRdma;
   throw std::runtime_error("Unknown scenario: " + s);
 }
 
 static bool requires_mpi(Scenario s) {
   switch (s) {
-    case Scenario::P2pNvlink:
     case Scenario::P2pStaged:
     case Scenario::MpiBarrierStall:
     case Scenario::MpiAllreduce:
     case Scenario::MpiHaloExchange:
-    case Scenario::HostStagedMpi:
-    case Scenario::GpuDirectRdma:
       return true;
     default:
       return false;
@@ -258,19 +254,16 @@ struct Config {
   bool pinned            = true;
   bool use_default_stream = false;
 
-  // memory_bandwidth
-  int stride = 1;             // 1 = coalesced; >1 = strided/uncoalesced
-
-  // low_occupancy
-  int smem_kb = 48;           // shared memory per block (KB)
-
   // P2P
-  int peer_device       = 1;   // second GPU for p2p_* scenarios
   int transfer_size_mb  = 64;  // transfer buffer for P2P / MPI halo scenarios (MB)
+  // Interior domain for scen_l: work independent of the halo, so the exchange
+  // latency is coverable. 0 disables it — scen_i runs without one, since a P2P
+  // buffer exchange between GPUs has no domain interior to speak of.
+  int interior_mb       = 0;   // interior domain size (MB); 0 = no interior
+  int interior_iters    = 64;  // arithmetic per interior element; tunes its cost
 
   // MPI
-  bool cuda_aware_mpi = false; // assert CUDA-aware MPI (required for gpu_direct_rdma)
-  int  stagger_us     = 500;   // per-rank CPU stagger in mpi_barrier_stall (µs)
+  bool cuda_aware_mpi = false; // assert CUDA-aware MPI (no scenario requires it now)
 
   bool csv = false;
   bool validate = false;
@@ -282,9 +275,9 @@ static void print_usage(const char *prog) {
     << "Usage: " << prog << " [options]\n\n"
     << "Scenarios (opaque IDs; see source and sbatch scripts for bottleneck descriptions):\n"
     << "  --scenario <id>     One of the IDs listed below\n\n"
-    << "  Single-GPU: scen_a scen_b scen_c scen_d scen_e scen_f scen_g\n"
-    << "  Intra-node P2P (2+ GPUs, no MPI): scen_h scen_i\n"
-    << "  Multi-rank (USE_MPI): scen_j scen_k scen_l scen_m scen_n\n\n"
+    << "  Single-GPU: scen_a scen_b scen_c scen_f\n"
+    << "  Intra-node P2P (USE_MPI, 1 GPU per rank): scen_i\n"
+    << "  Multi-rank (USE_MPI): scen_j scen_k scen_l\n\n"
     << "General knobs:\n"
     << "  --device INT           primary CUDA device (auto-set from MPI local_rank)\n"
     << "  --reps INT\n"
@@ -306,15 +299,13 @@ static void print_usage(const char *prog) {
     << "  --pinned 0|1\n"
     << "  --use-default-stream 0|1\n\n"
     << "Memory scenario:\n"
-    << "  --stride INT           1=coalesced, >1=strided/uncoalesced\n\n"
     << "Low-occupancy:\n"
-    << "  --smem-kb INT          shared memory per block in KB (default 48)\n\n"
     << "P2P knobs:\n"
-    << "  --peer-device INT      second GPU for scen_h/scen_i (default 1)\n"
-    << "  --transfer-size-mb INT buffer size for P2P / MPI halo (default 64)\n\n"
+    << "  --transfer-size-mb INT buffer size for P2P / MPI halo (default 64)\n"
+    << "  --interior-mb INT      interior domain for scen_l (default 0 = none)\n"
+    << "  --interior-iters INT   arithmetic per interior element (default 64)\n\n"
     << "MPI knobs:\n"
-    << "  --cuda-aware-mpi 0|1   assert CUDA-aware MPI (required for scen_n)\n"
-    << "  --stagger-us INT       per-rank CPU stagger for scen_j (default 500)\n";
+    << "  --cuda-aware-mpi 0|1   assert CUDA-aware MPI\n";
 }
 
 static bool parse_bool(const std::string &s) {
@@ -348,12 +339,10 @@ static Config parse_args(int argc, char **argv) {
     else if (arg == "--sync-every")       cfg.sync_every     = std::stoi(next(arg));
     else if (arg == "--pinned")           cfg.pinned         = parse_bool(next(arg));
     else if (arg == "--use-default-stream") cfg.use_default_stream = parse_bool(next(arg));
-    else if (arg == "--stride")           cfg.stride         = std::stoi(next(arg));
-    else if (arg == "--smem-kb")          cfg.smem_kb        = std::stoi(next(arg));
-    else if (arg == "--peer-device")      cfg.peer_device    = std::stoi(next(arg));
     else if (arg == "--transfer-size-mb") cfg.transfer_size_mb = std::stoi(next(arg));
+    else if (arg == "--interior-mb")      cfg.interior_mb    = std::stoi(next(arg));
+    else if (arg == "--interior-iters")   cfg.interior_iters = std::stoi(next(arg));
     else if (arg == "--cuda-aware-mpi")   cfg.cuda_aware_mpi = parse_bool(next(arg));
-    else if (arg == "--stagger-us")       cfg.stagger_us     = std::stoi(next(arg));
     else if (arg == "--csv")              cfg.csv            = true;
     else if (arg == "--validate")         cfg.validate       = true;
     else if (arg == "--ground-truth")     cfg.ground_truth_path = next(arg);
@@ -362,15 +351,20 @@ static Config parse_args(int argc, char **argv) {
 
   if (cfg.threads <= 0 || cfg.n == 0 || cfg.reps <= 0 || cfg.warmup < 0 ||
       cfg.launch_count <= 0 || cfg.nstreams <= 0 || cfg.chunks <= 0 ||
-      cfg.stride <= 0 || cfg.smem_kb <= 0 || cfg.transfer_size_mb <= 0) {
+      cfg.transfer_size_mb <= 0 || cfg.interior_iters <= 0) {
     throw std::runtime_error("Invalid non-positive command-line value.");
+  }
+  // interior_mb may legitimately be 0 (no interior domain), but a negative value
+  // would cast to a huge size_t and request an absurd allocation.
+  if (cfg.interior_mb < 0) {
+    throw std::runtime_error("--interior-mb must be >= 0.");
   }
   return cfg;
 }
 
 // ---------------------------------------------------------------------------
 // Kernels
-// Neutral names (kernel_a … kernel_e) prevent the profile from leaking any
+// Neutral names (kernel_a … kernel_d) prevent the profile from leaking any
 // hint about the bottleneck being tested.  See each comment for what it tests.
 // ---------------------------------------------------------------------------
 
@@ -399,27 +393,6 @@ __global__ void kernel_b(float *x, const float *y, std::size_t n, int work_iters
   }
 }
 
-// kernel_c: stride=1 → sequential HBM access (bandwidth-bound);
-//           stride>1 → strided/uncoalesced access (L2-thrashing).
-// Used by: scen_d (memory_bandwidth).
-__global__ void kernel_c(const float *a, const float *b, float *c,
-                         std::size_t n, int stride, int work_iters) {
-  const std::size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) *
-                          static_cast<std::size_t>(stride);
-  if (idx < n) {
-    float x = a[idx], y = b[idx];
-#pragma unroll 1
-    for (int it = 0; it < work_iters; ++it) {
-      x = x + 1.0001f * y;
-      y = y + 0.9999f * x;
-    }
-    c[idx] = x + y;
-  }
-}
-
-// kernel_d: SFU-heavy (__sinf/__cosf) — bottleneck is SFU saturation, not
-// FP32 throughput.  A100: 4 SFUs vs 128 FP32 cores per SM.
-// Used by: scen_e (compute_bound), scen_j (mpi_barrier_stall).
 __global__ void kernel_d(const float *a, const float *b, float *c,
                          std::size_t n, int work_iters) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -435,26 +408,6 @@ __global__ void kernel_d(const float *a, const float *b, float *c,
   }
 }
 
-// kernel_e: dynamic shared memory per block limits resident blocks per SM →
-// artificially low SM occupancy.
-// smem_bytes must be >= blockDim.x * sizeof(float).
-// Used by: scen_g (low_occupancy).
-__global__ void kernel_e(const float *__restrict__ a,
-                         float *__restrict__ b,
-                         std::size_t n, int work_iters) {
-  extern __shared__ float smem[];
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  smem[threadIdx.x] = (i < n) ? a[i] : 0.0f;
-  __syncthreads();
-  float v = smem[threadIdx.x];
-#pragma unroll 1
-  for (int it = 0; it < work_iters; ++it) v = fmaf(v, 1.000031f, smem[0]);
-  if (i < n) b[i] = v;
-}
-
-// ---------------------------------------------------------------------------
-// Host helpers
-// ---------------------------------------------------------------------------
 
 static void fill_host_vectors(std::vector<float> &a, std::vector<float> &b) {
   for (std::size_t i = 0; i < a.size(); ++i) {
@@ -465,7 +418,8 @@ static void fill_host_vectors(std::vector<float> &a, std::vector<float> &b) {
 
 struct DeviceArrays {
   float *a = nullptr, *b = nullptr, *c = nullptr;
-  ~DeviceArrays() { cudaFree(a); cudaFree(b); cudaFree(c); }
+  ~DeviceArrays() { CUDA_DISCARD(cudaFree(a)); CUDA_DISCARD(cudaFree(b));
+                    CUDA_DISCARD(cudaFree(c)); }
 };
 
 struct HostBuffer {
@@ -485,7 +439,7 @@ struct HostBuffer {
   }
   void release() {
     if (!ptr) return;
-    if (pinned) cudaFreeHost(ptr); else std::free(ptr);
+    if (pinned) CUDA_DISCARD(cudaFreeHost(ptr)); else std::free(ptr);
     ptr = nullptr; count = 0; pinned = false;
   }
   ~HostBuffer() { release(); }
@@ -505,7 +459,8 @@ struct RunResult { double total_ms = 0.0, avg_ms = 0.0; };
 struct EventPair {
   cudaEvent_t start, stop;
   EventPair()  { CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop)); }
-  ~EventPair() { cudaEventDestroy(start); cudaEventDestroy(stop); }
+  ~EventPair() { CUDA_DISCARD(cudaEventDestroy(start));
+                 CUDA_DISCARD(cudaEventDestroy(stop)); }
   void record_start() { CUDA_CHECK(cudaEventRecord(start)); }
   void record_stop()  { CUDA_CHECK(cudaEventRecord(stop));  CUDA_CHECK(cudaEventSynchronize(stop)); }
   double ms(bool timed) const { return timed ? elapsed_ms(start, stop) : 0.0; }
@@ -540,7 +495,10 @@ static RunResult run_tiny_kernels(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
   if (cfg.validate) {
     CUDA_CHECK(cudaMemcpy(h.data(), dev.a, cfg.n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -570,7 +528,10 @@ static RunResult run_sync_stall(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
@@ -631,169 +592,59 @@ static RunResult run_transfer_bound(const Config &cfg, const MpiCtx &mpi, bool s
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
   if (cfg.validate) {
     float sum = 0.0f;
     for (std::size_t i = 0; i < std::min<std::size_t>(cfg.n, 1024); ++i) sum += h_out.ptr[i];
     if (!std::isfinite(sum)) throw std::runtime_error("Validation failed: transfer/overlap");
   }
-  for (auto s : streams) if (s) cudaStreamDestroy(s);
+  for (auto s : streams) if (s) CUDA_DISCARD(cudaStreamDestroy(s));
   return {total, total / cfg.reps};
 }
-
-static RunResult run_memory_bandwidth(const Config &cfg, const MpiCtx &mpi) {
-  std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
-  fill_host_vectors(h_a, h_b);
-
-  DeviceArrays dev;
-  CUDA_CHECK(cudaMalloc(&dev.a, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dev.b, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dev.c, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dev.b, h_b.data(), cfg.n * sizeof(float), cudaMemcpyHostToDevice));
-
-  const std::size_t logical_n = (cfg.n + static_cast<std::size_t>(cfg.stride) - 1) /
-                                static_cast<std::size_t>(cfg.stride);
-  const int blocks = std::max(1, static_cast<int>((logical_n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_c<<<blocks, cfg.threads>>>(dev.a, dev.b, dev.c, cfg.n, cfg.stride, cfg.work_iters);
-    CUDA_CHECK(cudaGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    CUDA_CHECK(cudaMemcpy(h_c.data(), dev.c, cfg.n * sizeof(float), cudaMemcpyDeviceToHost));
-    if (!std::isfinite(h_c[0])) throw std::runtime_error("Validation failed: memory_bandwidth");
-  }
-  return {total, total / cfg.reps};
-}
-
-static RunResult run_compute_bound(const Config &cfg, const MpiCtx &mpi) {
-  std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
-  fill_host_vectors(h_a, h_b);
-
-  DeviceArrays dev;
-  CUDA_CHECK(cudaMalloc(&dev.a, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dev.b, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dev.c, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dev.b, h_b.data(), cfg.n * sizeof(float), cudaMemcpyHostToDevice));
-  const int blocks = std::max(1, static_cast<int>((cfg.n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_d<<<blocks, cfg.threads>>>(dev.a, dev.b, dev.c, cfg.n, cfg.work_iters);
-    CUDA_CHECK(cudaGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    CUDA_CHECK(cudaMemcpy(h_c.data(), dev.c, cfg.n * sizeof(float), cudaMemcpyDeviceToHost));
-    if (!std::isfinite(h_c[0])) throw std::runtime_error("Validation failed: compute_bound");
-  }
-  return {total, total / cfg.reps};
-}
-
-static RunResult run_low_occupancy(const Config &cfg, const MpiCtx &mpi) {
-  const std::size_t smem_bytes = std::max(
-      static_cast<std::size_t>(cfg.smem_kb) * 1024,
-      static_cast<std::size_t>(cfg.threads) * sizeof(float));
-
-  cudaDeviceProp prop{};
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, cfg.device));
-  // sharedMemPerBlockOptin is the maximum dynamic smem per block when the
-  // kernel opts in via cudaFuncSetAttribute (164 KB on A100).
-  // sharedMemPerBlock is only the default limit (48 KB); using it here would
-  // reject valid high-smem configurations that the opt-in path supports.
-  if (smem_bytes > prop.sharedMemPerBlockOptin)
-    throw std::runtime_error("--smem-kb exceeds device opt-in limit (" +
-                             std::to_string(prop.sharedMemPerBlockOptin / 1024) + " KB)");
-
-  // Opt kernel_e into the larger shared-memory carveout so launches with
-  // smem_bytes > 48 KB succeed on Ampere and later architectures.
-  CUDA_CHECK(cudaFuncSetAttribute(kernel_e,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  static_cast<int>(smem_bytes)));
-
-  std::vector<float> h_a(cfg.n), h_b(cfg.n, 0.0f);
-  for (std::size_t i = 0; i < cfg.n; ++i)
-    h_a[i] = 0.001f * static_cast<float>((i % 251) + 1);
-
-  DeviceArrays dev;
-  CUDA_CHECK(cudaMalloc(&dev.a, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dev.b, cfg.n * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(dev.a, h_a.data(), cfg.n * sizeof(float), cudaMemcpyHostToDevice));
-  const int blocks = std::max(1, static_cast<int>((cfg.n + cfg.threads - 1) / cfg.threads));
-
-  auto do_pass = [&](bool timed) -> double {
-    barrier_sync();
-    EventPair ev; ev.record_start();
-    kernel_e<<<blocks, cfg.threads, smem_bytes>>>(dev.a, dev.b, cfg.n, cfg.work_iters);
-    CUDA_CHECK(cudaGetLastError());
-    ev.record_stop();
-    return reduce_time_max(ev.ms(timed));
-  };
-
-  for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
-  double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
-
-  if (cfg.validate) {
-    CUDA_CHECK(cudaMemcpy(h_b.data(), dev.b, cfg.n * sizeof(float), cudaMemcpyDeviceToHost));
-    if (!std::isfinite(h_b[0])) throw std::runtime_error("Validation failed: low_occupancy");
-  }
-  return {total, total / cfg.reps};
-}
-
-// Forward declaration — defined in the multi-rank MPI section below.
-static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
-                                        bool device_ptrs);
 
 // ---------------------------------------------------------------------------
 // Scenario runners — intra-node P2P (multi-rank)
 // ---------------------------------------------------------------------------
 
-// scen_h (p2p_nvlink) — CUDA-aware MPI ring intra-node, N ranks, all symmetric
+// Intra-node P2P — no runner here by design.
 //
-// All N ranks participate in a ring: rank r sends to (r+1)%N and receives from
-// (r-1+N)%N using MPI_Sendrecv with device pointers (--cuda-aware-mpi 1).
-// When all ranks are on the same node, GTL routes transfers via NVLink directly
-// between GPU memories — no host staging. Identical code path to scen_n
-// (GpuDirectRdma); the topology difference (intra vs inter-node) is what
-// separates the two scenarios and produces distinct profile signatures.
-static RunResult run_p2p_nvlink(const Config &cfg, const MpiCtx &mpi) {
-  if (!cfg.cuda_aware_mpi)
-    throw std::runtime_error(
-        "scen_h (p2p_nvlink) requires --cuda-aware-mpi 1. "
-        "Ensure MPICH_GPU_SUPPORT_ENABLED=1 and the binary is linked with GTL.");
-  return run_halo_exchange_impl(cfg, mpi, true);
-}
+// scen_h (p2p_nvlink) once occupied this slot: a CUDA-aware MPI ring on device
+// pointers, routed over NVLink with no host staging. It injected no deficiency
+// and existed as a false-positive control — the one profile with nothing wrong
+// with it, which is the only unconfounded way to see an advisor inventing a
+// bottleneck to have something to report. Removed 2026-07-20 together with its
+// inter-node twin scen_n (gpu_direct_rdma): the benchmark suite measures whether
+// injected bottlenecks are found, and a run with no bottleneck was excluded from
+// every aggregate the summary reports, so it cost a capture slot and returned
+// nothing readable.
+//
+// Consequence, recorded so it is not rediscovered by surprise: the eval now
+// measures recall only. Nothing in either suite measures whether the advisor
+// over-reports, because every remaining profile contains a real deficiency and
+// its false-positive count is adjudicated through `also_true`. If precision ever
+// needs measuring, this is the shape of the thing to bring back — see
+// todo_list.md and bench/README.md § Run Reference.
 
 // ---------------------------------------------------------------------------
 // Scenario runners — multi-rank MPI
 // ---------------------------------------------------------------------------
 
-// scen_j (mpi_barrier_stall)
+// scen_j (mpi_barrier_stall) — GPU compute load imbalance
 //
-// Each rank k does work_iters*(k+1) SFU-heavy iterations — higher-ranked ranks
-// take proportionally longer. All ranks then call MPI_Barrier. The faster ranks
-// idle at the barrier, creating a load-imbalance signature in Nsight.
-// --stagger-us adds an extra CPU sleep proportional to rank to amplify the gap.
+// Each rank k runs work_iters*(k+1) SFU-heavy iterations of kernel_d over its
+// own private arrays — higher-ranked ranks take proportionally longer. All ranks
+// then hit MPI_Barrier, so the faster ranks idle there: a load-imbalance
+// signature whose cause (the per-rank kernel-duration spread) is visible in the
+// trace. The imbalance is GPU compute only — there is deliberately no CPU-side
+// stagger. An earlier --stagger-us knob added a rank-proportional host sleep that
+// dominated the GPU spread (~2x) and, being a `nanosleep`, was diagnosable as a
+// CPU stall rather than the GPU imbalance this scenario is named for; it was
+// removed 2026-07-20 so the scenario has one mechanism. The ranks share no data
+// across the barrier, which is what the third expected fix keys on.
 static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
   std::vector<float> h_a(cfg.n), h_b(cfg.n), h_c(cfg.n, 0.0f);
   fill_host_vectors(h_a, h_b);
@@ -816,10 +667,6 @@ static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    if (cfg.stagger_us > 0) {
-      std::this_thread::sleep_for(
-          std::chrono::microseconds(static_cast<long long>(mpi.rank) * cfg.stagger_us));
-    }
 
 #ifdef USE_MPI
     MPI_Barrier(MPI_COMM_WORLD);
@@ -831,7 +678,10 @@ static RunResult run_mpi_barrier_stall(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
@@ -883,12 +733,18 @@ static RunResult run_mpi_allreduce(const Config &cfg, const MpiCtx &mpi) {
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
   return {total, total / cfg.reps};
 }
 
-// Shared implementation for scen_l (mpi_halo_exchange), scen_m (host_staged_mpi),
-// and scen_n (gpu_direct_rdma).
+// Shared implementation for scen_i (p2p_staged) and scen_l (mpi_halo_exchange).
+//
+// The device_ptrs=true branch has no caller since scen_h was removed 2026-07-20.
+// Kept because it is the entire difference between the staged and direct paths:
+// re-adding an optimal-path control means calling this with true, nothing more.
 //
 // Ring topology: each rank sends to right=(rank+1)%size and receives from
 // left=(rank-1+size)%size.  --transfer-size-mb controls halo buffer size.
@@ -897,7 +753,7 @@ static RunResult run_mpi_allreduce(const Config &cfg, const MpiCtx &mpi) {
 // device_ptrs=true:  GPU-Direct path  — MPI_Sendrecv with device pointers
 //                    (requires CUDA-aware MPI; pass --cuda-aware-mpi 1)
 static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
-                                        bool device_ptrs) {
+                                        bool device_ptrs, int interior_mb) {
   const std::size_t halo_n     = static_cast<std::size_t>(cfg.transfer_size_mb) * 1024 * 1024
                                   / sizeof(float);
   const std::size_t halo_bytes = halo_n * sizeof(float);
@@ -909,6 +765,16 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
   CUDA_CHECK(cudaMalloc(&d_send, halo_bytes));
   CUDA_CHECK(cudaMalloc(&d_recv, halo_bytes));
   CUDA_CHECK(cudaMemset(d_send, 1, halo_bytes));
+
+  const std::size_t interior_n =
+      static_cast<std::size_t>(interior_mb) * 1024 * 1024 / sizeof(float);
+  float *d_int_a = nullptr, *d_int_b = nullptr;
+  if (interior_n) {
+    CUDA_CHECK(cudaMalloc(&d_int_a, interior_n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_int_b, interior_n * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_int_a, 1, interior_n * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_int_b, 1, interior_n * sizeof(float)));
+  }
 
   HostBuffer h_send, h_recv;
   if (!device_ptrs) {
@@ -938,6 +804,38 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
       CUDA_CHECK(cudaMemcpy(d_recv, h_recv.ptr, halo_bytes, cudaMemcpyHostToDevice));
     }
 
+    // Interior update — work that does NOT depend on the halo just received, so
+    // it could have been issued before the exchange and waited on afterwards.
+    // It deliberately is not: that unrealized overlap is what the scenario's
+    // second expected fix (MPI_Irecv/Isend + interior kernel + MPI_Waitall)
+    // addresses. Without an interior domain that fix names structure the profile
+    // does not contain, and an advisor that correctly reports "there is no
+    // interior work here" scores worse than one reciting textbook halo advice
+    // without reading the profile.
+    //
+    // Sized at roughly 20-30% of the exchange so the opportunity is real while
+    // host staging remains the dominant cost — see the gate in CLAUDE.md's
+    // known-defects table before trusting a re-capture.
+    if (interior_n) {
+      const int int_blocks =
+          std::max(1, static_cast<int>((interior_n + cfg.threads - 1) / cfg.threads));
+      kernel_b<<<int_blocks, cfg.threads>>>(d_int_a, d_int_b, interior_n,
+                                            cfg.interior_iters);
+    }
+
+    // Consume the halo just received. Without this the scenario launches no
+    // kernels at all: GPU utilisation is 0%, and every metric the advisor
+    // leads with (busy time, top kernels, phase detection by dominant kernel)
+    // reads empty, so the most salient true statement about the profile is
+    // "there is no GPU work here" rather than anything about host staging.
+    // Deliberately small — ~0.1-0.5 ms against ~6.4 ms of D2H+H2D at the
+    // default 64 MB halo — so staging still dominates by an order of
+    // magnitude and the injected bottleneck is unchanged. Runs in both
+    // branches so the staged and device-pointer paths stay comparable.
+    const int halo_blocks =
+        std::max(1, static_cast<int>((halo_n + cfg.threads - 1) / cfg.threads));
+    kernel_a<<<halo_blocks, cfg.threads>>>(d_recv, halo_n, cfg.tiny_inner_ops);
+
     CUDA_CHECK(cudaGetLastError());
     ev.record_stop();
     return reduce_time_max(ev.ms(timed));
@@ -945,38 +843,38 @@ static RunResult run_halo_exchange_impl(const Config &cfg, const MpiCtx &mpi,
 
   for (int i = 0; i < cfg.warmup; ++i) do_pass(false);
   double total = 0.0;
-  for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  {
+    CaptureScope _cap;  // profiler records only the timed loop
+    for (int i = 0; i < cfg.reps; ++i) total += do_pass(true);
+  }
 
-  cudaFree(d_send);
-  cudaFree(d_recv);
+  CUDA_DISCARD(cudaFree(d_send));
+  CUDA_DISCARD(cudaFree(d_recv));
+  if (interior_n) {
+    CUDA_DISCARD(cudaFree(d_int_a));
+    CUDA_DISCARD(cudaFree(d_int_b));
+  }
   return {total, total / cfg.reps};
 }
 
 static RunResult run_mpi_halo_exchange(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
-}
-
-static RunResult run_host_staged_mpi(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
+  // Interior domain enabled: this scenario models a domain-decomposed stencil,
+  // where work independent of the halo exists and the exchange could be hidden
+  // behind it.
+  return run_halo_exchange_impl(cfg, mpi, false, cfg.interior_mb);
 }
 
 // scen_i (p2p_staged) — host-staged ring, N ranks, all symmetric
 //
-// Same ring topology as scen_h but uses explicit D2H → MPI_Sendrecv → H2D.
+// Ring topology with explicit D2H → MPI_Sendrecv → H2D staging.
 // No CUDA-aware MPI; the send/recv buffers passed to MPI are host pinned.
 // Reuses run_halo_exchange_impl(device_ptrs=false) — same pattern, exercised
 // intra-node so NVLink vs. host-staging overhead is the controlled variable.
 static RunResult run_p2p_staged(const Config &cfg, const MpiCtx &mpi) {
-  return run_halo_exchange_impl(cfg, mpi, false);
-}
-
-static RunResult run_gpu_direct_rdma(const Config &cfg, const MpiCtx &mpi) {
-  if (!cfg.cuda_aware_mpi)
-    throw std::runtime_error(
-        "scen_n (gpu_direct_rdma) requires --cuda-aware-mpi 1. "
-        "Ensure you are using a CUDA-aware MPI build (e.g. Cray MPICH with "
-        "MPICH_GPU_SUPPORT_ENABLED=1, or OpenMPI --with-cuda).");
-  return run_halo_exchange_impl(cfg, mpi, true);
+  // No interior domain: this scenario models GPUs on one node exchanging
+  // buffers, which has no domain interior. Passing 0 also keeps scen_i and
+  // scen_l structurally distinct — previously they were the same call.
+  return run_halo_exchange_impl(cfg, mpi, false, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -988,18 +886,11 @@ static std::string expected_bottleneck(const Config &cfg) {
     case Scenario::TinyKernels:     return "kernel_launch_overhead";
     case Scenario::TransferBound:   return "pcie_transfer_bound";
     case Scenario::OverlapMissing:  return "cpu_gpu_overlap_missing";
-    case Scenario::MemoryBandwidth:
-      return (cfg.stride > 1) ? "uncoalesced_memory_access" : "memory_bandwidth_bound";
-    case Scenario::ComputeBound:    return "compute_bound_sfu";
     case Scenario::SyncStall:       return "cpu_sync_stall";
-    case Scenario::LowOccupancy:    return "low_sm_occupancy";
-    case Scenario::P2pNvlink:       return "p2p_direct_transfer";
     case Scenario::P2pStaged:       return "unnecessary_host_staging_intranode";
     case Scenario::MpiBarrierStall: return "mpi_load_imbalance";
     case Scenario::MpiAllreduce:    return "host_staged_collective";
     case Scenario::MpiHaloExchange: return "host_staged_halo_exchange";
-    case Scenario::HostStagedMpi:   return "unnecessary_host_staging_internode";
-    case Scenario::GpuDirectRdma:   return "gpu_direct_transfer";
   }
   return "unknown";
 }
@@ -1022,11 +913,7 @@ static void write_ground_truth(const Config &cfg, const RunResult &result,
     << "    \"launch_count\": "   << cfg.launch_count     << ",\n"
     << "    \"nstreams\": "       << cfg.nstreams         << ",\n"
     << "    \"chunks\": "         << cfg.chunks           << ",\n"
-    << "    \"stride\": "         << cfg.stride           << ",\n"
-    << "    \"smem_kb\": "        << cfg.smem_kb          << ",\n"
     << "    \"transfer_size_mb\": "<< cfg.transfer_size_mb << ",\n"
-    << "    \"peer_device\": "    << cfg.peer_device      << ",\n"
-    << "    \"stagger_us\": "     << cfg.stagger_us       << ",\n"
     << "    \"pinned\": "         << (cfg.pinned          ? "true" : "false") << ",\n"
     << "    \"cuda_aware_mpi\": " << (cfg.cuda_aware_mpi  ? "true" : "false") << "\n"
     << "  },\n"
@@ -1090,16 +977,8 @@ int main(int argc, char **argv) {
         result = run_transfer_bound(cfg, mpi, false); break;
       case Scenario::OverlapMissing:
         result = run_transfer_bound(cfg, mpi, true); break;
-      case Scenario::MemoryBandwidth:
-        result = run_memory_bandwidth(cfg, mpi); break;
-      case Scenario::ComputeBound:
-        result = run_compute_bound(cfg, mpi); break;
       case Scenario::SyncStall:
         result = run_sync_stall(cfg, mpi); break;
-      case Scenario::LowOccupancy:
-        result = run_low_occupancy(cfg, mpi); break;
-      case Scenario::P2pNvlink:
-        result = run_p2p_nvlink(cfg, mpi); break;
       case Scenario::P2pStaged:
         result = run_p2p_staged(cfg, mpi); break;
       case Scenario::MpiBarrierStall:
@@ -1108,10 +987,6 @@ int main(int argc, char **argv) {
         result = run_mpi_allreduce(cfg, mpi); break;
       case Scenario::MpiHaloExchange:
         result = run_mpi_halo_exchange(cfg, mpi); break;
-      case Scenario::HostStagedMpi:
-        result = run_host_staged_mpi(cfg, mpi); break;
-      case Scenario::GpuDirectRdma:
-        result = run_gpu_direct_rdma(cfg, mpi); break;
     }
 
     if (mpi.rank == 0) {
@@ -1119,8 +994,8 @@ int main(int argc, char **argv) {
 
       if (cfg.csv) {
         std::cout << "scenario,total_ms,avg_ms,reps,n,threads,work_iters,launch_count,"
-                     "nstreams,chunks,stride,smem_kb,"
-                     "transfer_size_mb,peer_device,stagger_us,mpi_ranks,"
+                     "nstreams,chunks,"
+                     "transfer_size_mb,mpi_ranks,"
                      "pinned,cuda_aware_mpi\n";
         std::cout << to_string(cfg.scenario) << ","
                   << std::fixed << std::setprecision(6)
@@ -1128,9 +1003,8 @@ int main(int argc, char **argv) {
                   << cfg.reps           << "," << cfg.n              << ","
                   << cfg.threads        << "," << cfg.work_iters     << ","
                   << cfg.launch_count   << "," << cfg.nstreams       << ","
-                  << cfg.chunks         << "," << cfg.stride         << ","
-                  << cfg.smem_kb        << "," << cfg.transfer_size_mb << ","
-                  << cfg.peer_device    << "," << cfg.stagger_us     << ","
+                  << cfg.chunks         << ","
+                  << cfg.transfer_size_mb << ","
                   << mpi.size           << ","
                   << (cfg.pinned          ? 1 : 0) << ","
                   << (cfg.cuda_aware_mpi  ? 1 : 0) << "\n";

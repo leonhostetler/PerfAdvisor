@@ -102,13 +102,26 @@ class StreamSummary(BaseModel):
 
 
 class DeviceInfo(BaseModel):
-    """Hardware properties extracted from the profile's device metadata table.
+    """Hardware and host properties extracted from the profile's metadata tables.
+
+    Mostly device properties, plus the host the capture ran on — both come from
+    profiler-written metadata and are read at the same point, so they share a
+    carrier rather than warranting a second one.
 
     All fields are optional: they will be None if the metadata table is absent
     or the profile format does not expose a given property.
     """
 
     vendor: str | None = Field(default=None, description="GPU vendor: 'nvidia' or 'amd'")
+    hostname: str | None = Field(
+        default=None,
+        description=(
+            "Host the profile was captured on. For a multi-rank job this is what "
+            "distinguishes an intra-node exchange from one crossing the network — "
+            "a distinction that is otherwise not reliably inferable, since blocking "
+            "MPI call durations reflect rank skew more than link bandwidth."
+        ),
+    )
     name: str | None = Field(
         default=None,
         description="GPU device name (e.g., 'NVIDIA A100-SXM4-40GB' or 'AMD Instinct MI250X')",
@@ -267,6 +280,9 @@ class RankOverview(BaseModel):
     """Whole-profile stats for a single MPI rank."""
 
     rank_id: int
+    hostname: str | None = Field(
+        default=None, description="Host this rank ran on; None if the profile omits it"
+    )
     gpu_kernel_s: float
     gpu_idle_s: float
     mpi_wait_s: float
@@ -331,6 +347,31 @@ class CrossRankSummary(BaseModel):
     )
     per_rank_overview: list[RankOverview]
     phases: list[CrossRankPhaseSummary]
+
+    # Derived node topology. Computed rather than left to the model: "are these
+    # ranks co-located?" is a pure function of the hostname list, and the fix for
+    # a host-staged exchange differs by the answer (peer access / IPC when the
+    # GPUs share a node; GPU-Direct RDMA when the hop crosses the network).
+    num_nodes: int | None = Field(
+        default=None,
+        description=(
+            "Distinct hosts across ranks; 1 means every rank is co-located. "
+            "None when the profile format does not report hostnames."
+        ),
+    )
+    ranks_per_node: dict[str, list[int]] = Field(
+        default_factory=dict,
+        description="hostname -> rank IDs running on it; empty when hostnames are unavailable",
+    )
+    neighbor_ranks_colocated: bool | None = Field(
+        default=None,
+        description=(
+            "Whether every adjacent rank pair (r, r+1) shares a host. False means a "
+            "ring/halo exchange crosses the network on every hop — the case "
+            "--distribution=cyclic produces. None when hostnames are unavailable "
+            "or there is only one rank."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

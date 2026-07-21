@@ -1,10 +1,26 @@
 {
   "_comment": "Static evaluation rubric for the synthetic CUDA benchmark suite. Keyed by the 'scenario' field in runtime ground-truth JSONs. Used by PerfAdvisor to score hypothesis quality: did the advisor identify the right bottleneck and recommend the right fixes?",
-
   "tiny_kernels": {
     "run_id": "test_01",
     "display_name": "Kernel launch overhead",
     "expected_bottleneck": "kernel_launch_overhead",
+    "also_true": [
+      {
+        "bottleneck_type": [
+          "synchronization"
+        ],
+        "keywords": [
+          "cudastreamsynchronize",
+          "hipstreamsynchronize",
+          "stream synchronize",
+          "synchronize after every",
+          "synchronizes after every",
+          "sync after each",
+          "blocking sync"
+        ],
+        "why": "submit_1gpu.sbatch runs test_01 with --host-sleep-us 5, which makes run_tiny_kernels synchronize after every launch; a sync-stall diagnosis is factually correct here."
+      }
+    ],
     "nsys_signature": [
       "CPU timeline dense with cudaLaunchKernel API calls; GPU timeline shows a barcode of very short kernel executions separated by idle gaps",
       "GPU utilization is near zero despite high CPU activity",
@@ -22,13 +38,12 @@
         "rationale": "Reduces total launch count proportionally; each GPU active window grows, eliminating idle gaps"
       },
       {
-        "action": "For producer-consumer pipelines, use persistent kernels that loop internally rather than re-launching",
-        "mechanism": "Grid-stride loop with device-side work queues or cooperative groups",
-        "rationale": "Eliminates re-launch entirely; the kernel stays resident and picks up new work without CPU involvement"
+        "action": "Collapse the repeated launches into a single persistent kernel that loops internally over the iterations instead of relaunching each time.",
+        "mechanism": "A grid-stride or internal loop inside one kernel launch replaces the N separate launches, removing the per-launch CPU cost.",
+        "rationale": "One launch replaces thousands; the GPU stops idling between kernels waiting on the CPU to issue the next."
       }
     ]
   },
-
   "sync_stall": {
     "run_id": "test_02",
     "display_name": "CPU sync stall",
@@ -45,9 +60,9 @@
         "rationale": "Breaks the CPU-GPU serialization loop; GPU can stay resident across multiple launches while CPU queues the next batch"
       },
       {
-        "action": "Use CUDA events to express fine-grained dependencies between streams without blocking the CPU thread",
-        "mechanism": "cudaEventRecord on the producing stream; cudaStreamWaitEvent on the consuming stream",
-        "rationale": "GPU-side dependency tracking lets the driver sequence work correctly without stalling the CPU"
+        "action": "Express any real dependency with an event rather than a blocking synchronize, so the CPU thread is not stalled waiting on the GPU.",
+        "mechanism": "Record a cudaEvent on the producing work and have the dependent work wait on it, instead of a host-side synchronize after each launch.",
+        "rationale": "The CPU issues the next launch immediately instead of blocking, letting launches pipeline on the GPU."
       },
       {
         "action": "If the CPU genuinely needs results, batch the synchronization at the end of a full pipeline stage rather than after each kernel",
@@ -56,7 +71,6 @@
       }
     ]
   },
-
   "transfer_bound": {
     "run_id": "test_03",
     "display_name": "PCIe transfer-bound",
@@ -78,17 +92,33 @@
         "rationale": "Eliminates D2H + subsequent H2D for the same buffer; reduces total PCIe traffic proportionally"
       },
       {
-        "action": "Use pinned (page-locked) host memory to maximize PCIe throughput if transfers are unavoidable",
-        "mechanism": "cudaMallocHost / cudaFreeHost for host-side staging buffers",
-        "rationale": "Pinned memory allows DMA to proceed at full PCIe bandwidth without OS page-faulting"
+        "action": "Reduce the bytes crossing PCIe: transfer in a lower precision (e.g. fp16/bf16) and upconvert on the device, or compress the payload before the copy.",
+        "mechanism": "Stage data as fp16 and widen to fp32 in the kernel; or apply a lightweight compression/quantization step so fewer bytes move per element.",
+        "rationale": "The transfers are already pinned, async and overlapped, so the only remaining transfer lever is moving less data."
       }
     ]
   },
-
   "overlap_missing": {
     "run_id": "test_04",
     "display_name": "Transfer-compute overlap missing",
     "expected_bottleneck": "cpu_gpu_overlap_missing",
+    "also_true": [
+      {
+        "bottleneck_type": [
+          "memory_bound"
+        ],
+        "keywords": [
+          "pcie",
+          "transfer bound",
+          "transfer-bound",
+          "transfer dominated",
+          "transfer-dominated",
+          "bandwidth-limited",
+          "bandwidth limited"
+        ],
+        "why": "test_04 runs the same workload and parameters as test_03 (--n 33554432 --chunks 16); the same bytes cross PCIe, so transfer-bound is also true."
+      }
+    ],
     "nsys_signature": [
       "Strictly sequential per-chunk H2D → kernel → D2H pattern; no two of these activities overlap in the timeline",
       "All streams appear to execute in series; MemCpy and Kernel rows never have simultaneous activity",
@@ -101,22 +131,34 @@
         "rationale": "Hides transfer latency behind compute; ideal throughput approaches max(PCIe bandwidth, compute throughput)"
       },
       {
-        "action": "Eliminate any implicit synchronization that collapses the pipeline",
-        "mechanism": "Audit for cudaDeviceSynchronize, cudaStreamSynchronize, and host-pinned memory faults between chunk submissions",
-        "rationale": "A single implicit sync forces all in-flight work to drain before the next chunk begins, destroying the pipeline"
+        "action": "Remove the per-chunk stream flush that serializes the pipeline, so chunk K+1's H2D transfer can begin before chunk K's compute finishes",
+        "mechanism": "Replace the synchronize between chunk submissions with cudaEventRecord on the transfer stream and cudaStreamWaitEvent on the compute stream, expressing the dependency without draining in-flight work",
+        "rationale": "Flushing between chunks forces every outstanding transfer and kernel to complete before the next chunk starts, so no transfer ever overlaps compute; event-based ordering preserves the chunk dependency while letting the stages run concurrently"
       },
       {
-        "action": "Use cudaMemcpyAsync (not cudaMemcpy) and ensure host buffers are page-locked so async copies can proceed concurrently with kernels",
-        "mechanism": "cudaMallocHost for host staging buffers; cudaMemcpyAsync with non-default stream",
-        "rationale": "cudaMemcpy is blocking by default; only the async variant can overlap with kernel execution on a separate stream"
+        "action": "Order chunks with events rather than a coarse per-chunk flush, and keep several chunks in flight so a stall on one does not idle the others.",
+        "mechanism": "Record a cudaEvent after each stage's transfer and have the compute stream wait on it, instead of a stream flush; raise the number of in-flight chunks to deepen the pipeline.",
+        "rationale": "Fine-grained event ordering exposes more concurrency than a flush and keeps the copy engines and SMs busy simultaneously."
       }
     ]
   },
-
   "p2p_staged": {
     "run_id": "test_05",
     "display_name": "Intra-node P2P with unnecessary host staging",
     "expected_bottleneck": "unnecessary_host_staging_intranode",
+    "also_true": [
+      {
+        "bottleneck_type": [
+          "synchronization",
+          "mpi_imbalance"
+        ],
+        "keywords": [
+          "mpi_barrier",
+          "barrier"
+        ],
+        "why": "the harness barrier_sync() runs inside the profiled region once per pass (reps + warmup), and its wait can exceed the injected bottleneck; on test_07 it measured ~0.370s across 35 calls against 0.33ms of GPU compute."
+      }
+    ],
     "nsys_signature": [
       "Per-halo-exchange triplet visible: D2H cudaMemcpy → MPI_Sendrecv → H2D cudaMemcpy",
       "GPU is idle during MPI_Sendrecv; data is sitting on the host",
@@ -134,13 +176,12 @@
         "rationale": "NVLink bandwidth is 600 GB/s vs 32 GB/s PCIe; a single peer copy replaces two PCIe transfers"
       },
       {
-        "action": "If using CUDA-aware MPI is not feasible, at least overlap the host staging of the next halo with the compute of the current step (double-buffering)",
-        "mechanism": "Use two halo buffers and alternate; stage buffer B while computing with the data in buffer A",
-        "rationale": "Hides the D2H + MPI + H2D latency behind useful work even without GPU-Direct"
+        "action": "If CUDA-aware MPI is unavailable, bypass MPI for the exchange entirely and copy device-to-device between the ranks' GPUs, which are all on one node",
+        "mechanism": "Share device pointers across processes with cudaIpcGetMemHandle / cudaIpcOpenMemHandle, then exchange with cudaMemcpyPeerAsync over NVLink",
+        "rationale": "All ranks are on the same node, so the data never needs to reach host memory or a network; CUDA IPC gives a direct peer-to-peer path even when the MPI library has no device-pointer support"
       }
     ]
   },
-
   "mpi_barrier_stall": {
     "run_id": "test_06",
     "display_name": "MPI load imbalance (barrier stall)",
@@ -162,17 +203,29 @@
         "rationale": "Fast ranks overlap their barrier wait with useful computation instead of spinning"
       },
       {
-        "action": "Restructure the algorithm to avoid a global synchronization point on the critical path",
-        "mechanism": "Replace global barrier with point-to-point synchronization (MPI_Send/Recv or MPI_Isend/Irecv) between dependent rank pairs only",
-        "rationale": "Scope of synchronization matches the actual data dependency; ranks not dependent on each other never stall"
+        "action": "The ranks share no data across the barrier, so the global synchronization enforces no real dependency — remove it. If the barrier marks a genuine step boundary, coarsen it to a periodic barrier every N iterations rather than one per iteration, so the imbalance is amortized across steps instead of paid every rep.",
+        "mechanism": "Delete the per-iteration MPI_Barrier when ranks are independent (the profile shows only barriers, no rank-to-rank data exchange); otherwise replace it with a barrier issued every N reps so fewer synchronization points multiply the per-rank skew.",
+        "rationale": "A barrier over ranks that exchange no data is pure synchronization overhead that the load imbalance amplifies once per rep; removing or coarsening it cuts the number of points at which the slowest rank stalls everyone."
       }
     ]
   },
-
   "mpi_allreduce": {
     "run_id": "test_07",
     "display_name": "Host-staged MPI_Allreduce",
     "expected_bottleneck": "host_staged_collective",
+    "also_true": [
+      {
+        "bottleneck_type": [
+          "synchronization",
+          "mpi_imbalance"
+        ],
+        "keywords": [
+          "mpi_barrier",
+          "barrier"
+        ],
+        "why": "the harness barrier_sync() runs inside the profiled region once per pass (reps + warmup), and its wait can exceed the injected bottleneck; on test_07 it measured ~0.370s across 35 calls against 0.33ms of GPU compute."
+      }
+    ],
     "nsys_signature": [
       "Per-reduction triplet visible on each rank: D2H cudaMemcpy → MPI_Allreduce → H2D cudaMemcpy",
       "GPU is idle during MPI_Allreduce; both PCIe directions are fully utilized flanking the collective",
@@ -190,17 +243,43 @@
         "rationale": "NCCL is tuned for GPU collectives; it avoids PCIe entirely for intra-node and saturates the NIC for inter-node"
       },
       {
-        "action": "If the reduction result is a scalar, perform the reduction on-device and transfer only the scalar result to the host",
-        "mechanism": "Use a device-side reduction kernel (e.g., cub::DeviceReduce) followed by a single 4-byte D2H transfer; then use MPI_Allreduce on the scalar",
-        "rationale": "Reduces PCIe traffic from O(N) to O(1) per rank; the MPI collective operates on tiny host scalars"
+        "action": "If the reduced result is not consumed immediately, issue the collective non-blocking (MPI_Iallreduce) and let independent GPU work proceed instead of blocking on it. The collective is the dominant cost in this profile, so hiding it behind computation helps more than removing the host staging alone.",
+        "mechanism": "Replace MPI_Allreduce with MPI_Iallreduce followed by MPI_Wait, issuing independent kernels between the two calls so the reduction progresses while the GPU works.",
+        "rationale": "The blocking collective dominates runtime; issuing it non-blocking converts the wait into useful work when the reduced result is not needed until later."
       }
     ]
   },
-
   "mpi_halo_exchange": {
     "run_id": "test_08",
     "display_name": "Inter-node halo exchange with host staging",
     "expected_bottleneck": "host_staged_halo_exchange",
+    "also_true": [
+      {
+        "bottleneck_type": [
+          "synchronization",
+          "mpi_imbalance"
+        ],
+        "keywords": [
+          "mpi_barrier",
+          "barrier"
+        ],
+        "why": "the harness barrier_sync() runs inside the profiled region once per pass (reps + warmup), and its wait can exceed the injected bottleneck; on test_07 it measured ~0.370s across 35 calls against 0.33ms of GPU compute."
+      },
+      {
+        "bottleneck_type": [
+          "synchronization",
+          "io"
+        ],
+        "keywords": [
+          "overlap",
+          "interior",
+          "non-blocking",
+          "mpi_irecv",
+          "mpi_isend"
+        ],
+        "why": "test_08 launches an interior kernel (--interior-mb 64) that does not depend on the received halo, yet runs strictly after the blocking exchange, so the exchange latency is fully exposed. This is deliberate, not a harness artefact: it is the structure the scenario's second expected fix (MPI_Irecv/Isend + interior kernel + MPI_Waitall) addresses. Reporting the missed overlap is therefore factual and must not count as a false positive -- but it is not the injected bottleneck either, which remains the host staging. Unlike the other also_true entries this one is not expected to disappear; it goes only if the interior domain is removed."
+      }
+    ],
     "nsys_signature": [
       "Per-halo-exchange triplet across the network: D2H cudaMemcpy → MPI_Sendrecv (inter-node) → H2D cudaMemcpy",
       "GPU idle during MPI_Sendrecv; two full-halo PCIe transfers (D2H send-side + H2D receive-side) visible per exchange",
@@ -213,9 +292,9 @@
         "rationale": "Eliminates both PCIe round-trips; the NIC DMAs directly from/to GPU HBM via GDRCopy; CPU is completely off the data path"
       },
       {
-        "action": "If GPU-Direct RDMA is unavailable, use double-buffering to overlap host staging of the next halo with computation on the current halo",
-        "mechanism": "Alternate between two device and two host halo buffers; issue D2H for buffer B while computing with the data just received in buffer A",
-        "rationale": "Hides the staging latency (D2H + network + H2D) behind useful GPU compute; amortizes the PCIe cost"
+        "action": "If GPU-Direct RDMA is unavailable, cover the cross-node exchange latency with interior compute: post non-blocking receives, launch the interior kernel, then process the boundary once the neighbour data lands",
+        "mechanism": "MPI_Irecv/MPI_Isend for the boundary exchange, split the domain kernel into interior and boundary launches, MPI_Waitall before the boundary launch",
+        "rationale": "Interior cells have no dependency on neighbour data, so their compute can cover the D2H + network + H2D staging latency; only the boundary cells must wait for the exchange to land"
       },
       {
         "action": "Reduce halo size or communication frequency by increasing the subdomain-to-surface ratio (stronger scaling in the volume dimension)",

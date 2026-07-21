@@ -1239,7 +1239,12 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
         console.print(f"Reasoning effort: [cyan]{_effort_str}[/cyan]")
 
     # ── Resolve judge model ──────────────────────────────────────────────────
-    judge_model_arg = args.judge_model or "claude-haiku-4-5-20251001"
+    # Opus rather than Haiku: the judge's hard call is whether two differently-phrased
+    # GPU optimisations are the same mechanism (does "overlap transfers" cover "keep
+    # data device-resident"? it does not), and auditing Haiku's full-credit awards
+    # found that judgement to be where it slips. The judge is ~1-2% of an eval's
+    # total cost at either tier, so there is nothing to save by going cheaper here.
+    judge_model_arg = args.judge_model or "claude-opus-4-8"
     judge_provider, judge_model, _ = _parse_provider_and_model(judge_model_arg)
     if not args.skip_judge:
         judge_missing = check_provider_available(judge_provider)
@@ -1389,15 +1394,22 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             _log_dir = None  # resolved per-run below using the sqlite parent
 
     results = []
-    for run_cfg in runs:
+    n_repeats = max(1, getattr(args, "repeats", 1))
+    run_plan = [(rc, rep_i) for rc in runs for rep_i in range(n_repeats)]
+
+    for run_cfg, repeat_idx in run_plan:
+        rep_note = f"  [dim](repeat {repeat_idx + 1}/{n_repeats})[/dim]" if n_repeats > 1 else ""
         console.print(
             f"\n[bold]── {run_cfg.run_id}[/bold]"
             f"  scenario={run_cfg.scenario}"
-            f"  ({len(run_cfg.sqlite_paths)} profile(s))"
+            f"  ({len(run_cfg.sqlite_paths)} profile(s)){rep_note}"
         )
         t0 = time.perf_counter()
         hypotheses: list[dict] = []
         error: str | None = None
+        # Populated by run_agent; None for the claude_code fallback, which reports
+        # no usage. Recorded now because it cannot be recovered without re-running.
+        token_usage: dict[str, int | None] = {}
 
         try:
             # Build per-rank summaries (mirrors cmd_analyze multi-rank path)
@@ -1542,6 +1554,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
                     primary_profile,
                     summary=summary,
                     cross_rank_summary=cross_rank_summary,
+                    token_usage=token_usage,
                     verbose=False,
                     model=args.model,
                     max_turns=args.max_turns,
@@ -1569,6 +1582,8 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             judge_provider=judge_provider,
             skip_judge=args.skip_judge,
             elapsed_s=elapsed,
+            token_usage=token_usage,
+            repeat=repeat_idx,
         )
         if error:
             r.error = error
@@ -1903,12 +1918,27 @@ def main() -> None:
         ),
     )
     p_evaluate.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run each profile N times (default 1). The agent loop is stochastic, so a "
+            "single sample per (model, scenario) cannot separate a real difference "
+            "between models from run-to-run noise; with N>1 the summary reports the "
+            "spread across repetitions. Note Stage 1 (profile parsing) is repeated too, "
+            "so wall-clock scales linearly — use --workers to offset."
+        ),
+    )
+    p_evaluate.add_argument(
         "--judge-model",
         default=None,
         metavar="MODEL",
         help=(
             "Model for LLM-judge suggestion scoring. Same provider:model format. "
-            "Default: claude-haiku-4-5-20251001."
+            "Default: claude-opus-4-8. A cheaper judge (e.g. claude-haiku-4-5) "
+            "saves cents per eval but is less reliable on borderline "
+            "partial-vs-full coverage calls."
         ),
     )
     p_evaluate.add_argument(
