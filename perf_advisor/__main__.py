@@ -1537,7 +1537,11 @@ def cmd_evaluate(args: argparse.Namespace) -> None:  # noqa: C901 — complexity
             _run_log_path: _Path | None = None
             if _log_requested:
                 _run_log_dir = _log_dir or _Path(primary_profile).parent
-                _run_log_path = _run_log_dir / f"{run_cfg.run_id}_{_ts}_log.txt"
+                # With --repeats > 1 the same (run_id, _ts) recurs per repetition;
+                # tag the filename with the repeat index so repeats don't overwrite
+                # each other's logs (the results JSON already keys on `repeat`).
+                _rep_suffix = f"_rep{repeat_idx + 1:02d}" if n_repeats > 1 else ""
+                _run_log_path = _run_log_dir / f"{run_cfg.run_id}_{_ts}{_rep_suffix}_log.txt"
                 console.print(f"  LLM log:  {_run_log_path}")
 
             with LLMLogger(_run_log_path) if _run_log_path else _null_context() as _logger:
